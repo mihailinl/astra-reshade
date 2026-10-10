@@ -1,0 +1,31 @@
+#pragma once
+// Her picture in the game's: the engine's frames (shared memory, "MCPT": premultiplied colour + linear depth,
+// crop-aware) are uploaded into AstraPassthrough.fx's textures; the effect re-projects the picture from the
+// camera it was drawn with onto the camera being presented, and depth-tests it against the game's depth.
+#include "view.h"
+
+namespace layer
+{
+	/// From DllMain: subscribes to ReShade's effect events.
+	void install();
+	/// Composite her this frame (the engine is linked, a provider is live and she is shown).
+	void set_active(bool active);
+	/// Where the engine says its frames are ("/dev/shm/astra-frame" or "Local\\AstraFrame"): mapped again at
+	/// every hello (a restarted engine's ring is a new file). Present thread only.
+	void set_frames_at(const char *where);
+	/// The camera being presented (absolute world) and the game's near clip (its depth buffer, reversed Z,
+	/// is linearised with it).
+	void set_host(const view::Pose &host, float near_m);
+	/// How dark her shadow on the game's ground may be (0: none) - cast from her view from the sun, which the
+	/// engine sends while a sun lights her.
+	void set_shadow(float strength);
+	/// The cam.id whose picture is waited for (up to wait_ms) before compositing; 0: none.
+	void expect_frame(unsigned long long cam_id);
+	/// How long to wait for that picture (ms; 0: never, re-project the newest instead). The overlay's slider.
+	float &wait_ms();
+	unsigned long long wait_timeouts();
+	/// Pictures uploaded so far.
+	unsigned long long frames();
+	/// One line for the overlay.
+	const char *status();
+}

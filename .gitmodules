@@ -1,0 +1,3 @@
+[submodule "extern/minecraft-in-death-stranding"]
+	path = extern/minecraft-in-death-stranding
+	url = https://github.com/mihailinl/minecraft-in-death-stranding

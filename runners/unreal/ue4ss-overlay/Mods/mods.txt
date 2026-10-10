@@ -1,0 +1,13 @@
+; Astra's UE4SS: only what Astra needs. UE4SS's own example mods that change the game (its console and cheat
+; manager enablers, the blueprint mod loader) are off - the game stays as it was, plus Astra.
+CheatManagerEnablerMod : 0
+ConsoleCommandsMod : 0
+ConsoleEnablerMod : 0
+SplitScreenMod : 0
+LineTraceMod : 0
+BPML_GenericFunctions : 0
+BPModLoaderMod : 0
+AstraUE : 1
+
+; Built-in keybinds, do not move up!
+Keybinds : 1
