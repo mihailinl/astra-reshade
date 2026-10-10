@@ -1,5 +1,8 @@
 # astra-reshade
 
+> **Experimental — phase 1, not yet run in a game.** Everything here builds and passes its offline tests; the first live test (Scarlet Skips, UE 5.6) is described in [docs/LIVE-TEST.md](docs/LIVE-TEST.md).
+
+
 Astra, the Astra companion's 3D avatar, inside **any D3D11/D3D12 game ReShade
 runs in** — on Windows, and on Linux under Proton/vkd3d. Her own engine (the Astra avatar engine, a separate
 native program) draws her from the game's camera; this ReShade add-on puts that picture into the game's picture
