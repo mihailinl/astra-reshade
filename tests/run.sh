@@ -2,7 +2,8 @@
 # The tests that run on any machine, no game, no Windows:
 #   1. the add-on's portable core (line protocol, provider state, camera math, frame ring) - native C++;
 #   2. the AstraUE Lua mod's maths and its pipe lines, against a stub of UE4SS - plain Lua 5.4;
-#   3. AstraPassthrough.fx through ReShade's own FX compiler front end (tools/fxcheck.sh).
+#   3. AstraPassthrough.fx through ReShade's own FX compiler front end (tools/fxcheck.sh), alone and with every game
+#      hook (AstraGame.fxh) defined.
 set -e
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 OUT="$HERE/build/tests"
@@ -20,3 +21,7 @@ fi
 $CXX -std=c++20 -O1 -Wall -Wextra -pthread -I"$HERE/src" "$HERE/tests/core_tests.cpp" "$HERE/src/lines.cpp" "$HERE/src/ring.cpp" -o "$OUT/core_tests"
 "$OUT/core_tests" $LINES
 "$HERE/tools/fxcheck.sh"
+# ...and with every game hook defined (tests/hooks/AstraGame.fxh in place of the foundation's empty one)
+mkdir -p "$OUT/hooks"
+cp "$HERE/shaders/AstraPassthrough.fx" "$HERE/tests/hooks/AstraGame.fxh" "$OUT/hooks/"
+"$HERE/tools/fxcheck.sh" "$OUT/hooks/AstraPassthrough.fx"

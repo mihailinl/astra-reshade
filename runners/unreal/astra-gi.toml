@@ -60,6 +60,12 @@ from = "astra-reshade/Shaders/AstraPassthrough.fx"
 to = "${game}/astra-reshade/Shaders/AstraPassthrough.fx"
 sha256 = "@sha256:astra-reshade/Shaders/AstraPassthrough.fx@"
 
+# the effect's game hooks: the foundation's own, empty (a game integration ships its own in place of it)
+[[game_files]]
+from = "astra-reshade/Shaders/AstraGame.fxh"
+to = "${game}/astra-reshade/Shaders/AstraGame.fxh"
+sha256 = "@sha256:astra-reshade/Shaders/AstraGame.fxh@"
+
 # ReShade's shader header (crosire/reshade-shaders, branch slim at fd00221, CC0-1.0; upstream, unmodified)
 [[game_files]]
 from = "astra-reshade/Shaders/ReShade.fxh"

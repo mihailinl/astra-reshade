@@ -41,7 +41,7 @@ cp -r "$HERE/runners/unreal/AstraUE" "$OUT/ue4ss/Mods/AstraUE"
 cp "$TP/reshade-6.8.0-addon/ReShade64.dll" "$OUT/dxgi.dll"
 cp "$HERE/runners/unreal/ReShade.ini" "$OUT/ReShade.ini"
 cp "$HERE/build/astra.addon64" "$OUT/astra-reshade/astra.addon64"
-cp "$HERE/shaders/AstraPassthrough.fx" "$TP/shaders/ReShade.fxh" "$OUT/astra-reshade/Shaders/"
+cp "$HERE/shaders/AstraPassthrough.fx" "$HERE/shaders/AstraGame.fxh" "$TP/shaders/ReShade.fxh" "$OUT/astra-reshade/Shaders/"
 cp "$HERE/LICENSE" "$OUT/LICENSES/astra-reshade-MIT.txt"
 cp "$OUT/ue4ss/LICENSE" "$OUT/LICENSES/RE-UE4SS-MIT.txt"
 # the WebSocket client and the fault guard compiled into astra.addon64 come from this MIT repository (and its own lineage)

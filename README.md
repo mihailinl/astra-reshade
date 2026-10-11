@@ -73,13 +73,28 @@ PROTOCOL) — AstraUE does, from UE4SS's Lua (`io.open(pipe, "r+b")`, one write 
 
 Her speed and `airborne` are raw facts: what they mean (walk, run, a jump) is her animation set's business.
 
+Version 2 (`astra_provider_version() >= 2`; look each one up by name, an older add-on has none):
+
+```c
+astra_provider_camera2(frame, eye, fwd, up, fov_deg, fov_is_horizontal, aspect, near_m, far_m); // a depth buffer with a far plane
+astra_provider_anchor("hips");          // her pos names her pelvis (a seat), not her feet; "feet" or NULL: back
+astra_provider_param("seated", 1.0f);   // more raw facts for her animation set (sticky; NaN: back to its default)
+astra_provider_log("...");              // a line in astra-reshade.log
+astra_provider_on_present(fn, ctx);     // a provider that reads the camera from memory at presentation: fn runs at
+                                        // the start of every Present, and the camera it writes IS the presented one
+```
+
+A game whose integration needs more of the compositor (the game's UI laid back over her, another mod's world in front
+of her) ships its own `AstraGame.fxh` beside `AstraPassthrough.fx`, in place of the foundation's empty one: the hooks
+are listed at the top of the effect.
+
 ## Install by hand (until Astra's launcher does it)
 
 Everything goes into the folder of the game's REAL executable (Unreal: `<Project>/Binaries/Win64/`, beside
 `<Project>-Win64-Shipping.exe`), see `docs/LIVE-TEST.md` for the exact steps:
 
 - ReShade 6.8.0 **with full add-on support**: its `ReShade64.dll` as `dxgi.dll`, and `runners/unreal/ReShade.ini`;
-- `astra-reshade/astra.addon64` and `astra-reshade/Shaders/{AstraPassthrough.fx, ReShade.fxh}`;
+- `astra-reshade/astra.addon64` and `astra-reshade/Shaders/{AstraPassthrough.fx, AstraGame.fxh, ReShade.fxh}`;
 - for Unreal: UE4SS (`dwmapi.dll` + `ue4ss/`) with `runners/unreal/AstraUE` in `ue4ss/Mods/` and our `mods.txt`.
 
 Under Proton, the game's launch options: `WINEDLLOVERRIDES="dwmapi=n,b;dxgi=n,b" %command%`.

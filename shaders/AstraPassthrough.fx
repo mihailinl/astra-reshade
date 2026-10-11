@@ -6,6 +6,17 @@
 // Always enabled (annotation): AstraActive gates it, so the game passes through untouched while she isn't out.
 // Derived from the Death Stranding add-on's AstraPassthrough.fx (same author).
 #include "ReShade.fxh"
+// A game integration's hooks into this compositor, as data (its own AstraGame.fxh, shipped beside this file in place
+// of the foundation's empty one). Each is optional:
+//   ASTRA_GAME_UI <semantic> + ASTRA_GAME_UI_ACTIVE <uniform>: a game that draws its UI into a target of its own and
+//     composites it with its scene in one pass leaves no picture without the UI for her to go under: the integration
+//     binds that target to the texture semantic and sets the bool uniform of that name (in every effect); her picture
+//     then gets the game's UI laid back over it.
+//   ASTRA_OCCLUDER_TEX <texture>: another compositor in the same game (another ReShade mod drawing its own world into
+//     the picture) shares this texture by name: x its coverage (> 0.5: drawn), y its depth in metres along the game
+//     camera's view axis, RGBA16F at the back buffer's size. Where it is drawn nearer than her, she is hidden. The
+//     integration sets AstraOccluderActive while that compositor has written it this frame.
+#include "AstraGame.fxh"
 
 texture AstraWorldTex : ASTRAWORLD;
 texture AstraDepthTex : ASTRADEPTH;
@@ -30,6 +41,18 @@ sampler sFogPrev { Texture = FogPrevTex; MinFilter = POINT; MagFilter = POINT; }
 // the game's picture at quarter size with mips: the light around her
 texture AstraLightTex { Width = BUFFER_WIDTH / 4; Height = BUFFER_HEIGHT / 4; Format = RGBA8; MipLevels = 7; };
 sampler sAstraLight { Texture = AstraLightTex; AddressU = CLAMP; AddressV = CLAMP; };
+#ifdef ASTRA_GAME_UI
+texture AstraGameUiTex : ASTRA_GAME_UI;
+sampler sAstraGameUi { Texture = AstraGameUiTex; AddressU = CLAMP; AddressV = CLAMP; };
+uniform bool ASTRA_GAME_UI_ACTIVE = false; // set by the integration: the target is bound this frame
+uniform float GameUiGamma < ui_type = "drag"; ui_min = 0.2; ui_max = 3.0; ui_step = 0.01; ui_label = "Game UI gamma"; > = 1.0;
+uniform float GameUiStrength < ui_type = "drag"; ui_min = 0.0; ui_max = 2.0; ui_step = 0.01; ui_label = "Game UI brightness"; > = 1.0;
+#endif
+#ifdef ASTRA_OCCLUDER_TEX
+texture ASTRA_OCCLUDER_TEX { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA16F; };
+sampler sAstraOccluder { Texture = ASTRA_OCCLUDER_TEX; MinFilter = POINT; MagFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
+uniform bool AstraOccluderActive = false; // set by the integration: the other compositor wrote it this frame
+#endif
 
 // set by the add-on
 uniform bool AstraActive = false;
@@ -298,9 +321,9 @@ void PS_FogCells(float4 pos : SV_Position, float2 uv : TEXCOORD, out float outSi
 		}
 	avg /= 9.0;
 	const float d = game_depth(uv);
-	// usable: not too near (noise), not the sky (no depth: it is the fog's colour itself)
-	const bool sky = d > 5000.0;
-	const bool usable = d > 8.0 && d < 2000.0;
+	// usable: not too near (noise), not the sky (no depth, or the far plane: it is the fog's colour itself)
+	const bool sky = d > min(5000.0, HostPlanes.y * 0.9);
+	const bool usable = d > 8.0 && d < 2000.0 && !sky;
 	outSigma = usable ? -log(max(1.0 - 0.95 * saturate(dark), 0.02)) / d : 1e4;
 	// the haziest places show the fog's colour: weight by how washed out they are (the sky counts fully)
 	const float w = usable ? pow(saturate(dark), 8.0) : (sky ? 1.0 : 0.0);
@@ -360,8 +383,16 @@ float3 PS_Astra(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 		astra = her_colour(auv);
 	if (DebugView == 1)
 		return astra.a > 0.0 ? bands(za) : host * 0.3;
-	// behind the game's surfaces
-	const float visible = za < zh + allow ? 1.0 : 0.0;
+	// behind the game's surfaces (and another compositor's, where it drew nearer)
+	float visible = za < zh + allow ? 1.0 : 0.0;
+#ifdef ASTRA_OCCLUDER_TEX
+	if (AstraOccluderActive)
+	{
+		const float4 o = tex2Dlod(sAstraOccluder, float4(uv, 0, 0));
+		if (o.x > 0.5 && o.y > 0.0 && o.y < za - 0.02)
+			visible = 0.0;
+	}
+#endif
 	const float cover = astra.a * visible;
 	// her shadow on the game's surfaces around her (where she doesn't cover them herself)
 	float3 shaded = host;
@@ -374,7 +405,17 @@ float3 PS_Astra(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 	}
 	// (her colour is premultiplied: relight it as straight colour, then by her coverage again)
 	const float3 lit = visible > 0.0 && astra.a > 1e-4 ? relight(astra.rgb / astra.a, uv, za) * astra.a : 0.0;
-	return saturate(lit * visible + shaded * (1.0 - cover));
+	float3 c = lit * visible + shaded * (1.0 - cover);
+#ifdef ASTRA_GAME_UI
+	// the game's UI back over her (the game composited it with its scene before she was drawn over that)
+	if (ASTRA_GAME_UI_ACTIVE && cover > 0.001)
+	{
+		const float4 ui = tex2D(sAstraGameUi, uv);
+		const float3 ui_rgb = pow(max(ui.rgb, 0.0), GameUiGamma) * GameUiStrength;
+		c = lerp(c, ui_rgb + c * saturate(1.0 - ui.a), saturate(cover));
+	}
+#endif
+	return saturate(c);
 }
 
 technique AstraPassthrough < enabled = true; ui_tooltip = "Astra, drawn by her engine from the game's camera (on while her engine is linked)."; >
