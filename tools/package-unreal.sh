@@ -50,33 +50,7 @@ cp "$HERE/extern/minecraft-in-death-stranding/mc/LICENSE.universal-modder" "$OUT
 [ -f "$CACHE/ReShade-LICENSE.md" ] || curl -fsSL -o "$CACHE/ReShade-LICENSE.md" https://raw.githubusercontent.com/crosire/reshade/v6.8.0/LICENSE.md
 cp "$CACHE/ReShade-LICENSE.md" "$OUT/LICENSES/ReShade-BSD-3-Clause.md"
 
-# the manifest: our digests in, then every file it names must exist and match what it pins
-python3 - "$HERE/runners/unreal/astra-gi.toml" "$OUT" <<'PY'
-import hashlib, os, re, sys, tomllib
-src, out = sys.argv[1], sys.argv[2]
-text = open(src, encoding="utf-8").read()
-digest = lambda p: hashlib.sha256(open(os.path.join(out, p), "rb").read()).hexdigest()
-text = re.sub(r"@sha256:([^@]+)@", lambda m: digest(m.group(1)), text)
-open(os.path.join(out, "astra-gi.toml"), "w", encoding="utf-8").write(text)
-m = tomllib.loads(text)
-for f in m.get("files", []):
-    base = f["from"].removesuffix("**").rstrip("/")
-    assert os.path.exists(os.path.join(out, base)), "missing " + f["from"]
-for f in m.get("game_files", []):
-    p = os.path.join(out, f["from"])
-    assert os.path.isfile(p), "missing " + f["from"]
-    if "sha256" in f:
-        assert digest(f["from"]) == f["sha256"], "digest mismatch: " + f["from"]
-print("manifest ok: %d [[files]], %d [[game_files]] (%d pinned)" % (len(m["files"]), len(m["game_files"]), sum("sha256" in f for f in m["game_files"])))
-PY
+# the manifest: our digests in, every file it names staged and matching what it pins; then the zip (reproducible)
 rm -f "$HERE/build/astra-gi.zip"
-python3 - "$OUT" "$HERE/build/astra-gi.zip" <<'PY'
-import os, sys, zipfile
-root, dest = sys.argv[1], sys.argv[2]
-with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
-    for d, _, files in sorted(os.walk(root)):
-        for f in sorted(files):
-            p = os.path.join(d, f)
-            z.write(p, os.path.relpath(p, root))
-PY
-echo "build/astra-gi.zip  $(du -h "$HERE/build/astra-gi.zip" | cut -f1)  sha256 $(sha "$HERE/build/astra-gi.zip")"
+python3 "$HERE/tools/gi-pack.py" "$HERE/runners/unreal/astra-gi.toml" "$OUT" "$HERE/build/astra-gi.zip"
+echo "build/astra-gi.zip  $(du -h "$HERE/build/astra-gi.zip" | cut -f1)"
