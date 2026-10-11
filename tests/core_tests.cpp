@@ -247,7 +247,7 @@ static void test_provider()
 		st.set_param(("p" + std::to_string(i)).c_str(), float(i));
 	CHECK(st.take_params().size() == provider::kMaxParams);
 	CHECK(st.refused == 2 + 2 + 4 + (20 - (provider::kMaxParams - 1))); // cues, anchors, params, the 17th on
-	// the present callback: one at a time, dropped only by its own pointer
+	// the present callback: one at a time, the last registration wins, NULL unregisters
 	static int called = 0;
 	struct Cb
 	{
@@ -261,10 +261,7 @@ static void test_provider()
 	pc.fn(pc.context);
 	CHECK(called == 1);
 	st.set_present_callback(&Cb::two, nullptr);
-	st.drop_present_callback(&Cb::one); // not the one registered: kept
 	CHECK(st.present_callback().fn == &Cb::two);
-	st.drop_present_callback(&Cb::two);
-	CHECK(st.present_callback().fn == nullptr);
 	st.set_present_callback(nullptr, &ctx);
 	CHECK(st.present_callback().fn == nullptr && st.present_callback().context == nullptr);
 	const double good[3] = {1, 2, 3}, bad[3] = {1, NAN, 3};

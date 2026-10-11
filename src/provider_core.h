@@ -308,13 +308,6 @@ namespace provider
 			std::lock_guard<std::mutex> lock(m_lock);
 			return m_present;
 		}
-		/// Unregisters `fn` only if it is still the one registered (a fault in it, while another took its place).
-		void drop_present_callback(void (*fn)(void *))
-		{
-			std::lock_guard<std::mutex> lock(m_lock);
-			if (m_present.fn == fn)
-				m_present = PresentCallback{};
-		}
 
 	private:
 		std::mutex m_lock;

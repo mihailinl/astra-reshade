@@ -1,6 +1,5 @@
 #define ASTRA_PROVIDER_EXPORTS
 #include "astra_provider.h"
-#include "guard.h"
 #include "log.h"
 #include "provider.h"
 #include <windows.h>
@@ -27,14 +26,15 @@ namespace provider
 
 	bool run_present_callback()
 	{
+		// NOT under this add-on's guard: a provider built on the same fault guard (minecraft-in-death-stranding's
+		// guard.cpp, compiled into each module) has a vectored handler and a thread-local resume point of its own, and
+		// two guards nested across modules break - whichever handler runs first resumes ITS point, and when that is
+		// ours the provider's own resume point is left dangling for the next fault on this thread. The provider
+		// contains its own faults.
 		const PresentCallback cb = state().present_callback();
 		if (cb.fn == nullptr)
 			return false;
-		if (!guard::run("the provider's present callback", [&] { cb.fn(cb.context); }))
-		{
-			state().drop_present_callback(cb.fn); // never called again: a provider that faults once would every frame
-			logf("provider: its present callback faulted and was unregistered");
-		}
+		cb.fn(cb.context);
 		return true;
 	}
 }

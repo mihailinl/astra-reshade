@@ -111,7 +111,8 @@ ASTRA_PROVIDER_API void astra_provider_log(const char *line);
  * `callback(context)` is called on the present thread at the start of every Present, before the add-on reads
  * anything - so a camera written inside it IS the frame being presented (the add-on's camera delay does not
  * apply to it). One provider at a time: a second registration replaces the first. NULL unregisters - do it
- * before your module unloads. A fault inside it is contained and unregisters it. Version 2. */
+ * before your module unloads. Contain your own faults in it (the add-on does not wrap it: fault guards of two
+ * modules must not nest). Version 2. */
 ASTRA_PROVIDER_API void astra_provider_on_present(void (*callback)(void *context), void *context);
 
 #ifdef __cplusplus
