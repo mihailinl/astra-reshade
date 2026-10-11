@@ -21,7 +21,7 @@ namespace layer
 	namespace
 	{
 		constexpr const char *kEffect = "AstraPassthrough.fx";
-		constexpr float kHostFar = 1.0e7f; // Unreal's projection has no far plane: reversed Z, infinite
+		constexpr float kHostFar = 1.0e7f; // a projection with no far plane (Unreal's): reversed Z, infinite
 
 		struct Layer
 		{
@@ -32,7 +32,7 @@ namespace layer
 		std::atomic<bool> g_active{false};
 		std::mutex g_lock; // host pose, shadow strength (written by the link on the present thread; the effects may run elsewhere)
 		view::Pose g_host;
-		float g_hostNear = 0.1f;
+		float g_hostNear = 0.1f, g_hostFar = 0.0f;
 		float g_shadow = 0.0f;
 
 		wchar_t g_name[128] = L"Local\\astra-frame", g_path[260] = L"Z:\\dev\\shm\\astra-frame";
@@ -286,11 +286,12 @@ namespace layer
 			if (!on)
 				return;
 			view::Pose host;
-			float host_near, shadow;
+			float host_near, host_far, shadow;
 			{
 				std::lock_guard<std::mutex> lock(g_lock);
 				host = g_host;
 				host_near = g_hostNear;
+				host_far = g_hostFar > host_near ? g_hostFar : kHostFar;
 				shadow = g_shadow;
 			}
 			if (!host.valid)
@@ -302,7 +303,7 @@ namespace layer
 			const view::Warp w = view::warp(host, from, moved);
 
 			set_float3(runtime, "AstraPlanes", g_frame.near_m, g_frame.far_m, float(g_frame.flags));
-			set_float3(runtime, "HostPlanes", host_near, kHostFar, 0.0f);
+			set_float3(runtime, "HostPlanes", host_near, host_far, 0.0f);
 			// the planes hold her rectangle of the whole picture (flag 128), or all of it
 			set_float4(runtime, "AstraRect", float(g_frame.rx) / float(g_frame.w), float(g_frame.ry) / float(g_frame.h), float(g_frame.rw) / float(g_frame.w),
 				float(g_frame.rh) / float(g_frame.h));
@@ -383,11 +384,12 @@ namespace layer
 		logf("layer: the engine's frames are at %s", where);
 	}
 
-	void set_host(const view::Pose &host, float near_m)
+	void set_host(const view::Pose &host, float near_m, float far_m)
 	{
 		std::lock_guard<std::mutex> lock(g_lock);
 		g_host = host;
 		g_hostNear = near_m > 0.0f ? near_m : 0.1f;
+		g_hostFar = far_m;
 	}
 
 	void set_shadow(float strength)

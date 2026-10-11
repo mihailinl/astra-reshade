@@ -13,9 +13,9 @@ namespace layer
 	/// Where the engine says its frames are ("/dev/shm/astra-frame" or "Local\\AstraFrame"): mapped again at
 	/// every hello (a restarted engine's ring is a new file). Present thread only.
 	void set_frames_at(const char *where);
-	/// The camera being presented (absolute world) and the game's near clip (its depth buffer, reversed Z,
-	/// is linearised with it).
-	void set_host(const view::Pose &host, float near_m);
+	/// The camera being presented (absolute world) and the game's near and far clip (its depth buffer, reversed
+	/// Z, is linearised with them; far 0: an infinite projection).
+	void set_host(const view::Pose &host, float near_m, float far_m);
 	/// How dark her shadow on the game's ground may be (0: none) - cast from her view from the sun, which the
 	/// engine sends while a sun lights her.
 	void set_shadow(float strength);

@@ -105,11 +105,16 @@ namespace
 		ImGui::SameLine();
 		ImGui::SetNextItemWidth(140);
 		changed |= ImGui::SliderFloat("size", &enginelink::size(), 0.5f, 2.0f, "x%.2f");
-		ImGui::SetNextItemWidth(140);
-		changed |= ImGui::SliderInt("camera delay (frames)", &enginelink::camera_delay(), 0, 3);
-		if (ImGui::IsItemHovered())
-			ImGui::SetTooltip("How many frames the picture on screen is behind the game's newest camera.\n"
-							  "Turn the camera fast: if she slides AHEAD of the turn, raise it; if she lags behind it, lower it.");
+		if (ls.present_callback)
+			ImGui::TextDisabled("camera: the presented frame's (the provider reads it at presentation)");
+		else
+		{
+			ImGui::SetNextItemWidth(140);
+			changed |= ImGui::SliderInt("camera delay (frames)", &enginelink::camera_delay(), 0, 3);
+			if (ImGui::IsItemHovered())
+				ImGui::SetTooltip("How many frames the picture on screen is behind the game's newest camera.\n"
+								  "Turn the camera fast: if she slides AHEAD of the turn, raise it; if she lags behind it, lower it.");
+		}
 		ImGui::SameLine();
 		ImGui::SetNextItemWidth(140);
 		changed |= ImGui::SliderFloat("wait for her picture", &layer::wait_ms(), 0.0f, 12.0f, "%.1f ms");

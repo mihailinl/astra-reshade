@@ -10,4 +10,6 @@ namespace provider
 	int64_t now_ms();
 	/// Calls refused for bad values (NaN, parallel basis...), for the overlay.
 	unsigned long long refused();
+	/// Calls the provider's present callback, if one is registered (fault-contained). True: one was called.
+	bool run_present_callback();
 }

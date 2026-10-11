@@ -37,6 +37,7 @@ namespace enginelink
 		unsigned long long sent, received, rebases, cams;
 		bool answered; // the engine's hello came on this connection
 		bool provider_fresh, provider_visible;
+		bool present_callback; // the provider writes its camera from the present callback (no camera delay)
 		long long camera_age_ms;
 	};
 	Stats stats();

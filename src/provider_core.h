@@ -2,9 +2,11 @@
 // What providers told the add-on, held for the present thread: the game's newest cameras (a short ring, so
 // the camera of the frame being PRESENTED can be picked, which in a game with a render thread is not the
 // newest), her placement, the sun, cues and who is providing. Writers (the game thread, the pipe thread)
-// never block the reader and the reader never sees half a write: every value sits behind a seqlock.
+// never block the reader and the reader never sees half a write: every value sits behind a seqlock (the rare,
+// sticky ones - her anchor, extra animator parameters, the present callback - behind a mutex).
 // Portable C++ (no Windows): tests/ builds it natively.
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -24,6 +26,7 @@ namespace provider
 		int fov_horizontal = 0;
 		float aspect = 0.0f;     // 0: the back buffer's
 		float near_m = 0.1f;
+		float far_m = 0.0f;      // 0: no far plane (an infinite reversed-Z projection)
 	};
 
 	struct Avatar
@@ -138,6 +141,23 @@ namespace provider
 		return true;
 	}
 
+	/// An identifier for the engine: a letter or '_', then letters, digits, '_'; 1..32 (an animator parameter's
+	/// name, a bone's). Put into JSON verbatim.
+	inline bool valid_ident(const char *s)
+	{
+		if (s == nullptr || !((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || *s == '_'))
+			return false;
+		size_t n = 0;
+		for (; s[n] != 0; ++n)
+		{
+			const char c = s[n];
+			const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+			if (!ok || n >= 32)
+				return false;
+		}
+		return true;
+	}
+
 	/// Shown text (integration id, game name): printable ASCII, no quotes or backslashes, <= 64.
 	inline std::string clean_text(const char *s)
 	{
@@ -156,6 +176,22 @@ namespace provider
 	struct Cue
 	{
 		std::string kind, name; // "play" / "trigger" / "resume"
+	};
+
+	/// An extra animator parameter (astra_provider_param). `clear`: send null once (back to the set's default).
+	struct Param
+	{
+		std::string name;
+		float value = 0.0f;
+		bool clear = false;
+	};
+	constexpr size_t kMaxParams = 16;
+
+	/// The provider's present callback (astra_provider_on_present).
+	struct PresentCallback
+	{
+		void (*fn)(void *) = nullptr;
+		void *context = nullptr;
 	};
 
 	/// Everything providers said, for the present thread.
@@ -204,10 +240,89 @@ namespace provider
 			game = m_game;
 		}
 
+		/// The point of her that her placement names: "feet" or a bone. False (kept as it was): not an identifier.
+		bool set_anchor(const char *point)
+		{
+			const bool reset = point == nullptr || *point == 0;
+			if (!reset && !valid_ident(point))
+			{
+				++refused;
+				return false;
+			}
+			std::lock_guard<std::mutex> lock(m_lock);
+			m_anchor = reset ? "feet" : point;
+			return true;
+		}
+		std::string anchor()
+		{
+			std::lock_guard<std::mutex> lock(m_lock);
+			return m_anchor;
+		}
+
+		/// Sets (a number) or hands back (NaN) an extra parameter. Refused: a bad name, speed/airborne (they come
+		/// with the placement), an infinity, or a 17th name.
+		bool set_param(const char *name, float value)
+		{
+			const bool clear = value != value;
+			if (!valid_ident(name) || std::strcmp(name, "speed") == 0 || std::strcmp(name, "airborne") == 0 || (!clear && value - value != 0.0f))
+			{
+				++refused;
+				return false;
+			}
+			std::lock_guard<std::mutex> lock(m_lock);
+			for (Param &p : m_params)
+				if (p.name == name)
+				{
+					p.value = clear ? 0.0f : value;
+					p.clear = clear;
+					return true;
+				}
+			if (clear)
+				return true; // never set: nothing to hand back
+			if (m_params.size() >= kMaxParams)
+			{
+				++refused;
+				return false;
+			}
+			m_params.push_back(Param{name, value, false});
+			return true;
+		}
+		/// The parameters to send with this placement; one handed back is in it once (clear), then forgotten.
+		std::vector<Param> take_params()
+		{
+			std::lock_guard<std::mutex> lock(m_lock);
+			std::vector<Param> out = m_params;
+			for (size_t i = m_params.size(); i-- > 0;)
+				if (m_params[i].clear)
+					m_params.erase(m_params.begin() + std::ptrdiff_t(i));
+			return out;
+		}
+
+		void set_present_callback(void (*fn)(void *), void *context)
+		{
+			std::lock_guard<std::mutex> lock(m_lock);
+			m_present = PresentCallback{fn, fn != nullptr ? context : nullptr};
+		}
+		PresentCallback present_callback()
+		{
+			std::lock_guard<std::mutex> lock(m_lock);
+			return m_present;
+		}
+		/// Unregisters `fn` only if it is still the one registered (a fault in it, while another took its place).
+		void drop_present_callback(void (*fn)(void *))
+		{
+			std::lock_guard<std::mutex> lock(m_lock);
+			if (m_present.fn == fn)
+				m_present = PresentCallback{};
+		}
+
 	private:
 		std::mutex m_lock;
 		std::vector<Cue> m_cues;
 		std::string m_integration, m_game;
+		std::string m_anchor = "feet";
+		std::vector<Param> m_params;
+		PresentCallback m_present;
 	};
 
 	/// No NaN, no infinity (x - x is 0 only for a finite x).

@@ -35,13 +35,14 @@ struct Recorder : lines::Sink
 {
 	std::vector<std::string> calls;
 	double pos[3] = {};
-	float fwd[3] = {}, up[3] = {}, vel[3] = {}, fov = 0, aspect = 0, near_m = 0, speed = 0, scale = 0;
+	float fwd[3] = {}, up[3] = {}, vel[3] = {}, fov = 0, aspect = 0, near_m = 0, far_m = -1, speed = 0, scale = 0, value = 0;
 	unsigned long long frame = 0;
 	int horizontal = -1, airborne = -1;
 	std::string a, b;
-	void camera(unsigned long long f, const double p[3], const float fw[3], const float u[3], float fv, int h, float asp, float n) override
+	void camera(unsigned long long f, const double p[3], const float fw[3], const float u[3], float fv, int h, float asp, float n, float fa) override
 	{
 		calls.push_back("camera");
+		far_m = fa;
 		frame = f;
 		std::memcpy(pos, p, sizeof(pos));
 		std::memcpy(fwd, fw, sizeof(fwd));
@@ -61,6 +62,17 @@ struct Recorder : lines::Sink
 		speed = s;
 		airborne = air;
 		scale = sc;
+	}
+	void anchor(const char *p) override
+	{
+		calls.push_back("anchor");
+		a = p;
+	}
+	void param(const char *n, float v) override
+	{
+		calls.push_back("param");
+		a = n;
+		value = v;
 	}
 	void visible(int on) override { calls.push_back(on ? "visible1" : "visible0"); }
 	void light(const float t[3], const float c[3], float i, float v) override
@@ -100,7 +112,11 @@ static void test_lines()
 	Recorder r;
 	CHECK(parse(r, "C 42 1000.5 2.25 -3 0 0 -1 0 1 0 90 h 1.7778 0.1"));
 	CHECK(r.calls.back() == "camera" && r.frame == 42 && near(r.pos[0], 1000.5) && near(r.pos[2], -3) && near(r.fwd[2], -1) && near(r.fov, 90) &&
-		r.horizontal == 1 && near(r.aspect, 1.7778) && near(r.near_m, 0.1));
+		r.horizontal == 1 && near(r.aspect, 1.7778) && near(r.near_m, 0.1) && r.far_m == 0.0f); // no far: an infinite projection
+	CHECK(parse(r, "C 42 0 0 0 0 0 -1 0 1 0 45 v 0 0.2 4000"));
+	CHECK(r.calls.back() == "camera" && near(r.near_m, 0.2) && near(r.far_m, 4000));
+	CHECK(!parse(r, "C 42 0 0 0 0 0 -1 0 1 0 45 v 0 0.2 4000 1")); // a field too many
+	CHECK(!parse(r, "C 42 0 0 0 0 0 -1 0 1 0 45 v 0 0.2 far"));
 	CHECK(parse(r, "C 43 0 0 0 0 0 -1 0 1 0 60 v 0 0\r"));
 	CHECK(r.horizontal == 0 && r.frame == 43);
 	CHECK(!parse(r, "C 44 0 0 0 0 0 -1 0 1 0 60 x 0 0"));    // axis
@@ -111,6 +127,12 @@ static void test_lines()
 	CHECK(parse(r, "A 1 2 3 0 0 1 0 1 0 0.5 0 0 1.4 1 1.2"));
 	CHECK(r.calls.back() == "avatar" && near(r.pos[1], 2) && near(r.vel[0], 0.5) && near(r.speed, 1.4) && r.airborne == 1 && near(r.scale, 1.2));
 	CHECK(!parse(r, "A 1 2 3 0 0 1 0 1 0 0.5 0 0 1.4 1"));
+	CHECK(parse(r, "N hips") && r.calls.back() == "anchor" && r.a == "hips");
+	CHECK(!parse(r, "N") && !parse(r, "N hips feet"));
+	CHECK(parse(r, "K seated 1") && r.calls.back() == "param" && r.a == "seated" && near(r.value, 1));
+	CHECK(parse(r, "K vspeed -2.5") && near(r.value, -2.5));
+	CHECK(parse(r, "K vspeed null") && r.value != r.value); // NaN: hand it back to the set's default
+	CHECK(!parse(r, "K vspeed") && !parse(r, "K vspeed fast") && !parse(r, "K vspeed inf"));
 	CHECK(parse(r, "V 0") && r.calls.back() == "visible0");
 	CHECK(parse(r, "V 1") && r.calls.back() == "visible1");
 	CHECK(parse(r, "L 0 1 0 1 0.9 0.8 1.0 0.5") && r.calls.back() == "light" && near(r.fwd[0], 0) && near(r.vel[0], 1) && near(r.scale, 0.5));
@@ -204,6 +226,47 @@ static void test_provider()
 	const auto cues = st.take_cues();
 	CHECK(cues.size() == 2 && cues[0].name == "seat" && cues[1].kind == "resume" && cues[1].name.empty());
 	CHECK(st.refused == 2);
+	// her anchor and the provider's own parameters: sticky, validated, a handed-back one sent once as null
+	CHECK(st.anchor() == "feet");
+	CHECK(st.set_anchor("hips") && st.anchor() == "hips");
+	CHECK(!st.set_anchor("hi\"ps") && !st.set_anchor("9lives") && st.anchor() == "hips");
+	CHECK(st.set_anchor(nullptr) && st.anchor() == "feet");
+	CHECK(provider::valid_ident("seated") && provider::valid_ident("_x9") && !provider::valid_ident("a-b") && !provider::valid_ident(std::string(33, 'a').c_str()));
+	CHECK(st.set_param("seated", 1.0f) && st.set_param("vspeed", -2.0f) && st.set_param("vspeed", -3.0f));
+	CHECK(!st.set_param("speed", 1.0f) && !st.set_param("airborne", 0.0f) && !st.set_param("bad name", 1.0f) && !st.set_param("x", INFINITY));
+	auto ps = st.take_params();
+	CHECK(ps.size() == 2 && ps[0].name == "seated" && ps[1].name == "vspeed" && ps[1].value == -3.0f && !ps[1].clear);
+	CHECK(st.take_params().size() == 2); // sticky: sent with every placement
+	CHECK(st.set_param("seated", NAN));
+	ps = st.take_params();
+	CHECK(ps.size() == 2 && ps[0].name == "seated" && ps[0].clear);
+	ps = st.take_params();
+	CHECK(ps.size() == 1 && ps[0].name == "vspeed"); // handed back once, then forgotten
+	CHECK(st.set_param("never_set", NAN) && st.take_params().size() == 1);
+	for (int i = 0; i < 20; ++i)
+		st.set_param(("p" + std::to_string(i)).c_str(), float(i));
+	CHECK(st.take_params().size() == provider::kMaxParams);
+	CHECK(st.refused == 2 + 2 + 4 + (20 - (provider::kMaxParams - 1))); // cues, anchors, params, the 17th on
+	// the present callback: one at a time, dropped only by its own pointer
+	static int called = 0;
+	struct Cb
+	{
+		static void one(void *c) { called += *static_cast<int *>(c); }
+		static void two(void *) { called += 100; }
+	};
+	int ctx = 1;
+	CHECK(st.present_callback().fn == nullptr);
+	st.set_present_callback(&Cb::one, &ctx);
+	provider::PresentCallback pc = st.present_callback();
+	pc.fn(pc.context);
+	CHECK(called == 1);
+	st.set_present_callback(&Cb::two, nullptr);
+	st.drop_present_callback(&Cb::one); // not the one registered: kept
+	CHECK(st.present_callback().fn == &Cb::two);
+	st.drop_present_callback(&Cb::two);
+	CHECK(st.present_callback().fn == nullptr);
+	st.set_present_callback(nullptr, &ctx);
+	CHECK(st.present_callback().fn == nullptr && st.present_callback().context == nullptr);
 	const double good[3] = {1, 2, 3}, bad[3] = {1, NAN, 3};
 	CHECK(provider::finite3(good) && !provider::finite3(bad));
 }

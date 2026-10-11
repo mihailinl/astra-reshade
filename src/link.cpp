@@ -15,7 +15,7 @@ namespace enginelink
 {
 	namespace
 	{
-		constexpr const char *kFoundation = "0.1.0";       // this add-on's version, told to the engine
+		constexpr const char *kFoundation = "0.2.0";       // this add-on's version, told to the engine
 		constexpr double kMaxPixels = 1920.0 * 1080.0;     // her picture: the game's aspect, about 1080p worth
 		constexpr double kRebase = 1500.0;                 // move the floating origin when she is this far from it
 		constexpr float kFar = 300.0f;                     // she is never far: a short depth range keeps it precise
@@ -191,8 +191,13 @@ namespace enginelink
 
 	void frame(int bw, int bh)
 	{
-		receive();
 		provider::State &ps = provider::state();
+		// a provider that reads the game's camera at presentation does it now: its camera is this frame's
+		const uint64_t cams_before = ps.cameras.count();
+		const bool called = provider::run_present_callback();
+		const bool presented_now = called && ps.cameras.count() > cams_before;
+		g_stats.present_callback = called;
+		receive();
 		const int64_t now = provider::now_ms();
 		provider::Camera newest, shown;
 		const bool have_cam = ps.cameras.get(0, newest);
@@ -250,8 +255,24 @@ namespace enginelink
 		if (av.has_vel)
 			std::snprintf(vel, sizeof(vel), ",\"vel\":[%.3f,%.3f,%.3f]", av.vel[0], av.vel[1], av.vel[2]);
 		const float scale = std::clamp(av.scale * g_size, 0.05f, 20.0f);
-		sendf("{\"t\":\"avatar\",\"id\":0,\"pos\":[%.4f,%.4f,%.4f],\"fwd\":[%.5f,%.5f,%.5f]%s%s,\"scale\":%.3f,\"params\":{\"speed\":%.3f,\"airborne\":%s}}",
-			feet[0], feet[1], feet[2], av.fwd[0], av.fwd[1], av.fwd[2], up, vel, scale, av.speed, av.airborne ? "true" : "false");
+		// which point of her pos names (a seat: her hips), and the provider's own parameters beside speed/airborne
+		char anchor[64] = "", extra[900] = "";
+		if (const std::string point = ps.anchor(); point != "feet")
+			std::snprintf(anchor, sizeof(anchor), ",\"anchor\":\"%s\"", point.c_str());
+		size_t used = 0;
+		for (const provider::Param &p : ps.take_params())
+		{
+			const int n = p.clear ? std::snprintf(extra + used, sizeof(extra) - used, ",\"%s\":null", p.name.c_str())
+								  : std::snprintf(extra + used, sizeof(extra) - used, ",\"%s\":%.5g", p.name.c_str(), double(p.value));
+			if (n <= 0 || used + size_t(n) >= sizeof(extra))
+			{
+				extra[used] = 0; // 16 names of 32 characters fit: never reached
+				break;
+			}
+			used += size_t(n);
+		}
+		sendf("{\"t\":\"avatar\",\"id\":0,\"pos\":[%.4f,%.4f,%.4f],\"fwd\":[%.5f,%.5f,%.5f]%s%s%s,\"scale\":%.3f,\"params\":{\"speed\":%.3f,\"airborne\":%s%s}}",
+			feet[0], feet[1], feet[2], av.fwd[0], av.fwd[1], av.fwd[2], up, vel, anchor, scale, av.speed, av.airborne ? "true" : "false", extra);
 
 		// the provider's animation cues (only to an engine that takes them)
 		for (const provider::Cue &c : ps.take_cues())
@@ -306,13 +327,14 @@ namespace enginelink
 			std::copy(g_origin, g_origin + 3, h.origin);
 		}
 
-		// the camera being PRESENTED: `camera_delay` provider cameras back (0 = the newest)
-		if (!ps.cameras.get(uint64_t(std::max(g_delay, 0)), shown))
+		// the camera being PRESENTED: the one the present callback just wrote, else `camera_delay` provider cameras
+		// back (0 = the newest)
+		if (!ps.cameras.get(presented_now ? 0 : uint64_t(std::max(g_delay, 0)), shown))
 			shown = newest;
 		const float tan_shown = view::tan_half_vertical(shown.fov_deg, shown.fov_horizontal != 0, shown.aspect > 0.0f ? shown.aspect : bb_aspect);
 		view::Pose host;
 		if (view::make_pose(shown.pos, shown.fwd, shown.up, tan_shown, host))
-			layer::set_host(host, shown.near_m);
+			layer::set_host(host, shown.near_m, shown.far_m);
 		// its picture, if it was sent, is waited for (briefly) instead of re-projecting an older one
 		unsigned long long want = 0;
 		{

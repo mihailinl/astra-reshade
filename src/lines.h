@@ -9,9 +9,13 @@ namespace lines
 	struct Sink
 	{
 		virtual ~Sink() = default;
+		/// far_m 0: the line had none (an infinite projection)
 		virtual void camera(unsigned long long frame, const double pos[3], const float fwd[3], const float up[3], float fov_deg, int fov_horizontal,
-			float aspect, float near_m) = 0;
+			float aspect, float near_m, float far_m) = 0;
 		virtual void avatar(const double pos[3], const float fwd[3], const float up[3], const float vel[3], float speed, int airborne, float scale) = 0;
+		virtual void anchor(const char *point) = 0;
+		/// value NaN: "null" (hand it back to her set's default)
+		virtual void param(const char *name, float value) = 0;
 		virtual void visible(int on) = 0;
 		virtual void light(const float toward[3], const float color[3], float intensity, float visible) = 0;
 		virtual void cue(const char *kind, const char *name) = 0;

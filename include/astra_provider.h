@@ -21,14 +21,18 @@
  * (Unreal: gl = (x, z, y) * 0.01 from UE's (x forward, y right, z up) centimetres.)
  *
  * PIPE PROTOCOL (\\.\pipe\astra-provider, byte mode, ASCII lines ending in '\n', fields split by spaces):
- *   C <frame> <px> <py> <pz> <fx> <fy> <fz> <ux> <uy> <uz> <fov> <v|h> <aspect> <near>   astra_provider_camera
+ *   C <frame> <px> <py> <pz> <fx> <fy> <fz> <ux> <uy> <uz> <fov> <v|h> <aspect> <near> [<far>]
+ *                                                     astra_provider_camera (with <far>: astra_provider_camera2)
  *   A <px> <py> <pz> <fx> <fy> <fz> <ux> <uy> <uz> <vx> <vy> <vz> <speed> <0|1> <scale>    astra_provider_avatar
+ *   N <point>                                                                             astra_provider_anchor
+ *   K <name> <value|null>                                                                 astra_provider_param
  *   V <0|1>                                                                               astra_provider_visible
  *   L <tx> <ty> <tz> <r> <g> <b> <intensity> <visible>                                    astra_provider_light
  *   P <state> | T <token> | R                                                             astra_provider_cue
  *   I <integration> <game name ...>                                                       astra_provider_identity
- *   M <text>                                                                              a line for astra-reshade.log
+ *   M <text>                                                                              astra_provider_log
  * A frame's lines may come in one write ("A ...\nC ...\n"); send the avatar BEFORE the camera.
+ * astra_provider_on_present has no line: a pipe cannot call back.
  */
 #ifndef ASTRA_PROVIDER_H
 #define ASTRA_PROVIDER_H
@@ -37,7 +41,10 @@
 extern "C" {
 #endif
 
-#define ASTRA_PROVIDER_VERSION 1
+/* 1: camera, avatar, visible, light, cue, identity.
+ * 2: + camera2 (the far plane), anchor, param, log, on_present. Look a version-2 function up by name: an older
+ *    add-on has none (GetProcAddress gives NULL). */
+#define ASTRA_PROVIDER_VERSION 2
 
 #ifdef ASTRA_PROVIDER_EXPORTS
 #define ASTRA_PROVIDER_API __declspec(dllexport)
@@ -58,11 +65,27 @@ ASTRA_PROVIDER_API int astra_provider_version(void);
 ASTRA_PROVIDER_API void astra_provider_camera(unsigned long long frame, const double pos[3], const float fwd[3], const float up[3],
 	float fov_deg, int fov_is_horizontal, float aspect, float near_m);
 
+/* The same with the game's far clip plane (metres) - for a game whose depth buffer (reversed Z) has one: the
+ * add-on linearises the game's depth with near AND far. far_m 0 = none (an infinite projection, as
+ * astra_provider_camera assumes). Version 2. */
+ASTRA_PROVIDER_API void astra_provider_camera2(unsigned long long frame, const double pos[3], const float fwd[3], const float up[3],
+	float fov_deg, int fov_is_horizontal, float aspect, float near_m, float far_m);
+
 /* Where she stands this frame: pos = her FEET; fwd her facing; up (may be NULL: she stays upright);
  * vel her velocity m/s (may be NULL); speed her ground speed m/s (a raw fact - her animation set decides
  * walk/run); airborne: off the ground (debounce it); scale: her size, 0 = 1. */
 ASTRA_PROVIDER_API void astra_provider_avatar(const double pos[3], const float fwd[3], const float up[3], const float vel[3], float speed,
 	int airborne, float scale);
+
+/* Which point of her `pos` names (astra_provider_avatar): "feet" (the default), or a VRM humanoid bone - "hips"
+ * with the seat point puts her pelvis on a seat. Kept until changed; NULL or "" = "feet". Version 2. */
+ASTRA_PROVIDER_API void astra_provider_anchor(const char *point);
+
+/* One more animator parameter for her animation set, beside speed and airborne: a RAW fact (a number; a bool
+ * as 1/0), never a decision - what it means is her set's call. name: [A-Za-z_][A-Za-z0-9_]*, <= 32 characters.
+ * Kept and sent with every placement until changed; a NaN value hands it back to the set's default. At most 16
+ * (more are refused). Version 2. */
+ASTRA_PROVIDER_API void astra_provider_param(const char *name, float value);
 
 /* 0: she is not shown (a menu, a loading screen, the game paused). Default 1. A provider that stops
  * sending cameras hides her too (after ~0.3 s). */
@@ -79,6 +102,17 @@ ASTRA_PROVIDER_API void astra_provider_cue(const char *kind, const char *name);
 /* Who is providing (shown to Astra's owner; optional): an integration id ("astra.unreal") and the game's
  * display name. Before the first camera, or the add-on reconnects to say it. */
 ASTRA_PROVIDER_API void astra_provider_identity(const char *integration, const char *game);
+
+/* A line for the add-on's log (astra-reshade.log, beside Astra's settings for this game): a provider's own
+ * diagnostics in the same file. Rate-limited (its first 200 lines, then every 100th). Version 2. */
+ASTRA_PROVIDER_API void astra_provider_log(const char *line);
+
+/* For a provider that reads the game's camera from memory at presentation (no hook on the game's own frame):
+ * `callback(context)` is called on the present thread at the start of every Present, before the add-on reads
+ * anything - so a camera written inside it IS the frame being presented (the add-on's camera delay does not
+ * apply to it). One provider at a time: a second registration replaces the first. NULL unregisters - do it
+ * before your module unloads. A fault inside it is contained and unregisters it. Version 2. */
+ASTRA_PROVIDER_API void astra_provider_on_present(void (*callback)(void *context), void *context);
 
 #ifdef __cplusplus
 }

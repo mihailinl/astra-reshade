@@ -16,20 +16,21 @@ namespace pipeserver
 		HANDLE g_stop = nullptr;
 		std::atomic<bool> g_serving{false}, g_connected{false};
 		std::atomic<unsigned long long> g_lines{0}, g_malformed{0}, g_clients{0};
-		unsigned g_messages = 0;
 
 		/// Each parsed line is the provider call it names.
 		struct Calls final : lines::Sink
 		{
 			void camera(unsigned long long frame, const double pos[3], const float fwd[3], const float up[3], float fov_deg, int fov_horizontal, float aspect,
-				float near_m) override
+				float near_m, float far_m) override
 			{
-				astra_provider_camera(frame, pos, fwd, up, fov_deg, fov_horizontal, aspect, near_m);
+				astra_provider_camera2(frame, pos, fwd, up, fov_deg, fov_horizontal, aspect, near_m, far_m);
 			}
 			void avatar(const double pos[3], const float fwd[3], const float up[3], const float vel[3], float speed, int airborne, float scale) override
 			{
 				astra_provider_avatar(pos, fwd, up, vel, speed, airborne, scale);
 			}
+			void anchor(const char *point) override { astra_provider_anchor(point); }
+			void param(const char *name, float value) override { astra_provider_param(name, value); }
 			void visible(int on) override { astra_provider_visible(on); }
 			void light(const float toward[3], const float color[3], float intensity, float visible) override
 			{
@@ -41,13 +42,7 @@ namespace pipeserver
 				astra_provider_identity(integration, game);
 				logf("provider: %s, %s", integration, game);
 			}
-			void message(const char *text) override
-			{
-				// a provider's own log lines (its first 200, then every 100th: never a flood)
-				if (g_messages < 200 || g_messages % 100 == 0)
-					logf("provider says: %s", text);
-				++g_messages;
-			}
+			void message(const char *text) override { astra_provider_log(text); }
 		};
 
 		/// Waits for an overlapped operation or the stop event. False: stopped or failed.

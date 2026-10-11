@@ -78,15 +78,15 @@ namespace lines
 		{
 		case 'C':
 		{
-			// C <frame> <px> <py> <pz> <fx> <fy> <fz> <ux> <uy> <uz> <fov> <v|h> <aspect> <near>
-			if (f.n != 15)
+			// C <frame> <px> <py> <pz> <fx> <fy> <fz> <ux> <uy> <uz> <fov> <v|h> <aspect> <near> [<far>]
+			if (f.n != 15 && f.n != 16)
 				return false;
 			char *end = nullptr;
 			const unsigned long long frame = std::strtoull(f.f[1], &end, 10);
 			if (end == f.f[1] || *end != 0)
 				return false;
-			double v[9], tail[2];
-			if (!nums(f, 2, 9, v) || !nums(f, 13, 2, tail))
+			double v[9], tail[3] = {0, 0, 0};
+			if (!nums(f, 2, 9, v) || !nums(f, 13, f.n - 13, tail))
 				return false;
 			double fov;
 			if (!num(f.f[11], fov))
@@ -97,7 +97,7 @@ namespace lines
 			float fwd[3], up[3];
 			to_float(v + 3, fwd, 3);
 			to_float(v + 6, up, 3);
-			sink.camera(frame, v, fwd, up, float(fov), axis[0] == 'h', float(tail[0]), float(tail[1]));
+			sink.camera(frame, v, fwd, up, float(fov), axis[0] == 'h', float(tail[0]), float(tail[1]), float(tail[2]));
 			return true;
 		}
 		case 'A':
@@ -113,6 +113,25 @@ namespace lines
 			to_float(v + 6, up, 3);
 			to_float(v + 9, vel, 3);
 			sink.avatar(v, fwd, up, vel, float(v[12]), v[13] != 0.0, float(v[14]));
+			return true;
+		}
+		case 'N':
+			// N <point>
+			if (f.n != 2)
+				return false;
+			sink.anchor(f.f[1]);
+			return true;
+		case 'K':
+		{
+			// K <name> <value|null>
+			double v;
+			if (f.n != 3)
+				return false;
+			if (std::strcmp(f.f[2], "null") == 0)
+				v = std::nan("");
+			else if (!num(f.f[2], v))
+				return false;
+			sink.param(f.f[1], float(v));
 			return true;
 		}
 		case 'V':
