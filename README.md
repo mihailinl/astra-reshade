@@ -1,6 +1,6 @@
 # astra-reshade
 
-> **Experimental — phase 1.** First run in a game on 2026-10-14: Scarlet Skips (UE 5.6) under Proton, Astra in the game with its depth, glued on camera cuts, hidden on pause — what was seen and what it took is in [docs/LIVE-TEST.md](docs/LIVE-TEST.md).
+> **Experimental — phase 2.** First run in a game on 2026-10-14: Scarlet Skips (UE 5.6) under Proton, Astra in the game with its depth, glued on camera cuts, hidden on pause; then drawn before the game's tonemapper (its grade, bloom and UI over her), standing on the ground under her, lit by the game's sun — what was seen and what it took is in [docs/LIVE-TEST.md](docs/LIVE-TEST.md).
 
 
 Astra, the Astra companion's 3D avatar, inside **any D3D11/D3D12 game ReShade
@@ -21,7 +21,16 @@ the game's process (Proton or Windows)                       Astra avatar engine
                         <──────────────────────────────────    hello (where its frames are)
              layer.cpp  <── shared memory "MCPT" ───────────   her picture + linear depth (her rectangle only)
   AstraPassthrough.fx   re-projects her picture onto the presented camera, depth-tests it against the game
+  pretone.cpp           ...right before the game's tonemapper, into its HDR scene colour (else at Present)
 ```
+
+**Before the tonemapper.** ReShade runs effects at Present, over the game's UI and past its tone curve.
+`src/pretone.cpp` finds the game's tonemapper in its Direct3D 12 command stream - a full-screen draw into an 8/10-bit
+target of the presented size that reads an HDR texture of that size (`src/passfind.h`; what a draw reads comes from
+the descriptors the game copied for it) - and runs the effects there, into a copy of that scene colour, copied back,
+the game's state put back after. Her 8-bit picture is mapped into the scene's light by an inverted filmic curve
+(`src/tone.h`; `[tone] Exposure` in the `-AstraConfig` ini, the overlay's "her exposure"). Not found, HDR output,
+another API or `[tone] Path=present`: at Present as before; the log and the overlay say which.
 
 ## What is in here
 
@@ -52,6 +61,9 @@ tools/package-unreal.sh                                   # -> build/astra-gi.zi
 
 `build.sh` needs `clang-cl`, `lld-link` and the MSVC CRT + Windows SDK from [xwin](https://github.com/Jake-Shadle/xwin)
 in `~/.xwin` (or `XWIN=`).
+
+AstraUE (the Unreal provider) also traces the ground under her (`LineTraceSingle` down, 4-20 times a second) and
+reads the game's sun (its main `DirectionalLightComponent`), sent as `astra_provider_light`.
 
 ## The provider API
 

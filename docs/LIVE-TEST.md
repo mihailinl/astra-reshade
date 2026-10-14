@@ -111,7 +111,7 @@ driver `tools/ue-test-driver/` (AstraUETest, a UE4SS mod reading commands from a
 
 Expected in phase 1, not bugs: she floats on stairs and slopes (no ground traces yet), she is drawn OVER the
 game's HUD and menus (the "before the UI" hook is the next phase), no shadow on the ground (the game's sun is not
-read yet), the light match is approximate. HDR output must be off.
+read yet), the light match is approximate. HDR output must be off. Phase 2 (below) does the first three.
 
 Without Astra's daemon, a standalone engine works too: `WGPU_PROTO_WINDOW=bridge astra-avatar-engine` (its
 `BRIDGE.md`).
@@ -133,9 +133,50 @@ Without Astra's daemon, a standalone engine works too: `WGPU_PROTO_WINDOW=bridge
 3. **She stayed out in the pause menu**: AstraUE asked `PlayerController:IsPaused()`, plain C++ that UE4SS cannot call
    (`attempt to call a TrivialObject value`, swallowed by a `pcall`). It reads `GameplayStatics:IsGamePaused` now.
 
-Open: a launch from the Steam client did not reach the game's exe on this machine (a session opens, Proton starts,
-no exe, no log) - also before any of these files were installed; a direct Proton launch of either exe works. Not
-looked into further (it needs the Steam window, the screen was locked).
+A launch from the Steam client did not reach the game's exe on this machine: explained in *Phase 2* below (a
+pending update of the compatibility tool, then a Steam dialog waiting for a click).
+
+### Phase 2 (2026-10-14 night, same game, headless gamescope while the screen was locked)
+
+Launched with `gamescope --backend headless -W 1920 -H 1080 -- <SLR4 entry point> proton waitforexitandrun <exe>`
+(screenshots `GAMESCOPE_WAYLAND_DISPLAY=gamescope-0 gamescopectl screenshot <file>`), the owner's test-build Astra
+linked as in step 3.
+
+1. **She is drawn before the game's tonemapper.** `astra-reshade.log`:
+   `pretone: the game's tonemapper found: it reads a 1920x1080 scene colour (format 26); she is drawn into it, before
+   the game's tone curve, grade, bloom and UI`, then every 30 s `pretone: last 30 s: 1317 frames drawn before the
+   tonemapper, 0 at presentation`. The menu's **Play** button is drawn over her and the game's grade/bloom soften her
+   like the grass (phase 1: she was pasted over the button). In Scarlet Skips (UE 5.6) the tonemapper is a 3-vertex
+   draw into the back buffer (R10G10B10A2) plus a second target, reading the post-TSR scene colour (R11G11B10F), bloom
+   at half size and a 60x34 exposure texture. Where it is not found the log says `no tonemapper pass found in 30 s:
+   she is drawn at presentation (over the game's UI)`; HDR output says so too. To see what a game's post-processing
+   looks like: `ASTRA_PRETONE_TRACE=600` (frame number) logs every candidate pass of frames 600-603.
+   Her brightness in the game's light: overlay `her exposure in the game's light` (`[tone] Exposure` in the
+   `-AstraConfig` ini, or `ASTRA_TONE_EXPOSURE`); `[tone] Path=present` (`ASTRA_TONE_PATH=present`) forces the old path.
+   `timing: last 30 s, 70 of 1373 frames got a newer game camera between her pass and Present` - her pass runs ~1 ms
+   before Present; whether that ever shows as a frame of slip on fast turns is the morning's visual check.
+2. **She stands on the ground under her**: `[AstraUE] frame ... player -1600 580 0  her -1314 515 45  ground 45 (325
+   traces, 0 missed)  0.294 ms/frame` - 45 cm up the hill where the player stands at 0; her legs show to her feet where
+   phase 1 had them under the crest. About 4 traces a second standing, up to 20 walking.
+3. **The game's sun**: `[AstraUE] the game's sun: DirectionalLightComponent
+   /Game/Maps/L_ScarletJump.L_ScarletJump:PersistentLevel.DirectionalLight_0.LightComponent0 (1 directional lights)`,
+   sent ~5 times a second as the provider's light (direction, linear colour, in sun or not by a trace toward it); her
+   engine lights her with it and the add-on casts her shadow from the engine's sun view. A shadow shape appears on the
+   grass beside her in sun (`shots2/h03-sunlit.png`) - whether it is hers and where it should fall is a morning check.
+
+**Why the Steam client launches did not reach the game** (`~/.local/share/Steam/logs/console_log.txt`,
+`content_log.txt`), neither caused by UE4SS or ReShade:
+- 23:25 `LaunchApp changed task to DownloadingDepots`: Steam turned the launch into an update - the game's shader
+  depot and its compatibility tool's runtime (Steam Linux Runtime 4, app 4183110: `Update Required`) - and released
+  the session 2 s later. No process.
+- 00:17 `LaunchApp waiting for user response to ShowInterstitials`: Steam showed a dialog that needs a click (on a
+  locked screen nobody answers). It sat there for an hour; at 01:18:47 it `continues with user response`, went on to
+  `CreatingProcess` and failed with `AppError_16` because a directly launched copy of the game was already running.
+So Astra's launcher must, before `steam://rungameid/<app>`: check that the game AND its compatibility tool are fully
+installed (`appmanifest_<app>.acf` `StateFlags` 4, no update queued - the tool's appmanifest too); tell the user
+when Steam may show a dialog (watch `console_log.txt` for `waiting for user response to <task>` and bring Steam's
+window forward); and never launch while the game already runs (`AppError_16`). Which dialog it was is the morning's
+check: launch from Steam with the screen unlocked.
 
 ### Remove
 
