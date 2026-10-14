@@ -54,6 +54,12 @@ sampler sAstraOccluder { Texture = ASTRA_OCCLUDER_TEX; MinFilter = POINT; MagFil
 uniform bool AstraOccluderActive = false; // set by the integration: the other compositor wrote it this frame
 #endif
 
+// Loop counts the shader compiler must not see. Under Proton, ReShade compiles with Wine's d3dcompiler_47 (vkd3d-shader)
+// unless the game ships Microsoft's (most Unreal games ship none): it refuses the [fastopt] ReShade writes for [loop],
+// and it unrolls every loop it can count - minutes for the march below. A count read from a uniform keeps each a real
+// loop on every compiler (tools/winecheck.sh compiles this effect with Wine's).
+uniform int3 AstraLoops < hidden = true; > = int3(24, 7, 3); // march steps, halvings, settling steps
+
 // set by the add-on
 uniform bool AstraActive = false;
 // near, far, flags (1: [0,1] depth, 2: rows bottom-up, 4: reversed Z, 8: depth is linear metres along the view axis)
@@ -170,9 +176,9 @@ bool reproject(float2 uv, float zFar, out float2 suv, out float zs)
 		return zs < 1e8 && zs < zFar + 0.05;
 	}
 	float zprev = zNear;
-	[loop] for (int i = 0; i < 24; ++i)
+	for (int i = 0; i < AstraLoops.x; ++i)
 	{
-		const float z = zNear * pow(zFar / zNear, i / 23.0);
+		const float z = zNear * pow(zFar / zNear, i / (AstraLoops.x - 1.0));
 		const float3 pm = warp_point(ray * z);
 		if (pm.z > -1e-3)
 			continue;
@@ -187,7 +193,7 @@ bool reproject(float2 uv, float zFar, out float2 suv, out float zs)
 		}
 		// the step went from in front of her to behind: find where (halving), then is it her surface or a gap behind?
 		float lo = zprev, hi = z;
-		[loop] for (int b = 0; b < 7; ++b)
+		for (int b = 0; b < AstraLoops.y; ++b)
 		{
 			const float mid = 0.5 * (lo + hi);
 			const float3 mb = warp_point(ray * mid);
@@ -215,7 +221,7 @@ bool reproject(float2 uv, float zFar, out float2 suv, out float zs)
 			const float3 mh = warp_point(ray * hi);
 			ndc = mh.xy / -mh.z / scale;
 		}
-		[loop] for (int k = 0; k < 3; ++k)
+		for (int k = 0; k < AstraLoops.z; ++k)
 		{
 			const float3 mk = warp_point(ray * zg);
 			if (mk.z > -1e-3)
@@ -335,13 +341,15 @@ void PS_FogCells(float4 pos : SV_Position, float2 uv : TEXCOORD, out float outSi
 float4 PS_FogParams(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
 	float sum = 0.0, n = 0.0;
-	[loop] for (int by = 0; by < FOG_H / 6; ++by)
-		[loop] for (int bx = 0; bx < FOG_W / 8; ++bx)
+	// 8 x 6 blocks of 8 x 6 cells; the sizes come from the texture, so no compiler unrolls these (see AstraLoops)
+	const int2 cells = tex2Dsize(sFogSigma), block = cells / int2(FOG_W / 8, FOG_H / 6);
+	for (int by = 0; by < cells.y; by += block.y)
+		for (int bx = 0; bx < cells.x; bx += block.x)
 		{
 			float m = 1e4;
-			[loop] for (int y = 0; y < 6; ++y)
-				[loop] for (int x = 0; x < 8; ++x)
-					m = min(m, tex2Dfetch(sFogSigma, int2(bx * 8 + x, by * 6 + y)).r);
+			for (int y = 0; y < block.y; ++y)
+				for (int x = 0; x < block.x; ++x)
+					m = min(m, tex2Dfetch(sFogSigma, int2(bx + x, by + y)).r);
 			if (m < 1e3)
 			{
 				sum += m;

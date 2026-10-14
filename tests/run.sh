@@ -3,7 +3,9 @@
 #   1. the add-on's portable core (line protocol, provider state, camera math, frame ring) - native C++;
 #   2. the AstraUE Lua mod's maths and its pipe lines, against a stub of UE4SS - plain Lua 5.4;
 #   3. AstraPassthrough.fx through ReShade's own FX compiler front end (tools/fxcheck.sh), alone and with every game
-#      hook (AstraGame.fxh) defined.
+#      hook (AstraGame.fxh) defined;
+#   4. the HLSL ReShade makes of it through Wine's d3dcompiler_47 - what it compiles with under Proton when the game
+#      ships none (tools/winecheck.sh; skipped without wine or the xwin SDK).
 set -e
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 OUT="$HERE/build/tests"
@@ -25,3 +27,4 @@ $CXX -std=c++20 -O1 -Wall -Wextra -pthread -I"$HERE/src" "$HERE/tests/core_tests
 mkdir -p "$OUT/hooks"
 cp "$HERE/shaders/AstraPassthrough.fx" "$HERE/tests/hooks/AstraGame.fxh" "$OUT/hooks/"
 "$HERE/tools/fxcheck.sh" "$OUT/hooks/AstraPassthrough.fx"
+"$HERE/tools/winecheck.sh" "$HERE"/shaders/*.fx "$OUT/hooks/AstraPassthrough.fx"
