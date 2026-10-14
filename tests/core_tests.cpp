@@ -1,13 +1,19 @@
 // Native tests of the add-on's portable core: the pipe's line protocol, the provider's seqlocked state, the
 // camera math and the frame-ring reader (crop included). Run: tests/run.sh (any Linux/macOS clang++ or g++).
 #include "lines.h"
+#include "passfind.h"
 #include "provider_core.h"
 #include "ring.h"
+#include "tone.h"
 #include "view.h"
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <regex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -199,7 +205,9 @@ static void test_provider()
 		}
 	});
 	int torn = 0, reads = 0;
-	for (int i = 0; i < 200000; ++i)
+	// 200000 tries, and on until one read lands (a loaded machine can starve the reader that long)
+	const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	for (int i = 0; i < 200000 || (reads == 0 && std::chrono::steady_clock::now() < until); ++i)
 	{
 		Pair p;
 		if (v.read(p))
@@ -495,12 +503,193 @@ static void test_lua_lines(const char *path)
 	std::printf("AstraUE's lines: %zu calls, %d malformed\n", r.calls.size(), bad);
 }
 
+
+// ---- passfind: the tonemapper among a game's draws -------------------------------------------------------------
+
+namespace
+{
+	constexpr uint32_t kOutW = 1920, kOutH = 1080;
+	constexpr uint32_t kRGBA16F = 10, kR11G11B10F = 26, kRGB10A2 = 24, kBGRA8 = 90, kRGBA8 = 27, kR16F = 54, kRG16 = 35, kBC3 = 76, kR32F = 41;
+
+	passfind::Tex tex(uint64_t id, uint32_t w, uint32_t h, uint32_t dxgi, bool written = false)
+	{
+		return passfind::Tex{id, w, h, passfind::kind_of(dxgi), written};
+	}
+
+	/// A draw as recorded: its targets, its viewport, its vertices and what it reads.
+	struct Draw
+	{
+		passfind::Tracker t;
+		uint32_t vertices = 3, instances = 1;
+		std::vector<passfind::Tex> reads;
+		Draw(const passfind::Tex &target, uint32_t targets = 1)
+		{
+			t.targets(targets, target);
+			t.viewport(float(target.w), float(target.h));
+		}
+		/// The scene colour it reads, if it is the tonemapper (id 0: it is not).
+		uint64_t scene(uint32_t out_w = kOutW, uint32_t out_h = kOutH, bool *ambiguous = nullptr) const
+		{
+			if (!passfind::tonemapper_shape(t, vertices, instances, out_w, out_h))
+				return 0;
+			return passfind::scene_read(t, reads.data(), reads.size(), ambiguous).id;
+		}
+	};
+}
+
+static void test_passfind()
+{
+	CHECK(passfind::kind_of(kRGBA16F) == passfind::Kind::hdr && passfind::kind_of(kR11G11B10F) == passfind::Kind::hdr);
+	CHECK(passfind::kind_of(9) == passfind::Kind::hdr && passfind::typed_hdr(9) == kRGBA16F && passfind::typed_hdr(kR11G11B10F) == kR11G11B10F);
+	CHECK(passfind::kind_of(kRGB10A2) == passfind::Kind::ldr && passfind::kind_of(kBGRA8) == passfind::Kind::ldr && passfind::kind_of(29) == passfind::Kind::ldr);
+	CHECK(passfind::kind_of(40) == passfind::Kind::other && passfind::kind_of(kRG16) == passfind::Kind::other && passfind::kind_of(kBC3) == passfind::Kind::other);
+
+	// Recorded in Scarlet Skips (Unreal 5.6, D3D12, 2026-10-14): the frame's draws into targets of the presented size.
+	const passfind::Tex backbuffer = tex(10, 1920, 1080, kRGB10A2), scene = tex(1, 1920, 1080, kR11G11B10F), bloom = tex(2, 960, 540, kR11G11B10F),
+						exposure = tex(3, 60, 34, kR16F), white = tex(4, 1, 1, kRGBA8);
+	// the tonemapper: three vertices into the back buffer (and a second target), reading the scene colour, bloom,
+	// a 60x34 exposure texture and a 1x1 one
+	{
+		Draw d(backbuffer, 2);
+		d.reads = {white, exposure, bloom, scene};
+		bool ambiguous = true;
+		CHECK(d.scene(kOutW, kOutH, &ambiguous) == scene.id && !ambiguous);
+	}
+	// a G-buffer pass of the same shape (three vertices into an 8-bit target) reads no HDR picture: not it
+	{
+		Draw d(tex(11, 1920, 1080, kBGRA8));
+		d.reads = {tex(12, 1920, 1080, kRG16)};
+		CHECK(d.scene() == 0);
+	}
+	// Slate's UI quads over it: six vertices into the back buffer, reading UI textures (and a 1280x720 image)
+	{
+		Draw a(backbuffer), b(backbuffer);
+		a.vertices = b.vertices = 6;
+		a.reads = {white};
+		b.reads = {tex(13, 1280, 720, kBC3)};
+		CHECK(a.scene() == 0 && b.scene() == 0);
+	}
+	// the deferred lighting into the HDR scene colour itself, and bloom at half size: not 8/10-bit targets
+	{
+		Draw a(scene), b(tex(14, 960, 540, kR11G11B10F));
+		a.reads = {tex(15, 1920, 1080, kBGRA8), tex(16, 1920, 1080, kRGB10A2)};
+		b.reads = {bloom};
+		CHECK(a.scene() == 0 && b.scene() == 0);
+	}
+	// a mesh, instancing, a viewport inside a larger target: not full-screen
+	{
+		Draw a(backbuffer), b(backbuffer), c(backbuffer);
+		a.vertices = 36;
+		b.instances = 2;
+		c.t.viewport(1280, 720);
+		a.reads = b.reads = c.reads = {scene};
+		CHECK(a.scene() == 0 && b.scene() == 0 && c.scene() == 0);
+	}
+	// a scene capture (a mirror, a minimap) tonemapped into a small target is not the presented picture
+	{
+		Draw d(tex(17, 512, 512, kBGRA8));
+		d.reads = {tex(18, 512, 512, kRGBA16F)};
+		CHECK(d.scene() == 0);
+	}
+	// a game that tonemaps at its render resolution (same aspect, at least half size) and upscales after; not another aspect
+	{
+		Draw a(tex(19, 1280, 720, kBGRA8)), b(tex(20, 1280, 1024, kBGRA8));
+		a.reads = {tex(21, 1280, 720, kRGBA16F)};
+		b.reads = {tex(22, 1280, 1024, kRGBA16F)};
+		CHECK(a.scene() == 21 && b.scene() == 0);
+	}
+	// an HDR picture of another size, or one bound for writing, is not its input; two of them are flagged
+	{
+		Draw a(backbuffer), b(backbuffer), c(backbuffer);
+		a.reads = {tex(23, 1280, 720, kRGBA16F)};
+		b.reads = {tex(24, 1920, 1080, kRGBA16F, true)};
+		c.reads = {scene, tex(25, 1920, 1080, kRGBA16F)};
+		bool ambiguous = false;
+		CHECK(a.scene() == 0 && b.scene() == 0 && c.scene(kOutW, kOutH, &ambiguous) == scene.id && ambiguous);
+	}
+	// inside an API render pass nothing can be copied; with no Present seen yet nothing is known
+	{
+		Draw a(backbuffer), b(backbuffer);
+		a.t.in_pass = true;
+		a.reads = b.reads = {scene};
+		CHECK(a.scene() == 0 && b.scene(0, 0) == 0);
+	}
+	// a compute tonemapper writes ONE 8/10-bit picture of the presented size from an HDR one; Unreal's compute passes
+	// recorded beside it in Scarlet Skips do not qualify (TSR writes several, lighting writes HDR, a pass writing an
+	// 8-bit picture and a float one is not a tonemapper)
+	{
+		const passfind::Tex cs[] = {white, bloom, scene, tex(30, 1920, 1080, kRGBA8, true)};
+		const passfind::Tex tsr[] = {tex(31, 1920, 1080, kRGBA8), tex(32, 1920, 1080, kRGBA16F), scene, tex(33, 1920, 1080, kR11G11B10F, true),
+			tex(34, 1920, 1080, kRGBA8, true), tex(35, 1920, 1080, kRGBA8, true)};
+		const passfind::Tex light[] = {tex(36, 1920, 1080, kBGRA8), tex(37, 1920, 1080, kRGB10A2), tex(38, 1920, 1080, kR11G11B10F, true)};
+		const passfind::Tex two[] = {tex(39, 1920, 1080, kBGRA8), tex(40, 1920, 1080, kRGB10A2, true), tex(41, 1920, 1080, kR32F, true), scene};
+		CHECK(passfind::compute_scene(cs, 4, kOutW, kOutH).id == scene.id);
+		CHECK(passfind::compute_scene(tsr, 6, kOutW, kOutH).id == 0 && passfind::compute_scene(light, 3, kOutW, kOutH).id == 0);
+		CHECK(passfind::compute_scene(two, 4, kOutW, kOutH).id == 0);
+	}
+}
+
+// ---- tone: her picture into the scene's light -----------------------------------------------------------------
+
+static void test_tone()
+{
+	// the fit and its inverse are each other's inverse over her range, monotonic, 0 at 0
+	CHECK(tone::fit(0.0f) == 0.0f && tone::fit_inverse(0.0f) == 0.0f);
+	float prev = -1.0f;
+	bool monotonic = true, round = true;
+	for (int i = 0; i <= 98; ++i)
+	{
+		const float y = float(i) / 100.0f;
+		const float x = tone::fit_inverse(y);
+		monotonic = monotonic && x > prev;
+		prev = x;
+		round = round && near(tone::fit(x), y, 1e-4);
+	}
+	CHECK(monotonic && round);
+	// a shown colour into the scene and back is itself, at any exposure (light and fog are measured that way)
+	bool back = true;
+	for (float e : {0.5f, 1.0f, 2.0f})
+		for (int i = 0; i <= 95; ++i)
+		{
+			const float d = float(i) / 100.0f;
+			back = back && near(tone::scene_to_display(tone::display_to_scene(d, e), e), d, 2e-3);
+		}
+	CHECK(back);
+	// exposure scales her in the scene linearly; her whitest white stays finite (the fit's asymptote is cut at kTop)
+	CHECK(near(tone::display_to_scene(0.6f, 2.0f), 2.0f * tone::display_to_scene(0.6f, 1.0f), 1e-5));
+	const float white = tone::display_to_scene(1.0f, 1.0f);
+	CHECK(std::isfinite(white) && white > 2.0f && white < 50.0f);
+	// mid grey (sRGB 0.46, linear 0.18) lands near the scene's mid grey: she is not lit like another world
+	const float grey = tone::display_to_scene(0.46f, 1.0f);
+	CHECK(grey > 0.1f && grey < 0.6f);
+}
+
+/// AstraPassthrough.fx carries tone.h's curve in HLSL: the same constants, or her colours drift between the two.
+static void test_tone_constants_in_effect()
+{
+	std::ifstream f(ASTRA_FX);
+	CHECK(f.good());
+	std::stringstream ss;
+	ss << f.rdbuf();
+	const std::string fx = ss.str();
+	const auto constant = [&](const char *name) {
+		const std::regex re(std::string("static const float ") + name + R"(\s*=\s*([0-9.]+)\s*;)");
+		std::smatch m;
+		return std::regex_search(fx, m, re) ? std::stof(m[1].str()) : -1.0f;
+	};
+	CHECK(constant("ToneA") == tone::kA && constant("ToneB") == tone::kB && constant("ToneC") == tone::kC);
+	CHECK(constant("ToneD") == tone::kD && constant("ToneE") == tone::kE && constant("TonePre") == tone::kPre && constant("ToneTop") == tone::kTop);
+}
+
 int main(int argc, char **argv)
 {
 	test_lines();
 	test_provider();
 	test_view();
 	test_ring();
+	test_passfind();
+	test_tone();
+	test_tone_constants_in_effect();
 	if (argc > 1)
 		test_lua_lines(argv[1]);
 	std::printf("%d checks, %d failed\n", g_checks, g_failed);

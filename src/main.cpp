@@ -6,6 +6,7 @@
 //   pipe.cpp      the same API over \\.\pipe\astra-provider, for mods that cannot call native code
 //   link.cpp      the Astra avatar engine's game bridge: her placement and the camera out, her pictures back
 //   layer.cpp     her pictures into AstraPassthrough.fx: re-projected onto the presented camera, depth-tested
+//   pretone.cpp   the effects drawn before the game's tonemapper (its grade and UI over her), else at Present
 // Shared with Minecraft in Death Stranding (extern/minecraft-in-death-stranding, MIT): the WebSocket client (ws)
 // and fault containment (guard).
 #define ImTextureID ImU64
@@ -17,11 +18,14 @@
 #include "link.h"
 #include "log.h"
 #include "pipe.h"
+#include "pretone.h"
 #include "provider.h"
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <mutex>
 
 using namespace reshade::api;
 
@@ -37,6 +41,8 @@ namespace
 	uint32_t g_bbWidth = 0, g_bbHeight = 0;
 	bool g_started = false;
 	device *g_presenter = nullptr; // the device whose swap chain started the threads
+	std::mutex g_frameLock;
+	bool g_frameBegun = false; // the engine link's frame ran for the frame being drawn (at its tonemapper)
 
 	void load_overlay_settings()
 	{
@@ -52,6 +58,11 @@ namespace
 		bool on = enginelink::enabled();
 		reshade::get_config_value(nullptr, "ASTRA", "Enabled", on);
 		enginelink::enabled() = on;
+		// [tone] of the -AstraConfig ini (the launcher's, per game) first; ReShade.ini's overlay value over it
+		float exposure = g_settings.tone_exposure;
+		reshade::get_config_value(nullptr, "ASTRA", "ToneExposure", exposure);
+		layer::tone_exposure() = std::clamp(exposure, 0.1f, 8.0f);
+		pretone::path() = g_settings.tone_present ? 1 : 0;
 	}
 
 	void save_overlay_settings()
@@ -60,6 +71,18 @@ namespace
 		reshade::set_config_value(nullptr, "ASTRA", "WaitMs", layer::wait_ms());
 		reshade::set_config_value(nullptr, "ASTRA", "Size", enginelink::size());
 		reshade::set_config_value(nullptr, "ASTRA", "Enabled", enginelink::enabled());
+		reshade::set_config_value(nullptr, "ASTRA", "ToneExposure", layer::tone_exposure());
+	}
+
+	/// The engine link's frame - her placement and the newest camera out, the presented camera to the compositor -
+	/// once per frame: at the game's tonemapper when her pass is drawn there (pretone.cpp), else at Present.
+	void begin_frame()
+	{
+		std::lock_guard<std::mutex> lock(g_frameLock);
+		if (g_frameBegun)
+			return;
+		g_frameBegun = true;
+		enginelink::frame(int(g_bbWidth), int(g_bbHeight));
 	}
 
 	/// At the start of Present, before ReShade renders its effects: her placement and the newest camera go to
@@ -85,7 +108,12 @@ namespace
 				g_bbHeight = d.texture.height;
 			}
 		}
-		enginelink::frame(int(g_bbWidth), int(g_bbHeight));
+		begin_frame(); // nothing if it ran at this frame's tonemapper
+		{
+			std::lock_guard<std::mutex> lock(g_frameLock);
+			g_frameBegun = false; // the next frame's tonemapper begins the next one
+		}
+		pretone::presented(swap, g_bbWidth, g_bbHeight);
 	}
 
 	/// The threads stop with the device they started for - here, not in DllMain: ReShade unloads its add-ons right
@@ -116,6 +144,7 @@ namespace
 			ls.provider_visible ? "" : " (hidden by the game)", ls.camera_age_ms, ps.connected ? "connected" : (ps.serving ? "waiting" : "not serving"), ps.lines,
 			ps.malformed, provider::refused() ? "  REFUSED values" : "");
 		ImGui::TextDisabled("%s", layer::status());
+		ImGui::TextDisabled("%s", pretone::status());
 		bool changed = false;
 		changed |= ImGui::Checkbox("Show Astra", &enginelink::enabled());
 		ImGui::SameLine();
@@ -136,6 +165,11 @@ namespace
 		changed |= ImGui::SliderFloat("wait for her picture", &layer::wait_ms(), 0.0f, 12.0f, "%.1f ms");
 		ImGui::SameLine();
 		ImGui::TextDisabled("(late %llu times)", layer::wait_timeouts());
+		ImGui::SetNextItemWidth(140);
+		changed |= ImGui::SliderFloat("her exposure in the game's light", &layer::tone_exposure(), 0.25f, 4.0f, "x%.2f", ImGuiSliderFlags_Logarithmic);
+		if (ImGui::IsItemHovered())
+			ImGui::SetTooltip("Drawn before the game's tonemapper, she goes through its tone curve: if she looks too dark or too bright\n"
+							  "against the world in good light, move this ([tone] Exposure).");
 		if (changed)
 			save_overlay_settings();
 		if (guard::contained() > 0)
@@ -147,6 +181,8 @@ void logf(const char *fmt, ...)
 {
 	if (g_log == nullptr)
 		return;
+	static std::mutex lock; // whole lines: the command-stream events come from the game's recording threads
+	std::lock_guard<std::mutex> hold(lock);
 	SYSTEMTIME t;
 	GetLocalTime(&t);
 	std::fprintf(g_log, "%02d:%02d:%02d.%03d f%llu ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, (unsigned long long)g_frame);
@@ -167,11 +203,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 			return FALSE;
 		g_settings = config::load();
 		_wfopen_s(&g_log, g_settings.log_path.c_str(), L"a");
-		logf("---- Astra (astra-reshade) loaded; settings from %ls; engine port %d%s", g_settings.source.c_str(), g_settings.port,
-			g_settings.token.empty() ? "" : ", token set");
+		logf("---- Astra (astra-reshade) loaded; settings from %ls; engine port %d%s; tone: exposure %.2f, %s", g_settings.source.c_str(),
+			g_settings.port, g_settings.token.empty() ? "" : ", token set", g_settings.tone_exposure,
+			g_settings.tone_present ? "at presentation" : "before the tonemapper when found");
 		guard::install();
 		load_overlay_settings();
 		layer::install();
+		pretone::install(begin_frame);
 		reshade::register_event<reshade::addon_event::present>(on_present);
 		reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
 		reshade::register_overlay("Astra", on_overlay);

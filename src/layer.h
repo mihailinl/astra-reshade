@@ -10,6 +10,15 @@ namespace layer
 	void install();
 	/// Composite her this frame (the engine is linked, a provider is live and she is shown).
 	void set_active(bool active);
+	bool active();
+	/// The effects about to run draw into the game's HDR scene colour, before its tonemapper (pretone.cpp): her
+	/// picture is mapped into the scene's light (tone.h), the game's own grade applies to her after.
+	void set_hdr_pass(bool hdr);
+	/// [tone] Exposure: her brightness in the game's scene, before its tone curve (1: as her engine drew her).
+	float &tone_exposure();
+	/// How many times the effects began (ReShade's begin-effects event): tells a caller of render_effects whether
+	/// they ran (not while they compile for a new target, nor twice in a frame).
+	unsigned long long effect_runs();
 	/// Where the engine says its frames are ("/dev/shm/astra-frame" or "Local\\AstraFrame"): mapped again at
 	/// every hello (a restarted engine's ring is a new file). Present thread only.
 	void set_frames_at(const char *where);

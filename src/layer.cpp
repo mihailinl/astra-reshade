@@ -29,7 +29,9 @@ namespace layer
 			resource_view srv = {0};
 		};
 
-		std::atomic<bool> g_active{false};
+		std::atomic<bool> g_active{false}, g_hdrPass{false};
+		std::atomic<unsigned long long> g_effectRuns{0};
+		float g_toneExposure = 1.0f;
 		std::mutex g_lock; // host pose, shadow strength (written by the link on the present thread; the effects may run elsewhere)
 		view::Pose g_host;
 		float g_hostNear = 0.1f, g_hostFar = 0.0f;
@@ -271,6 +273,11 @@ namespace layer
 
 		void on_begin_effects(effect_runtime *runtime, command_list *, resource_view, resource_view)
 		{
+			++g_effectRuns;
+			// into the game's HDR scene colour (before its tonemapper), or onto the presented picture
+			set_bool(runtime, "AstraHdr", g_hdrPass);
+			if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "ToneExposure"); v.handle != 0)
+				runtime->set_uniform_value_float(v, g_toneExposure);
 			bool on = g_active && open_mapping();
 			if (on)
 			{
@@ -359,6 +366,26 @@ namespace layer
 	void set_active(bool active)
 	{
 		g_active = active;
+	}
+
+	bool active()
+	{
+		return g_active;
+	}
+
+	void set_hdr_pass(bool hdr)
+	{
+		g_hdrPass = hdr;
+	}
+
+	float &tone_exposure()
+	{
+		return g_toneExposure;
+	}
+
+	unsigned long long effect_runs()
+	{
+		return g_effectRuns;
 	}
 
 	void set_frames_at(const char *where)

@@ -65,6 +65,15 @@ namespace config
 			s.token = clean_token(token);
 			s.log_path = dir_of(ini) + L"astra-reshade.log";
 			s.source = ini;
+			wchar_t v[64] = L"";
+			if (GetPrivateProfileStringW(L"tone", L"Exposure", L"", v, 64, ini.c_str()) > 0)
+			{
+				const float e = std::wcstof(v, nullptr);
+				if (e > 0.0f && e < 100.0f)
+					s.tone_exposure = e;
+			}
+			GetPrivateProfileStringW(L"tone", L"Path", L"auto", v, 64, ini.c_str());
+			s.tone_present = _wcsicmp(v, L"present") == 0;
 		}
 		else
 		{
@@ -80,6 +89,14 @@ namespace config
 				s.token = clean_token(v);
 				s.source = L"environment";
 			}
+			if (GetEnvironmentVariableW(L"ASTRA_TONE_EXPOSURE", v, 300) > 0)
+			{
+				const float e = std::wcstof(v, nullptr);
+				if (e > 0.0f && e < 100.0f)
+					s.tone_exposure = e;
+			}
+			if (GetEnvironmentVariableW(L"ASTRA_TONE_PATH", v, 300) > 0)
+				s.tone_present = _wcsicmp(v, L"present") == 0;
 			if (!ini.empty())
 				s.source = L"defaults (-AstraConfig file not found: " + ini + L")";
 		}

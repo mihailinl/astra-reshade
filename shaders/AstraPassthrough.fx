@@ -4,6 +4,11 @@
 // the game's presented camera, hides her behind the game's surfaces (its depth buffer: reversed Z, as Unreal's),
 // matches the game's light and fog a little, and casts her shadow from her view from the sun when there is one.
 // Always enabled (annotation): AstraActive gates it, so the game passes through untouched while she isn't out.
+// Two places it runs (the add-on picks, AstraHdr says which): onto the presented picture (8-bit, sRGB), or - when
+// the add-on finds the game's tonemapper - into the game's HDR scene colour right before it (linear, pre-exposed):
+// her picture is mapped into the scene's light there (the tone functions below), and the game's tone curve, grade,
+// bloom and UI then apply to her as to its world. No texture here has mipmaps: ReShade makes them with a compute
+// pass, and between a game's own draws that would clobber the game's compute state.
 // Derived from the Death Stranding add-on's AstraPassthrough.fx (same author).
 #include "ReShade.fxh"
 // A game integration's hooks into this compositor, as data (its own AstraGame.fxh, shipped beside this file in place
@@ -31,16 +36,20 @@ sampler sAstraSun { Texture = AstraSunTex; MinFilter = POINT; MagFilter = POINT;
 #define FOG_H 36
 texture FogSigmaTex { Width = FOG_W; Height = FOG_H; Format = R32F; };
 sampler sFogSigma { Texture = FogSigmaTex; MinFilter = POINT; MagFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
-texture FogColourTex { Width = FOG_W; Height = FOG_H; Format = RGBA16F; MipLevels = 7; };
+texture FogColourTex { Width = FOG_W; Height = FOG_H; Format = RGBA16F; };
 sampler sFogColour { Texture = FogColourTex; AddressU = CLAMP; AddressV = CLAMP; };
 // x: density (1/m), yzw: the fog's colour; smoothed over frames (FogPrevTex: last frame's)
 texture FogParamsTex { Width = 1; Height = 1; Format = RGBA16F; };
 sampler sFogParams { Texture = FogParamsTex; MinFilter = POINT; MagFilter = POINT; };
 texture FogPrevTex { Width = 1; Height = 1; Format = RGBA16F; };
 sampler sFogPrev { Texture = FogPrevTex; MinFilter = POINT; MagFilter = POINT; };
-// the game's picture at quarter size with mips: the light around her
-texture AstraLightTex { Width = BUFFER_WIDTH / 4; Height = BUFFER_HEIGHT / 4; Format = RGBA8; MipLevels = 7; };
+// the game's picture (as shown: sRGB) at quarter size, then 1/32 (the light around her) and its mean (its grade)
+texture AstraLightTex { Width = BUFFER_WIDTH / 4; Height = BUFFER_HEIGHT / 4; Format = RGBA8; };
 sampler sAstraLight { Texture = AstraLightTex; AddressU = CLAMP; AddressV = CLAMP; };
+texture AstraLightBlurTex { Width = BUFFER_WIDTH / 32; Height = BUFFER_HEIGHT / 32; Format = RGBA16F; };
+sampler sAstraLightBlur { Texture = AstraLightBlurTex; AddressU = CLAMP; AddressV = CLAMP; };
+texture AstraLightMeanTex { Width = 1; Height = 1; Format = RGBA16F; };
+sampler sAstraLightMean { Texture = AstraLightMeanTex; MinFilter = POINT; MagFilter = POINT; };
 #ifdef ASTRA_GAME_UI
 texture AstraGameUiTex : ASTRA_GAME_UI;
 sampler sAstraGameUi { Texture = AstraGameUiTex; AddressU = CLAMP; AddressV = CLAMP; };
@@ -62,6 +71,10 @@ uniform int3 AstraLoops < hidden = true; > = int3(24, 7, 3); // march steps, hal
 
 // set by the add-on
 uniform bool AstraActive = false;
+// drawn into the game's HDR scene colour, before its tonemapper (else onto the presented picture)
+uniform bool AstraHdr < hidden = true; > = false;
+// [tone] Exposure: her brightness in the game's scene, before its tone curve (1: as her engine drew her)
+uniform float ToneExposure < hidden = true; > = 1.0;
 // near, far, flags (1: [0,1] depth, 2: rows bottom-up, 4: reversed Z, 8: depth is linear metres along the view axis)
 uniform float3 AstraPlanes = float3(0.05, 300.0, 24.0);
 // the game's near and far clip (metres) for its reversed-Z depth buffer (Unreal: no far plane, a huge far stands in)
@@ -97,8 +110,8 @@ uniform float LightMatch < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step
 	ui_tooltip = "Darken/tint her by the game's light around her. She is already lit (MToon) by her engine, so only a little."; > = 0.3;
 uniform float LightReference < ui_type = "drag"; ui_min = 0.1; ui_max = 1.0; ui_step = 0.01; ui_label = "Neutral brightness"; > = 0.42;
 uniform float LightTint < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Light colour"; > = 0.55;
-uniform float LightBlur < ui_type = "drag"; ui_min = 1.0; ui_max = 6.0; ui_step = 0.1; ui_label = "Light blur (mip)"; > = 3.2;
-uniform float GradeMatch < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Match the game's colour grade"; > = 0.25;
+uniform float GradeMatch < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Match the game's colour grade";
+	ui_tooltip = "Drawn at presentation only: before the game's tonemapper its own grade colours her."; > = 0.25;
 uniform float FogMatch < ui_type = "drag"; ui_min = 0.0; ui_max = 2.0; ui_step = 0.01; ui_label = "Match the game's fog";
 	ui_tooltip = "Her fog by the game's own: its colour and density measured from its picture every frame (1: as measured)."; > = 1.0;
 uniform float ShadowStrength < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Her shadow";
@@ -260,6 +273,55 @@ float luma(float3 c)
 	return dot(c, float3(0.2126, 0.7152, 0.0722));
 }
 
+// ---- her picture into the game's HDR scene colour (the add-on's src/tone.h is the reference: same constants) ----
+// The game's tone curve is not read: a filmic one close to Unreal's default (ACES, Narkowicz's fit, Unreal's 0.6 into
+// it) stands in, inverted. Unreal's scene colour is pre-exposed: what is left for its tonemapper to apply is ~1.
+static const float ToneA = 2.51;
+static const float ToneB = 0.03;
+static const float ToneC = 2.43;
+static const float ToneD = 0.59;
+static const float ToneE = 0.14;
+static const float TonePre = 0.6;
+static const float ToneTop = 0.98;
+
+float3 tone_fit(float3 x)
+{
+	x = max(x, 0.0);
+	return saturate(x * (ToneA * x + ToneB) / (x * (ToneC * x + ToneD) + ToneE));
+}
+
+float3 tone_fit_inverse(float3 y)
+{
+	y = clamp(y, 0.0, ToneTop);
+	const float3 qa = ToneC * y - ToneA, qb = ToneD * y - ToneB, qc = ToneE * y;
+	return max((-qb - sqrt(max(qb * qb - 4.0 * qa * qc, 0.0))) / (2.0 * qa), 0.0);
+}
+
+float3 srgb_decode(float3 c)
+{
+	c = saturate(c);
+	return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+
+float3 srgb_encode(float3 c)
+{
+	c = saturate(c);
+	return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+/// A shown colour (sRGB, as her picture holds it) -> the game's scene colour (linear, pre-exposed).
+float3 display_to_scene(float3 d)
+{
+	return tone_fit_inverse(srgb_decode(d)) * ToneExposure / TonePre;
+}
+
+/// The game's colour where this runs -> about what the game will show there (sRGB): the light, fog and grade around her
+/// are measured in her picture's own space wherever the effect runs.
+float3 host_display(float3 c)
+{
+	return AstraHdr ? srgb_encode(tone_fit(c * TonePre / max(ToneExposure, 1e-4))) : c;
+}
+
 float3 bands(float z)
 {
 	return lerp(float3(0.1, 0.1, 0.1), float3(0.4, 0.85, 1.0), step(0.5, frac(z))) * saturate(1.5 - z / 100.0);
@@ -276,14 +338,14 @@ float fog_transmittance(float z, out float3 colour)
 /// Her own shading stays; the game's local light darkens and tints her a little, its grade colours her, its fog too.
 float3 relight(float3 c, float2 uv, float z)
 {
-	const float3 L = tex2Dlod(sAstraLight, float4(uv, 0, LightBlur)).rgb;
+	const float3 L = tex2Dlod(sAstraLightBlur, float4(uv, 0, 0)).rgb;
 	const float lum = luma(L);
 	const float gain = clamp(lum / LightReference, 0.42, 1.3);
 	const float3 tint = clamp(lerp(1.0, L / max(lum, 1e-3), LightTint), 0.55, 1.5);
 	c = lerp(c, c * gain * tint, LightMatch);
-	const float3 M = tex2Dlod(sAstraLight, float4(0.5, 0.5, 0, 6.0)).rgb;
+	const float3 M = tex2Dfetch(sAstraLightMean, int2(0, 0)).rgb;
 	const float3 grade = clamp(lerp(1.0, M / max(luma(M), 1e-3), 0.6), 0.6, 1.6);
-	c = lerp(c, c * grade, GradeMatch);
+	c = lerp(c, c * grade, AstraHdr ? 0.0 : GradeMatch); // before the tonemapper the game's own grade colours her
 	float3 fog;
 	const float t = fog_transmittance(z, fog);
 	return lerp(fog, c, t);
@@ -321,7 +383,7 @@ void PS_FogCells(float4 pos : SV_Position, float2 uv : TEXCOORD, out float outSi
 	[unroll] for (int y = -1; y <= 1; ++y)
 		[unroll] for (int x = -1; x <= 1; ++x)
 		{
-			const float3 c = tex2Dlod(ReShade::BackBuffer, float4(uv + float2(x, y) * float2(0.33 / FOG_W, 0.33 / FOG_H), 0, 0)).rgb;
+			const float3 c = host_display(tex2Dlod(ReShade::BackBuffer, float4(uv + float2(x, y) * float2(0.33 / FOG_W, 0.33 / FOG_H), 0, 0)).rgb);
 			dark = min(dark, min(c.r / A.r, min(c.g / A.g, c.b / A.b)));
 			avg += c;
 		}
@@ -357,7 +419,11 @@ float4 PS_FogParams(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 			}
 		}
 	const float sigma = n > 0.0 ? sum / n : 0.0;
-	const float4 c = tex2Dlod(sFogColour, float4(0.5, 0.5, 0, 6));
+	// the haziest colours' weighted mean (a loop, not mipmaps: see the top)
+	float4 c = 0.0;
+	for (int cy = 0; cy < cells.y; ++cy)
+		for (int cx = 0; cx < cells.x; ++cx)
+			c += tex2Dfetch(sFogColour, int2(cx, cy));
 	const float4 prev = tex2Dfetch(sFogPrev, int2(0, 0));
 	const float3 colour = c.a > 1e-5 ? c.rgb / c.a : (prev.w > 0.0 ? prev.yzw : float3(0.6, 0.6, 0.6));
 	const float k = prev.w > 0.0 ? 0.08 : 1.0; // ease over ~a dozen frames
@@ -371,17 +437,41 @@ float4 PS_FogKeep(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 
 float4 PS_Light(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
-	return float4(tex2D(ReShade::BackBuffer, uv).rgb, 1.0);
+	return float4(host_display(tex2D(ReShade::BackBuffer, uv).rgb), 1.0);
 }
 
-float3 PS_Astra(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+/// The light around her: 8 x 8 cells of the quarter picture per texel (16 bilinear taps of 2 x 2).
+float4 PS_LightBlur(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
-	const float3 host = tex2D(ReShade::BackBuffer, uv).rgb;
+	const float2 texel = 1.0 / float2(BUFFER_WIDTH / 4, BUFFER_HEIGHT / 4);
+	float3 sum = 0.0;
+	[unroll] for (int y = 0; y < 4; ++y)
+		[unroll] for (int x = 0; x < 4; ++x)
+			sum += tex2Dlod(sAstraLight, float4(uv + (float2(x, y) * 2.0 - 3.0) * texel, 0, 0)).rgb;
+	return float4(sum / 16.0, 1.0);
+}
+
+/// The whole picture's mean (its grade): every texel of the light (a loop sized by the texture: see AstraLoops).
+float4 PS_LightMean(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+	const int2 n = tex2Dsize(sAstraLightBlur);
+	float3 sum = 0.0;
+	for (int y = 0; y < n.y; ++y)
+		for (int x = 0; x < n.x; ++x)
+			sum += tex2Dfetch(sAstraLightBlur, int2(x, y)).rgb;
+	return float4(sum / max(float(n.x * n.y), 1.0), 1.0);
+}
+
+/// What this pass writes where she is not: the game's own colour, its alpha kept (a scene colour may carry one).
+float4 PS_Astra(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+	const float4 host4 = tex2D(ReShade::BackBuffer, uv);
+	const float3 host = host4.rgb; // the game's linear scene colour (AstraHdr), or its presented picture
 	const float zh = game_depth(uv);
-	if (DebugView == 2)
-		return bands(zh); // the game's depth as ReShade gives it (works without her: check it first)
+	if (DebugView == 2) // the game's depth as ReShade gives it (works without her: check it first)
+		return float4(AstraHdr ? display_to_scene(bands(zh)) : bands(zh), host4.a);
 	if (!AstraActive)
-		return host;
+		return host4;
 	const float allow = min(DepthBias + SlopeBias * abs(ddy(zh)), max(MaxBias, DepthBias));
 	const float zFar = max(min(zh + allow, 400.0), 0.5);
 	float2 auv;
@@ -390,7 +480,10 @@ float3 PS_Astra(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 	if (reproject(uv, zFar, auv, za))
 		astra = her_colour(auv);
 	if (DebugView == 1)
-		return astra.a > 0.0 ? bands(za) : host * 0.3;
+	{
+		const float3 d = astra.a > 0.0 ? bands(za) : host_display(host) * 0.3;
+		return float4(AstraHdr ? display_to_scene(d) : d, host4.a);
+	}
 	// behind the game's surfaces (and another compositor's, where it drew nearer)
 	float visible = za < zh + allow ? 1.0 : 0.0;
 #ifdef ASTRA_OCCLUDER_TEX
@@ -411,9 +504,14 @@ float3 PS_Astra(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 		const float tg = fog_transmittance(zh, fogc); // the fog over that ground fills her shadow in
 		shaded = host * (1.0 - ShadowStrength * AstraShadow * tg * her_shadow_map(p));
 	}
-	// (her colour is premultiplied: relight it as straight colour, then by her coverage again)
-	const float3 lit = visible > 0.0 && astra.a > 1e-4 ? relight(astra.rgb / astra.a, uv, za) * astra.a : 0.0;
-	float3 c = lit * visible + shaded * (1.0 - cover);
+	// (her colour is premultiplied: relight it as straight colour, then by her coverage again; before the tonemapper,
+	// into the scene's light)
+	float3 lit = visible > 0.0 && astra.a > 1e-4 ? relight(astra.rgb / astra.a, uv, za) : 0.0;
+	if (AstraHdr)
+		lit = display_to_scene(lit);
+	float3 c = lit * astra.a * visible + shaded * (1.0 - cover);
+	if (AstraHdr)
+		return float4(max(c, 0.0), host4.a); // the game's UI comes after, over her
 #ifdef ASTRA_GAME_UI
 	// the game's UI back over her (the game composited it with its scene before she was drawn over that)
 	if (ASTRA_GAME_UI_ACTIVE && cover > 0.001)
@@ -423,7 +521,7 @@ float3 PS_Astra(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 		c = lerp(c, ui_rgb + c * saturate(1.0 - ui.a), saturate(cover));
 	}
 #endif
-	return saturate(c);
+	return float4(saturate(c), host4.a);
 }
 
 technique AstraPassthrough < enabled = true; ui_tooltip = "Astra, drawn by her engine from the game's camera (on while her engine is linked)."; >
@@ -452,6 +550,18 @@ technique AstraPassthrough < enabled = true; ui_tooltip = "Astra, drawn by her e
 		VertexShader = PostProcessVS;
 		PixelShader = PS_Light;
 		RenderTarget = AstraLightTex;
+	}
+	pass LightBlur
+	{
+		VertexShader = PostProcessVS;
+		PixelShader = PS_LightBlur;
+		RenderTarget = AstraLightBlurTex;
+	}
+	pass LightMean
+	{
+		VertexShader = PostProcessVS;
+		PixelShader = PS_LightMean;
+		RenderTarget = AstraLightMeanTex;
 	}
 	pass Astra
 	{
