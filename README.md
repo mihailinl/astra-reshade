@@ -1,6 +1,6 @@
 # astra-reshade
 
-> **Experimental — phase 1, not yet run in a game.** Everything here builds and passes its offline tests; the first live test (Scarlet Skips, UE 5.6) is described in [docs/LIVE-TEST.md](docs/LIVE-TEST.md).
+> **Experimental — phase 1.** First run in a game on 2026-10-14: Scarlet Skips (UE 5.6) under Proton, Astra in the game with its depth, glued on camera cuts, hidden on pause — what was seen and what it took is in [docs/LIVE-TEST.md](docs/LIVE-TEST.md).
 
 
 Astra, the Astra companion's 3D avatar, inside **any D3D11/D3D12 game ReShade

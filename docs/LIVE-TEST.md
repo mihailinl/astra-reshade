@@ -1,7 +1,11 @@
 # Live test: Astra in an Unreal game (phase 1)
 
-Nothing here has run in a game yet. Each step proves one piece and says what you should see; stop at the first
-step that does not show it and send `UE4SS.log` and `astra-reshade.log` (both beside the game's exe).
+Each step proves one piece and says what you should see; stop at the first step that does not show it and send
+`ue4ss/UE4SS.log`, `ReShade.log` and `astra-reshade.log` (beside the game's exe).
+
+**First run: Scarlet Skips, 2026-10-14, Linux (proton-cachyos 11.0-20261005, AMD RX 9060 XT): steps 1-3 passed**
+after three fixes, all generic (see *What the first run found* at the end). Nothing in the foundation is specific
+to the game.
 
 Build once (Linux, this repo): `./build.sh && tools/package-unreal.sh` — `build/astra-gi/` is then the whole
 install, laid out as the launcher would place it.
@@ -21,6 +25,16 @@ cp "$A/dwmapi.dll" "$G/" && cp -r "$A/ue4ss" "$G/"
 Steam → Scarlet Skips → Properties → Launch options: `WINEDLLOVERRIDES="dwmapi=n,b" %command%`. Play, get into
 the game itself (not the menu), walk and turn for 20 s, quit.
 
+No launch options at all (what the first run used): the override as a per-exe key in the Proton prefix's
+`user.reg` - Wine reads it for that exe only, and Proton's own overrides already have `dxgi=n`, so ReShade's
+`dxgi.dll` beside the exe loads with no option either (proved by a launch through the root `ScarletSkips.exe` with an
+empty `WINEDLLOVERRIDES`: Wine's `loaddll` trace shows both proxies `native`):
+```
+[Software\\Wine\\AppDefaults\\ScarletSkips-Win64-Shipping.exe\\DllOverrides] 1792000000
+"dwmapi"="native,builtin"
+```
+(`compatdata/4513480/pfx/user.reg`; edit it only while the game is not running, wineserver rewrites it at exit.)
+
 `$G/ue4ss/UE4SS.log` must have:
 - UE4SS's banner and the engine version it detected (5.6), and no `Failed to find` / fatal line before it;
 - `[AstraUE] started: every engine frame (EngineTick)` — or `EngineTick hook unavailable, polling...` (works, a
@@ -30,6 +44,12 @@ the game itself (not the menu), walk and turn for 20 s, quit.
   — the camera follows your turns, `her` stays ~1.7 m from `player`, the cost is well under 0.5 ms.
 
 No `UE4SS.log` at all: the override is missing or `dwmapi.dll` is not beside `ScarletSkips-Win64-Shipping.exe`.
+
+Seen 2026-10-14: `UE4SS - v3.0.1 Beta`, `[PS] Found EngineVersion: 5.6`, `[AstraUE] started: every engine frame
+(EngineTick)`, `frame 839  camera 209 -72 124  pitch -3.3 yaw 160.0 roll 0.0  fov 35.0v  player 0 0 0  her -140 90 0
+0.333 ms/frame`. Scarlet Skips keeps the vertical fov (`35.0v`, MaintainYFOV) and its own camera (a `BP_Camera`
+view target, still while you play: a jump-rope game). The cost reads 0.3-0.9 ms: `os.clock` ticks in whole
+milliseconds under Wine, so it is an average of 0s and 1s - read it over several lines.
 
 ### 2. ReShade + the add-on, and the game's depth
 
@@ -54,6 +74,12 @@ depth (1 m bands)". Expect stripes 1 m apart that sit still on walls and the flo
 
 Set `DebugView` back to "Composite".
 
+Seen 2026-10-14 with no depth setting changed (`ReShade.ini` as shipped, native resolution, TSR at the game's
+defaults): the bands sat still on the ground and the trees, finer near the camera, the sky clear; no Generic Depth
+pick, no copy before clears, no `r.RDG.TransientAllocator=0`. `DebugView` can be set without the overlay:
+`astra-reshade/AstraPreset.ini` = `Techniques=AstraPassthrough@AstraPassthrough.fx`, `[AstraPassthrough.fx]`,
+`DebugView=2`. A step-2-only run that must not pull her off the desktop: `ASTRA_BRIDGE_PORT=25699` (nothing there).
+
 ### 3. Astra in the game
 
 Start Astra with the companion on (she is on the desktop). Within a second or two of the game's link she leaves
@@ -73,6 +99,16 @@ Look for, in order:
    beside you).
 5. **Pause** (Esc): she disappears while the game is paused.
 
+Seen 2026-10-14 (the owner's Astra test build, game switch on): `[switch] a game asked for her — leaving the
+desktop` within 0.05 s of the hello, `layer: connected to the engine's frames (6 slots, up to 1920x1080)`, the engine
+`... frames published, 0 dropped`; she stood on the grass beside the player at her size (1); the hill's terrain hid
+her legs when she stood behind its crest (2); with the camera cut 40 degrees back and forth eleven times, every one
+of 70 window grabs (one per 25 ms) showed her where that frame's scenery says - none a frame late, `camera delay` 1
+is right here; swings at 70 degrees/s kept her feet on the ground (3); she followed the player 17 m (4); the game's
+pause hid her and unpausing brought her back (5); quitting gave her back to the desktop (`[switch] no game holds her
+— back to the desktop`). This game's camera never turns: the turns, the walk and the pause came from the test
+driver `tools/ue-test-driver/` (AstraUETest, a UE4SS mod reading commands from a file), not from a player.
+
 Expected in phase 1, not bugs: she floats on stairs and slopes (no ground traces yet), she is drawn OVER the
 game's HUD and menus (the "before the UI" hook is the next phase), no shadow on the ground (the game's sun is not
 read yet), the light match is approximate. HDR output must be off.
@@ -80,12 +116,34 @@ read yet), the light match is approximate. HDR output must be off.
 Without Astra's daemon, a standalone engine works too: `WGPU_PROTO_WINDOW=bridge astra-avatar-engine` (its
 `BRIDGE.md`).
 
+### What the first run found (all fixed, all generic)
+
+1. **The game hung at start** (black, `UE4SS.log` stuck at "waiting for object construction"). ReShade loads and
+   unloads its add-ons with every D3D12 device, and Unreal 5 makes and drops two probe devices first; the fault
+   guard's vectored exception handler stayed registered in the unloaded add-on, and the next exception in any thread
+   called it, faulted, and called it again forever (Proton log, `PROTON_LOG=1`: `call_vectored_handlers calling
+   handler at 00006FFFF7AB3A90` repeating). The add-on now removes the handler at `DLL_PROCESS_DETACH`
+   (`guard::uninstall`) and stops its threads when their device is destroyed, not in `DllMain`.
+2. **`AstraPassthrough.fx` did not compile**: `E5017: Aborting due to not yet implemented feature: Unhandled
+   attribute 'fastopt'`. Under Proton ReShade compiles with Wine's `d3dcompiler_47` (vkd3d-shader) unless the game
+   ships Microsoft's (Death Stranding does; Unreal games mostly do not), and ReShade writes `[fastopt]` for every
+   `[loop]`. Without the attribute that compiler unrolls the re-projection march for minutes. The loop counts now come
+   from a hidden uniform and the fog texture's size; `tests/run.sh` compiles the effect with Wine's compiler
+   (`tools/winecheck.sh`). First compile in game: 2.8 s, cached after.
+3. **She stayed out in the pause menu**: AstraUE asked `PlayerController:IsPaused()`, plain C++ that UE4SS cannot call
+   (`attempt to call a TrivialObject value`, swallowed by a `pcall`). It reads `GameplayStatics:IsGamePaused` now.
+
+Open: a launch from the Steam client did not reach the game's exe on this machine (a session opens, Proton starts,
+no exe, no log) - also before any of these files were installed; a direct Proton launch of either exe works. Not
+looked into further (it needs the Steam window, the screen was locked).
+
 ### Remove
 
 ```bash
 cd "$G" && rm -rf dwmapi.dll dxgi.dll ReShade.ini astra-reshade ue4ss astra-reshade.log ReShade.log
 ```
-and clear the launch options.
+and clear the launch options (or delete the `AppDefaults\ScarletSkips-Win64-Shipping.exe\DllOverrides` key from
+the prefix's `user.reg`, with the game closed).
 
 ## S.T.A.L.K.E.R. 2 (UE 5.1)
 
