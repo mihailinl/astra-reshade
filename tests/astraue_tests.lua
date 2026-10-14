@@ -125,10 +125,13 @@ function make_world()
         GetFOVAngle = function() return 90 end,
         CameraCachePrivate = { POV = { bConstrainAspectRatio = false, AspectRatio = 1.7778, PerspectiveNearClipPlane = 10 } },
     })
-    local pc = object({ PlayerCameraManager = pcm, Pawn = pawn, Player = { AspectRatioAxisConstraint = 1 }, IsPaused = function() return false end })
+    -- what a real UE 5.6 offers: no IsPaused on the PlayerController (plain C++), GameplayStatics' IsGamePaused
+    local pc = object({ PlayerCameraManager = pcm, Pawn = pawn, Player = { AspectRatioAxisConstraint = 1 } })
+    local statics = object({ IsGamePaused = function(_, context) return context == pc and w.paused == true end })
     package.loaded["UEHelpers"] = nil
     package.preload["UEHelpers"] = function()
-        return { GetKismetSystemLibrary = function() return kismet end, GetPlayerController = function() return pc end }
+        return { GetKismetSystemLibrary = function() return kismet end, GetPlayerController = function() return pc end,
+            GetGameplayStatics = function() return statics end }
     end
     UnrealVersion = { GetMajor = function() return 5 end, GetMinor = function() return 6 end }
     EngineTickAvailable = true
@@ -174,12 +177,32 @@ do
         loop()
         loop() -- a second call in the same engine frame sends nothing
     end
+    local first_five = #written
+
+    -- the game pauses (its pause menu): she hides within a tenth of a second, and comes back with the game
+    local sent = #written
+    world.paused = true
+    for i = 1, 10 do
+        set_frame(2000 + i)
+        clock = clock + 1 / 60
+        loop()
+    end
+    local during = table.concat(written, "", sent + 1)
+    check(during:find("V 0\n", 1, true) ~= nil and select(2, during:gsub("\nC ", "")) <= 6,
+        "paused: she is hidden (V 0) within 0.1 s (" .. during:gsub("\n", " | "):sub(1, 120) .. ")")
+    world.paused = false
+    for i = 1, 10 do
+        set_frame(3000 + i)
+        clock = clock + 1 / 60
+        loop()
+    end
+    check(table.concat(written, "", #written - 1):find("V 1\n", 1, true) ~= nil, "unpaused: she is back")
     io.open, os.clock = real_open, real_clock
 
     local all = table.concat(written)
     check(all:find("I astra.unreal TestGame\n", 1, true) ~= nil, "it says who it is")
     local cams, avatars, last_c = 0, 0, nil
-    for l in all:gmatch("[^\n]+") do
+    for l in table.concat(written, "", 1, first_five):gmatch("[^\n]+") do
         if l:sub(1, 2) == "C " then cams, last_c = cams + 1, l end
         if l:sub(1, 2) == "A " then avatars = avatars + 1 end
     end

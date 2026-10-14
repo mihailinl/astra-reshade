@@ -127,7 +127,7 @@ local UEHelpers = require("UEHelpers")
 
 local pipe, next_open = nil, 0
 local pc, next_find = nil, 0
-local cache = { at = -1 }
+local cache = { at = -1, paused_at = -1 }
 local her = { placed = false, x = 0, y = 0, z = 0, yaw = 0, v = 0, vx = 0, vy = 0, speed = 0 }
 local last_frame, last_clock, own_frame, frame_counter = -1, nil, 0, nil
 local stats = { frames = 0, sent = 0, cost = 0, logged_at = 0, errors = 0 }
@@ -187,8 +187,21 @@ local function refresh_cache(now, pcm, pawn)
     end)
     cache.half_height = 0
     pcall(function() cache.half_height = pawn.CapsuleComponent:GetScaledCapsuleHalfHeight() end)
-    cache.paused = false
-    pcall(function() cache.paused = pc:IsPaused() end)
+end
+
+--- Is the game paused (its pause menu)? Read ten times a second: she hides as the menu opens. GameplayStatics'
+--- IsGamePaused, a UFunction in every UE4/UE5 - APlayerController's own IsPaused is plain C++, not callable from
+--- here (UE 5.6 live: "attempt to call a TrivialObject value"). A read that fails says so once and counts as running.
+local function paused(now)
+    if now - cache.paused_at < 0.1 then return cache.paused end
+    cache.paused_at = now
+    local ok, value = pcall(function() return UEHelpers.GetGameplayStatics():IsGamePaused(pc) end)
+    if not ok and not cache.pause_warned then
+        cache.pause_warned = true
+        log("cannot read the game's pause (she stays out in its pause menu): %s", tostring(value))
+    end
+    cache.paused = ok and value == true
+    return cache.paused
 end
 
 local function tick()
@@ -216,7 +229,7 @@ local function tick()
     local pcm, pawn = pc.PlayerCameraManager, pc.Pawn
     if not valid(pcm) or not valid(pawn) then send("V 0\n") return end
     refresh_cache(now, pcm, pawn)
-    if cache.paused then send("V 0\n") return end
+    if paused(now) then send("V 0\n") return end
 
     local loc, rot, fov = pcm:GetCameraLocation(), pcm:GetCameraRotation(), pcm:GetFOVAngle()
     local at, prot, vel = pawn:K2_GetActorLocation(), pawn:K2_GetActorRotation(), pawn:GetVelocity()
