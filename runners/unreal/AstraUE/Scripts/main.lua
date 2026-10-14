@@ -13,6 +13,9 @@
 -- Her height is the ground under HER: a line trace straight down where she stands (KismetSystemLibrary's
 -- LineTraceSingle, the Visibility channel), a few times a second and whenever she moved - so she stands on slopes and
 -- stairs. A trace that misses (or a game where tracing fails) leaves her on the player's ground.
+-- The game's sun: its main DirectionalLightComponent (found again every few seconds: the brightest one that lights
+-- the world, the atmosphere's sun first), its direction, colour and temperature, and whether it reaches her (a trace
+-- from her chest toward it) - sent as the provider API's light, so her engine lights her with it and casts her shadow.
 
 local M = {}
 
@@ -35,6 +38,14 @@ M.TRACE_MOVE = 15.0             -- sooner than TRACE_MAX once she moved this far
 M.TRACE_UP, M.TRACE_DOWN = 100.0, 300.0 -- from this far above the higher of her and the player's feet, to this far below the lower
 M.GROUND_KEEP = 1.0             -- a trace that misses keeps the last ground this long, then the player's
 M.TRACE_CHANNEL = 0             -- ETraceTypeQuery: 0 = TraceTypeQuery1, the Visibility channel in every UE game
+
+-- the game's sun
+M.SUN_FIND_EVERY = 5.0          -- seconds between searches for the sun (a level change, a time of day swapping lights)
+M.SUN_EVERY = 0.2               -- seconds between light lines (the add-on sends ~10 a second to her engine)
+M.SUN_LUX = nil                 -- a game's daylight in lux, if its lights use physical units: intensity = lux / SUN_LUX
+                                -- (nil: every sun is a daylight sun, 1 - her engine bounds her level, the game's exposure ours)
+M.SUN_CHEST = 120.0             -- her chest above her feet (cm): where the sun is traced from
+M.SUN_REACH = 20000.0           -- how far toward the sun a blocker counts (cm)
 
 ---------------------------------------------------------------------------------------------------- maths
 
@@ -82,6 +93,62 @@ function M.turn(from, to, step)
     local d = (to - from + 540) % 360 - 180
     if d > step then d = step elseif d < -step then d = -step end
     return (from + d + 540) % 360 - 180
+end
+
+---------------------------------------------------------------------------------------------------- the sun
+
+--- An sRGB 8-bit channel (an FColor's) to linear.
+function M.srgb_to_linear(c)
+    c = c / 255
+    if c <= 0.04045 then return c / 12.92 end
+    return ((c + 0.055) / 1.055) ^ 2.4
+end
+
+--- A black body's colour at `kelvin` (linear RGB, max 1): Tanner Helland's fit, the curve Unreal's light temperature follows.
+function M.temperature_rgb(kelvin)
+    local t = math.max(1000, math.min(kelvin, 40000)) / 100
+    local r, g, b
+    if t <= 66 then
+        r = 255
+        g = 99.4708025861 * math.log(t) - 161.1195681661
+        b = t <= 19 and 0 or 138.5177312231 * math.log(t - 10) - 305.0447927307
+    else
+        r = 329.698727446 * (t - 60) ^ -0.1332047592
+        g = 288.1221695283 * (t - 60) ^ -0.0755148492
+        b = 255
+    end
+    local function c(v) return M.srgb_to_linear(math.max(0, math.min(255, v))) end
+    r, g, b = c(r), c(g), c(b)
+    local m = math.max(r, g, b, 1e-6)
+    return r / m, g / m, b / m
+end
+
+--- Of the directional lights (each {intensity, affects, visible, atmosphere, name}), the sun: lights the world,
+--- shown, the atmosphere's sun first, then the brightest. Returns its index or nil.
+function M.pick_sun(lights)
+    local best, best_score = nil, -1
+    for i, l in ipairs(lights) do
+        if l.affects ~= false and l.visible ~= false and (l.intensity or 0) > 0 and not (l.name or ""):find("Default__", 1, true) then
+            local score = (l.atmosphere and 1e9 or 0) + l.intensity
+            if score > best_score then best, best_score = i, score end
+        end
+    end
+    return best
+end
+
+--- The light line: L <toward the sun, glTF> <linear colour> <intensity> <visible>. rot: the light component's rotation
+--- (it shines along its forward axis); color: its FColor; temperature: kelvin or nil; lux: its Intensity.
+function M.light_line(rot, color, temperature, lux, visible)
+    local fx, fy, fz = M.rotator_axes(rot.Pitch, rot.Yaw, rot.Roll)
+    local tx, ty, tz = M.dir_to_gl(-fx, -fy, -fz)
+    local r, g, b = M.srgb_to_linear(color.R or 255), M.srgb_to_linear(color.G or 255), M.srgb_to_linear(color.B or 255)
+    if temperature then
+        local kr, kg, kb = M.temperature_rgb(temperature)
+        r, g, b = r * kr, g * kg, b * kb
+    end
+    local m = math.max(r, g, b, 1e-6)
+    local intensity = M.SUN_LUX and math.max(0, math.min((lux or 0) / M.SUN_LUX, 16)) or 1
+    return string.format("L %s %s %s %.4f %.4f %.4f %.3f %.2f\n", fmt(tx), fmt(ty), fmt(tz), r / m, g / m, b / m, intensity, visible)
 end
 
 ---------------------------------------------------------------------------------------------------- the ground
@@ -181,6 +248,7 @@ local stats = { frames = 0, sent = 0, cost = 0, logged_at = 0, errors = 0 }
 local kismet = nil
 local NO_COLOR = { R = 0, G = 0, B = 0, A = 0 }
 local trace_broken = false
+local sun = { comp = nil, find_at = -1e9, sent_at = -1e9, said = nil, visible = 1 }
 
 local function log(fmtstr, ...)
     print(string.format("[AstraUE] " .. fmtstr .. "\n", ...))
@@ -279,6 +347,72 @@ local function trace_down(pawn)
     return tracer
 end
 
+--- The game's sun, searched again every SUN_FIND_EVERY seconds (UE4SS's FindAllOf walks every object: not each frame).
+local function find_sun(now)
+    if now - sun.find_at < M.SUN_FIND_EVERY then return sun.comp end
+    sun.find_at = now
+    local lights, found = {}, {}
+    pcall(function()
+        for _, c in ipairs(FindAllOf("DirectionalLightComponent") or {}) do
+            if c:IsValid() then
+                local l = { comp = c }
+                pcall(function() l.name = c:GetFullName() end)
+                pcall(function() l.intensity = c.Intensity end)
+                pcall(function() l.affects = c.bAffectsWorld end)
+                pcall(function() l.visible = c.bVisible end)
+                pcall(function() l.atmosphere = c.bAtmosphereSunLight == true or c.bUsedAsAtmosphereSunLight == true end)
+                lights[#lights + 1] = l
+                found[#found + 1] = l
+            end
+        end
+    end)
+    local i = M.pick_sun(lights)
+    sun.comp = i and lights[i].comp or nil
+    local said = sun.comp and lights[i].name or "none"
+    if said ~= sun.said then
+        sun.said = said
+        log("the game's sun: %s (%d directional lights)", said, #found)
+    end
+    return sun.comp
+end
+
+--- The light line for this moment (rate-limited), or "".
+local function sun_line(now, pawn)
+    if now - sun.sent_at < M.SUN_EVERY then return "" end
+    sun.sent_at = now
+    local comp = find_sun(now)
+    if comp == nil or not comp:IsValid() then
+        sun.comp = nil
+        return ""
+    end
+    local ok, line = pcall(function()
+        local rot = comp:K2_GetComponentRotation()
+        local color = comp.LightColor or { R = 255, G = 255, B = 255 }
+        local temperature = comp.bUseTemperature == true and comp.Temperature or nil
+        -- does it reach her? a trace from her chest toward it (the player ignored); a blocker within SUN_REACH: shade
+        local fx, fy, fz = M.rotator_axes(rot.Pitch, rot.Yaw, rot.Roll)
+        if not trace_broken then
+            local from = { X = her.x, Y = her.y, Z = her.z + M.SUN_CHEST }
+            local to = { X = from.X - fx * M.SUN_REACH, Y = from.Y - fy * M.SUN_REACH, Z = from.Z - fz * M.SUN_REACH }
+            local hit = {}
+            local tok, blocked = pcall(function()
+                return kismet:LineTraceSingle(pawn, from, to, M.TRACE_CHANNEL, false, { pawn }, 0, hit, true, NO_COLOR, NO_COLOR, 0.0)
+            end)
+            if tok then sun.visible = blocked == true and 0 or 1 end
+        end
+        return M.light_line(rot, color, temperature, comp.Intensity, sun.visible)
+    end)
+    if not ok then
+        if not sun.warned then
+            sun.warned = true
+            log("cannot read the game's sun: %s", tostring(line))
+        end
+        sun.comp = nil
+        return ""
+    end
+    return line
+end
+
 local function tick()
     local t0 = os.clock()
     local now = t0
@@ -315,7 +449,7 @@ local function tick()
     M.follow(her, { x = at.X, y = at.Y, z = at.Z - (cache.half_height or 0), yaw = prot.Yaw, vx = vel.X, vy = vel.Y, falling = falling }, dt, now,
         trace_down(pawn))
     -- her placement first, the camera last (the engine draws when the camera comes)
-    if send("V 1\n" .. M.avatar_line(her) .. M.camera_line(frame, loc, rot, fov, cache.horizontal, cache.aspect, cache.near)) then
+    if send("V 1\n" .. sun_line(now, pawn) .. M.avatar_line(her) .. M.camera_line(frame, loc, rot, fov, cache.horizontal, cache.aspect, cache.near)) then
         stats.sent = stats.sent + 1
     end
     stats.frames = stats.frames + 1

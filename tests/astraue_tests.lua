@@ -174,6 +174,40 @@ do
     check(her.trace.misses > 0 and her.trace.traces > her.trace.misses, "traces and misses are counted")
 end
 
+-------------------------------------------------------------------------------- the sun
+do
+    -- colour temperature: a black body - warm at 2000 K, about white at 6500 K, blue above
+    local r, g, b = M.temperature_rgb(2000)
+    check(near(r, 1) and g < 0.4 and b < 0.1, string.format("2000 K is orange (%.2f %.2f %.2f)", r, g, b))
+    r, g, b = M.temperature_rgb(6500)
+    check(r > 0.9 and g > 0.9 and b > 0.85, string.format("6500 K is about white (%.2f %.2f %.2f)", r, g, b))
+    local _, _, b9 = M.temperature_rgb(9000)
+    r = M.temperature_rgb(9000)
+    check(near(b9, 1) and r < 1, "9000 K is blue")
+    check(near(M.srgb_to_linear(255), 1) and near(M.srgb_to_linear(0), 0) and near(M.srgb_to_linear(188), 0.5, 0.01), "sRGB 8-bit to linear")
+
+    -- the sun among the directional lights: the atmosphere's sun first, then the brightest that lights the world
+    check(M.pick_sun({ { intensity = 2, name = "Fill" }, { intensity = 10, name = "Sun" } }) == 2, "the brightest")
+    check(M.pick_sun({ { intensity = 50, name = "Fill" }, { intensity = 3, atmosphere = true, name = "Sun" } }) == 2, "the atmosphere's sun first")
+    check(M.pick_sun({ { intensity = 50, affects = false }, { intensity = 50, visible = false }, { intensity = 50, name = "Default__DirectionalLightComponent" },
+        { intensity = 0 } }) == nil, "none: off, hidden, a class default, dark")
+
+    -- the light line: a sun 45 degrees up, shining along +X and down: toward it is up and back (-X)
+    local line = M.light_line({ Pitch = -45, Yaw = 0, Roll = 0 }, { R = 255, G = 128, B = 0 }, nil, 10, 1)
+    local f = {}
+    for w in line:gmatch("%S+") do f[#f + 1] = w end
+    check(#f == 9 and f[1] == "L", "the light line: 9 fields")
+    check(near(tonumber(f[2]), -0.7071, 1e-3) and near(tonumber(f[3]), 0.7071, 1e-3) and near(tonumber(f[4]), 0, 1e-3), "toward the sun, glTF: up and back")
+    check(near(tonumber(f[5]), 1) and near(tonumber(f[6]), M.srgb_to_linear(128), 1e-3) and near(tonumber(f[7]), 0), "its colour, linear, max 1")
+    check(near(tonumber(f[8]), 1) and near(tonumber(f[9]), 1), "a daylight sun (no lux scale): intensity 1, visible")
+    M.SUN_LUX = 20
+    line = M.light_line({ Pitch = -45, Yaw = 0, Roll = 0 }, { R = 255, G = 255, B = 255 }, 6500, 10, 0)
+    M.SUN_LUX = nil
+    f = {}
+    for w in line:gmatch("%S+") do f[#f + 1] = w end
+    check(near(tonumber(f[8]), 0.5) and near(tonumber(f[9]), 0) and tonumber(f[7]) < 1, "a lux scale, the temperature, in shade")
+end
+
 -------------------------------------------------------------------------------- a stub of UE4SS and a game
 --- A fake game: a PlayerController with its camera manager and pawn, UE4SS's helpers and kismet library.
 function make_world()
@@ -192,6 +226,7 @@ function make_world()
             w.traces = w.traces + 1
             if w.trace_error then error("LineTraceSingle is not a function in this game") end
             w.trace_args = { context = context, from = from, to = to, channel = channel, ignore = ignore, ignore_self = ignore_self }
+            if to.Z > from.Z then return w.sun_blocked == true end -- a trace up toward the sun
             if w.ground == nil or w.ground > from.Z or w.ground < to.Z then return false end
             hit.ImpactPoint = { X = from.X, Y = from.Y, Z = w.ground }
             hit.bBlockingHit = true
@@ -221,6 +256,20 @@ function make_world()
     end
     UnrealVersion = { GetMajor = function() return 5 end, GetMinor = function() return 6 end }
     EngineTickAvailable = true
+    -- two directional lights: a fill and the sun (40 degrees up, warm)
+    w.finds = 0
+    local function light(name, intensity, pitch)
+        local l = object({ Intensity = intensity, bAffectsWorld = true, bVisible = true, LightColor = { R = 255, G = 240, B = 220, A = 255 },
+            bUseTemperature = false, K2_GetComponentRotation = function() return { Pitch = pitch, Yaw = 30, Roll = 0 } end })
+        l.GetFullName = function() return name end
+        return l
+    end
+    FindAllOf = function(class)
+        w.finds = w.finds + 1
+        if class ~= "DirectionalLightComponent" then return nil end
+        return { light("DirectionalLightComponent /Game/Maps/Test.Test:PersistentLevel.Fill.Light", 2, -70),
+            light("DirectionalLightComponent /Game/Maps/Test.Test:PersistentLevel.Sun.Light", 8, -40) }
+    end
     return w
 end
 
@@ -338,8 +387,32 @@ do
     for w in a:gmatch("%S+") do f[#f + 1] = w end
     check(near(tonumber(f[3]), 1.3, 0.02), "her feet on the traced ground, 1.3 m (" .. a .. ")")
     check(world.traces >= 2 * 4 and world.traces <= 2 * 20 + 1, "rate-limited: " .. world.traces .. " traces in 2 s")
-    check(world.trace_args.channel == M.TRACE_CHANNEL and world.trace_args.to.Z < world.trace_args.from.Z and world.trace_args.ignore_self == true,
-        "a trace straight down on the Visibility channel, ignoring the player")
+    check(world.trace_args.ignore_self == true and world.trace_args.channel == M.TRACE_CHANNEL, "traces on the Visibility channel, ignoring the player")
+    -- the sun: found once in 2 s (not each frame), a light line ~5 times a second, the brighter light, in sun
+    local text = table.concat(written)
+    local lines = {}
+    for l in text:gmatch("L [^\n]+") do lines[#lines + 1] = l end
+    check(world.finds == 1, "the sun is searched for once in 2 s (" .. world.finds .. ")")
+    check(#lines >= 8 and #lines <= 12, "a light line about 5 times a second (" .. #lines .. " in 2 s)")
+    local lf = {}
+    for w in (lines[#lines] or ""):gmatch("%S+") do lf[#lf + 1] = w end
+    check(#lf == 9 and tonumber(lf[3]) > 0.6 and near(tonumber(lf[9]), 1), "the sun's line: 40 degrees up, she is in it (" .. tostring(lines[#lines]) .. ")")
+    local said = false
+    for _, s in ipairs(logs) do if s:find("the game's sun: DirectionalLightComponent /Game/Maps/Test.Test:PersistentLevel.Sun.Light", 1, true) then said = true end end
+    check(said, "it says which light is the sun")
+    -- something between her and the sun: in shade
+    world.sun_blocked = true
+    for i = 1, 30 do
+        world.frame = 7500 + i
+        clock = clock + 1 / 60
+        loop()
+    end
+    lines = {}
+    for l in table.concat(written):gmatch("L [^\n]+") do lines[#lines + 1] = l end
+    lf = {}
+    for w in lines[#lines]:gmatch("%S+") do lf[#lf + 1] = w end
+    check(near(tonumber(lf[9]), 0), "a roof between her and the sun: visible 0 (" .. lines[#lines] .. ")")
+    world.sun_blocked = false
     -- a game where the call fails: logged once, never called again, she stands on the player's ground
     world.trace_error = true
     local before = world.traces
