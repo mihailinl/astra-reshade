@@ -10,8 +10,9 @@
 -- her picture, compositing with the game's depth.
 --
 -- Coordinates sent: glTF (right-handed, +Y up, metres) = (x, z, y) * 0.01 of UE's (x forward, y right, z up) cm.
--- Phase 1: no traces yet - her height is the player's last grounded height (stairs and slopes come with the
--- follow brain's line traces).
+-- Her height is the ground under HER: a line trace straight down where she stands (KismetSystemLibrary's
+-- LineTraceSingle, the Visibility channel), a few times a second and whenever she moved - so she stands on slopes and
+-- stairs. A trace that misses (or a game where tracing fails) leaves her on the player's ground.
 
 local M = {}
 
@@ -27,6 +28,13 @@ M.FLOOR_APART = 300.0
 M.WALK_MIN = 150.0              -- her slowest catch-up pace (cm/s)
 M.RUN_MAX = 950.0
 M.STILL = 30.0                  -- the player "stands" below this speed (cm/s)
+
+-- the ground under her (UE centimetres, seconds)
+M.TRACE_MIN, M.TRACE_MAX = 0.05, 0.25 -- never more often than this; at least this often
+M.TRACE_MOVE = 15.0             -- sooner than TRACE_MAX once she moved this far
+M.TRACE_UP, M.TRACE_DOWN = 100.0, 300.0 -- from this far above the higher of her and the player's feet, to this far below the lower
+M.GROUND_KEEP = 1.0             -- a trace that misses keeps the last ground this long, then the player's
+M.TRACE_CHANNEL = 0             -- ETraceTypeQuery: 0 = TraceTypeQuery1, the Visibility channel in every UE game
 
 ---------------------------------------------------------------------------------------------------- maths
 
@@ -76,19 +84,58 @@ function M.turn(from, to, step)
     return (from + d + 540) % 360 - 180
 end
 
+---------------------------------------------------------------------------------------------------- the ground
+
+--- Should she trace the ground now? g: the last trace {at, x, y}; at most every TRACE_MIN, at least every TRACE_MAX,
+--- and in between once she moved TRACE_MOVE.
+function M.should_trace(g, now, x, y)
+    if g.at == nil then return true end
+    local since = now - g.at
+    if since < M.TRACE_MIN then return false end
+    if since >= M.TRACE_MAX then return true end
+    local dx, dy = x - g.x, y - g.y
+    return dx * dx + dy * dy >= M.TRACE_MOVE * M.TRACE_MOVE
+end
+
+--- Her ground: under her (`ground(x, y, top, bottom)` -> the height hit, or nil: a line trace down), rate-limited;
+--- a miss keeps the last one GROUND_KEEP seconds; with no trace, the player's ground while he stands on it.
+function M.update_ground(s, p, now, ground, force)
+    s.trace = s.trace or {}
+    local g = s.trace
+    if ground ~= nil and now ~= nil and (force or M.should_trace(g, now, s.x, s.y)) then
+        local z = ground(s.x, s.y, math.max(s.z, p.z) + M.TRACE_UP, math.min(s.z, p.z) - M.TRACE_DOWN)
+        g.at, g.x, g.y, g.traces = now, s.x, s.y, (g.traces or 0) + 1
+        if z ~= nil then
+            g.z, g.hit_at = z, now
+        else
+            g.misses = (g.misses or 0) + 1
+        end
+    end
+    if g.z ~= nil and now ~= nil and now - g.hit_at <= M.GROUND_KEEP then
+        s.ground = g.z
+    elseif not p.falling then
+        s.ground = p.z
+    end
+end
+
 ---------------------------------------------------------------------------------------------------- follow brain
 
---- One step of her walking. s: her state (UE cm); p: the player {x, y, z (feet), yaw, vx, vy, falling}; dt seconds.
-function M.follow(s, p, dt)
+--- One step of her walking. s: her state (UE cm); p: the player {x, y, z (feet), yaw, vx, vy, falling}; dt seconds;
+--- now: a clock (seconds) and ground: a line trace down (both optional: without them she stands on the player's ground).
+function M.follow(s, p, dt, now, ground)
     local yr = math.rad(p.yaw)
     local fx, fy = math.cos(yr), math.sin(yr)
     local rx, ry = -fy, fx -- UE: +Y is to the right of +X
     local tx, ty = p.x - fx * M.BACK + rx * M.SIDE, p.y - fy * M.BACK + ry * M.SIDE
-    if not p.falling then s.ground = p.z end
+    if s.placed then M.update_ground(s, p, now, ground) end
     local pspeed = math.sqrt(p.vx * p.vx + p.vy * p.vy)
     local to_spot = math.sqrt((tx - s.x) ^ 2 + (ty - s.y) ^ 2)
     if not s.placed or to_spot > M.TELEPORT or math.abs((s.ground or p.z) - s.z) > M.FLOOR_APART then
-        s.x, s.y, s.z, s.yaw = tx, ty, s.ground or p.z, p.yaw
+        -- put at her spot, on the ground there (traced at once)
+        s.x, s.y, s.z, s.yaw = tx, ty, p.z, p.yaw
+        if s.trace then s.trace.z = nil end
+        M.update_ground(s, p, now, ground, true)
+        s.z = s.ground or p.z
         s.v, s.vx, s.vy, s.speed, s.placed, s.teleports = 0, 0, 0, 0, true, (s.teleports or 0) + 1
         return s
     end
@@ -132,6 +179,8 @@ local her = { placed = false, x = 0, y = 0, z = 0, yaw = 0, v = 0, vx = 0, vy = 
 local last_frame, last_clock, own_frame, frame_counter = -1, nil, 0, nil
 local stats = { frames = 0, sent = 0, cost = 0, logged_at = 0, errors = 0 }
 local kismet = nil
+local NO_COLOR = { R = 0, G = 0, B = 0, A = 0 }
+local trace_broken = false
 
 local function log(fmtstr, ...)
     print(string.format("[AstraUE] " .. fmtstr .. "\n", ...))
@@ -204,6 +253,32 @@ local function paused(now)
     return cache.paused
 end
 
+--- A line trace straight down at (x, y) from top to bottom (cm): the height it hits, or nil. The player's pawn is the
+--- world context and is ignored. A game where the call fails says so once and is not traced again.
+local tracer, tracer_pawn = nil, nil
+local function trace_down(pawn)
+    if tracer_pawn == pawn and tracer ~= nil then return tracer end
+    tracer_pawn = pawn
+    tracer = function(x, y, top, bottom)
+        if trace_broken then return nil end
+        local hit = {}
+        local ok, did = pcall(function()
+            return kismet:LineTraceSingle(pawn, { X = x, Y = y, Z = top }, { X = x, Y = y, Z = bottom }, M.TRACE_CHANNEL, false, { pawn }, 0, hit,
+                true, NO_COLOR, NO_COLOR, 0.0)
+        end)
+        if not ok then
+            trace_broken = true
+            log("cannot trace the ground (she stands on the player's ground): %s", tostring(did))
+            return nil
+        end
+        if did ~= true then return nil end
+        local point = hit.ImpactPoint or hit.Location
+        local z = point ~= nil and point.Z or nil
+        return type(z) == "number" and z or nil
+    end
+    return tracer
+end
+
 local function tick()
     local t0 = os.clock()
     local now = t0
@@ -237,7 +312,8 @@ local function tick()
     pcall(function() falling = pawn.CharacterMovement:IsFalling() end)
     local dt = last_clock and math.min(math.max(now - last_clock, 0), 0.1) or 0
     last_clock = now
-    M.follow(her, { x = at.X, y = at.Y, z = at.Z - (cache.half_height or 0), yaw = prot.Yaw, vx = vel.X, vy = vel.Y, falling = falling }, dt)
+    M.follow(her, { x = at.X, y = at.Y, z = at.Z - (cache.half_height or 0), yaw = prot.Yaw, vx = vel.X, vy = vel.Y, falling = falling }, dt, now,
+        trace_down(pawn))
     -- her placement first, the camera last (the engine draws when the camera comes)
     if send("V 1\n" .. M.avatar_line(her) .. M.camera_line(frame, loc, rot, fov, cache.horizontal, cache.aspect, cache.near)) then
         stats.sent = stats.sent + 1
@@ -246,9 +322,11 @@ local function tick()
     stats.cost = stats.cost + (os.clock() - t0)
     if now - stats.logged_at >= 10 then
         stats.logged_at = now
-        log("frame %d  camera %.0f %.0f %.0f  pitch %.1f yaw %.1f roll %.1f  fov %.1f%s  player %.0f %.0f %.0f%s  her %.0f %.0f %.0f  %.3f ms/frame",
+        local t = her.trace or {}
+        log("frame %d  camera %.0f %.0f %.0f  pitch %.1f yaw %.1f roll %.1f  fov %.1f%s  player %.0f %.0f %.0f%s  her %.0f %.0f %.0f  ground %s (%d traces, %d missed)  %.3f ms/frame",
             frame, loc.X, loc.Y, loc.Z, rot.Pitch, rot.Yaw, rot.Roll, fov, cache.horizontal and "h" or "v", at.X, at.Y, at.Z,
-            falling and " (falling)" or "", her.x, her.y, her.z, stats.frames > 0 and stats.cost * 1000 / stats.frames or 0)
+            falling and " (falling)" or "", her.x, her.y, her.z, t.z ~= nil and string.format("%.0f", t.z) or "the player's", t.traces or 0,
+            t.misses or 0, stats.frames > 0 and stats.cost * 1000 / stats.frames or 0)
         stats.frames, stats.cost = 0, 0
     end
 end

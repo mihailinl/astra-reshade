@@ -99,6 +99,81 @@ do
     check(near(her.x, p.x - M.BACK * math.cos(math.rad(p.yaw)) - M.SIDE * math.sin(math.rad(p.yaw)), 1), "fast travel: she is put at her spot")
 end
 
+-------------------------------------------------------------------------------- the ground under her
+do
+    -- the rate limit: at once, then not before TRACE_MIN, at TRACE_MAX at the latest, in between when she moved
+    local g = {}
+    check(M.should_trace(g, 10, 0, 0), "the first trace is at once")
+    g.at, g.x, g.y = 10, 0, 0
+    check(not M.should_trace(g, 10 + M.TRACE_MIN / 2, 500, 0), "never twice within TRACE_MIN, however far she went")
+    check(not M.should_trace(g, 10 + M.TRACE_MIN * 1.5, M.TRACE_MOVE / 2, 0), "standing nearly still: not yet")
+    check(M.should_trace(g, 10 + M.TRACE_MIN * 1.5, M.TRACE_MOVE * 1.5, 0), "moved TRACE_MOVE: again")
+    check(M.should_trace(g, 10 + M.TRACE_MAX, 0, 0), "standing still: again after TRACE_MAX")
+
+    -- a slope (10 % along +X) and stairs (20 cm every 30 cm along +Y): she walks on them, not at the player's height
+    local traces = 0
+    local function slope(x, y, top, bottom)
+        traces = traces + 1
+        local z = 0.1 * x
+        if y > 3000 then z = math.floor((y - 3000) / 30) * 20 end
+        if z > top or z < bottom then return nil end
+        return z
+    end
+    local her = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }
+    local p = { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+    local now = 0
+    M.follow(her, p, 1 / 60, now, slope)
+    check(near(her.z, 0.1 * her.x, 0.5), "put at her spot, she stands on the slope there (" .. string.format("%.1f vs %.1f", her.z, 0.1 * her.x) .. ")")
+    -- the player walks up the slope at 3 m/s for 4 s (his feet on it too)
+    local worst = 0
+    traces = 0
+    for i = 1, 240 do
+        now = now + 1 / 60
+        p.x, p.vx = p.x + 300 / 60, 300
+        p.z = 0.1 * p.x
+        M.follow(her, p, 1 / 60, now, slope)
+        if i > 60 then worst = math.max(worst, math.abs(her.z - 0.1 * her.x)) end
+    end
+    check(worst < 6, "walking up the slope her feet stay on it (worst " .. string.format("%.1f", worst) .. " cm)")
+    check(traces <= 4 * 20 + 1 and traces >= 4 * 4, "walking: traced at most 20 and at least 4 times a second (" .. traces .. " in 4 s)")
+    -- standing still: at most 4 traces a second
+    traces = 0
+    p.vx = 0
+    for _ = 1, 120 do
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, slope)
+    end
+    check(traces <= 2 * 4 + 1, "standing: at most 4 traces a second (" .. traces .. " in 2 s)")
+
+    -- stairs: the player climbs along +Y; she settles on the step she stands on
+    her = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }
+    p = { x = 0, y = 3300, z = 200, yaw = 90, vx = 0, vy = 0, falling = false }
+    for _ = 1, 120 do
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, slope)
+    end
+    local step = math.floor((her.y - 3000) / 30) * 20
+    check(near(her.z, step, 1), "on stairs she stands on her step (" .. string.format("%.1f vs %d", her.z, step) .. ")")
+
+    -- a trace that misses keeps the last ground GROUND_KEEP seconds, then the player's
+    her = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }
+    p = { x = 0, y = 0, z = 50, yaw = 0, vx = 0, vy = 0, falling = false }
+    local function at(z) return function() return z end end
+    M.follow(her, p, 1 / 60, now, at(80))
+    check(near(her.ground, 80), "a hit is her ground (80, the player at 50)")
+    for _ = 1, math.floor(M.GROUND_KEEP * 60 * 0.5) do
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, at(nil))
+    end
+    check(near(her.ground, 80), "misses for half of GROUND_KEEP: the last ground holds")
+    for _ = 1, math.floor(M.GROUND_KEEP * 60) do
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, at(nil))
+    end
+    check(near(her.ground, 50), "misses for longer: the player's ground")
+    check(her.trace.misses > 0 and her.trace.traces > her.trace.misses, "traces and misses are counted")
+end
+
 -------------------------------------------------------------------------------- a stub of UE4SS and a game
 --- A fake game: a PlayerController with its camera manager and pawn, UE4SS's helpers and kismet library.
 function make_world()
@@ -108,9 +183,20 @@ function make_world()
         t.GetFullName = function() return "BP_PlayerController_C /Game/Test" end
         return t
     end
+    w.traces = 0
     local kismet = object({
         GetFrameCount = function() return w.frame end,
         GetGameName = function() return { ToString = function() return "TestGame" end } end,
+        -- UE4SS's call: (world context, start, end, channel, complex, ignore, draw, out hit, ignore self, colours, time)
+        LineTraceSingle = function(_, context, from, to, channel, complex, ignore, draw, hit, ignore_self)
+            w.traces = w.traces + 1
+            if w.trace_error then error("LineTraceSingle is not a function in this game") end
+            w.trace_args = { context = context, from = from, to = to, channel = channel, ignore = ignore, ignore_self = ignore_self }
+            if w.ground == nil or w.ground > from.Z or w.ground < to.Z then return false end
+            hit.ImpactPoint = { X = from.X, Y = from.Y, Z = w.ground }
+            hit.bBlockingHit = true
+            return true
+        end,
     })
     local pawn = object({
         K2_GetActorLocation = function() return { X = 1000, Y = 2000, Z = 188 } end,
@@ -222,6 +308,54 @@ do
         out:write(all)
         out:close()
     end
+end
+
+-------------------------------------------------------------------------------- the ground, traced through UE4SS's stub
+do
+    local written = {}
+    local fake_pipe = { write = function(self, s) written[#written + 1] = s return self end, setvbuf = function() end, close = function() end }
+    local real_open, real_clock, real_print = io.open, os.clock, print
+    io.open = function(name, mode)
+        if name == M.PIPE then return fake_pipe end
+        return real_open(name, mode)
+    end
+    local clock = 200.0
+    os.clock = function() return clock end
+    local logs = {}
+    print = function(s) logs[#logs + 1] = s end
+    local world = make_world()
+    world.ground = 130 -- the ground under her spot is 30 cm above the player's feet (100): a slope
+    local loop
+    LoopInGameThreadAfterFrames = function(_, fn) loop = fn end
+    dofile(path)
+    for i = 1, 120 do
+        world.frame = 7000 + i
+        clock = clock + 1 / 60
+        loop()
+    end
+    local a = table.concat(written):match("A [^\n]+\n$") or table.concat(written):match(".*(A [^\n]+)")
+    local f = {}
+    for w in a:gmatch("%S+") do f[#f + 1] = w end
+    check(near(tonumber(f[3]), 1.3, 0.02), "her feet on the traced ground, 1.3 m (" .. a .. ")")
+    check(world.traces >= 2 * 4 and world.traces <= 2 * 20 + 1, "rate-limited: " .. world.traces .. " traces in 2 s")
+    check(world.trace_args.channel == M.TRACE_CHANNEL and world.trace_args.to.Z < world.trace_args.from.Z and world.trace_args.ignore_self == true,
+        "a trace straight down on the Visibility channel, ignoring the player")
+    -- a game where the call fails: logged once, never called again, she stands on the player's ground
+    world.trace_error = true
+    local before = world.traces
+    for i = 1, 90 do
+        world.frame = 8000 + i
+        clock = clock + 1 / 60
+        loop()
+    end
+    local said = 0
+    for _, s in ipairs(logs) do if s:find("cannot trace the ground", 1, true) then said = said + 1 end end
+    check(said == 1 and world.traces == before + 1, "a failing trace: said once, not called again (" .. said .. ", " .. (world.traces - before) .. ")")
+    a = table.concat(written):match(".*(A [^\n]+)")
+    f = {}
+    for w in a:gmatch("%S+") do f[#f + 1] = w end
+    check(near(tonumber(f[3]), 1.0, 0.05), "after that: the player's ground, 1.0 m (" .. a .. ")")
+    io.open, os.clock, print = real_open, real_clock, real_print
 end
 
 -------------------------------------------------------------------------------- no add-on: it still reads and logs the camera
