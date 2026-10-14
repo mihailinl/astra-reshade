@@ -36,6 +36,7 @@ namespace
 	config::Settings g_settings;
 	uint32_t g_bbWidth = 0, g_bbHeight = 0;
 	bool g_started = false;
+	device *g_presenter = nullptr; // the device whose swap chain started the threads
 
 	void load_overlay_settings()
 	{
@@ -70,6 +71,7 @@ namespace
 		if (!g_started)
 		{
 			g_started = true; // threads start here, not in DllMain (loader lock)
+			g_presenter = swap != nullptr ? swap->get_device() : nullptr;
 			pipeserver::start();
 			enginelink::start(g_settings.port, g_settings.token);
 		}
@@ -84,6 +86,20 @@ namespace
 			}
 		}
 		enginelink::frame(int(g_bbWidth), int(g_bbHeight));
+	}
+
+	/// The threads stop with the device they started for - here, not in DllMain: ReShade unloads its add-ons right
+	/// after the last device is released (a game's exit; Unreal also makes and drops probe devices first), and a
+	/// thread joined under the loader lock never ends, it needs that lock to exit. A later device starts them again.
+	void on_destroy_device(device *dev)
+	{
+		if (!g_started || dev != g_presenter)
+			return;
+		pipeserver::stop();
+		enginelink::stop();
+		g_started = false;
+		g_presenter = nullptr;
+		logf("the device the link started for is gone: its threads stopped");
 	}
 
 	void on_overlay(effect_runtime *)
@@ -157,14 +173,16 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 		load_overlay_settings();
 		layer::install();
 		reshade::register_event<reshade::addon_event::present>(on_present);
+		reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
 		reshade::register_overlay("Astra", on_overlay);
 		break;
 	case DLL_PROCESS_DETACH:
 		if (reserved == nullptr) // FreeLibrary; on process exit the threads are already gone, joining would hang
 		{
-			pipeserver::stop();
+			pipeserver::stop(); // already stopped with their device (on_destroy_device): nothing to join
 			enginelink::stop();
 		}
+		guard::uninstall(); // never leave a vectored handler pointing into this module once it is unmapped
 		reshade::unregister_addon(module);
 		if (g_log)
 			std::fclose(g_log);
