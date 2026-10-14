@@ -43,6 +43,12 @@ namespace
 	device *g_presenter = nullptr; // the device whose swap chain started the threads
 	std::mutex g_frameLock;
 	bool g_frameBegun = false; // the engine link's frame ran for the frame being drawn (at its tonemapper)
+	bool g_begunEarly = false; // ...and it ran there, before Present
+	uint64_t g_camerasAtBegin = 0;
+	// how often the game's newest camera changed between her pass (at the tonemapper) and Present: her picture's
+	// camera is picked counting back from the newest, so a camera arriving in between would make her a frame late
+	uint64_t g_earlyFrames = 0, g_camerasBetween = 0;
+	ULONGLONG g_nextTimingLog = 0;
 
 	void load_overlay_settings()
 	{
@@ -82,6 +88,7 @@ namespace
 		if (g_frameBegun)
 			return;
 		g_frameBegun = true;
+		g_camerasAtBegin = provider::state().cameras.count();
 		enginelink::frame(int(g_bbWidth), int(g_bbHeight));
 	}
 
@@ -108,10 +115,27 @@ namespace
 				g_bbHeight = d.texture.height;
 			}
 		}
+		{
+			std::lock_guard<std::mutex> lock(g_frameLock);
+			g_begunEarly = g_frameBegun;
+		}
 		begin_frame(); // nothing if it ran at this frame's tonemapper
 		{
 			std::lock_guard<std::mutex> lock(g_frameLock);
+			if (g_begunEarly && enginelink::stats().provider_fresh)
+			{
+				++g_earlyFrames;
+				g_camerasBetween += provider::state().cameras.count() != g_camerasAtBegin;
+			}
 			g_frameBegun = false; // the next frame's tonemapper begins the next one
+		}
+		if (GetTickCount64() >= g_nextTimingLog)
+		{
+			if (g_nextTimingLog != 0 && g_earlyFrames > 0)
+				logf("timing: last 30 s, %llu of %llu frames got a newer game camera between her pass and Present", (unsigned long long)g_camerasBetween,
+					(unsigned long long)g_earlyFrames);
+			g_earlyFrames = g_camerasBetween = 0;
+			g_nextTimingLog = GetTickCount64() + 30000;
 		}
 		pretone::presented(swap, g_bbWidth, g_bbHeight);
 	}
