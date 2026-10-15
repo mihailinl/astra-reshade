@@ -110,6 +110,15 @@ uniform float LightMatch < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step
 	ui_tooltip = "Darken/tint her by the game's light around her. She is already lit (MToon) by her engine, so only a little."; > = 0.3;
 uniform float LightReference < ui_type = "drag"; ui_min = 0.1; ui_max = 1.0; ui_step = 0.01; ui_label = "Neutral brightness"; > = 0.42;
 uniform float LightTint < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Light colour"; > = 0.55;
+// The game's picture around her is its surfaces' colour times its light: green grass reads as green light. Two guards
+// on that estimate (light_tint), both off at these defaults - the look before them:
+uniform float LightTintMax < ui_type = "drag"; ui_min = 0.0; ui_max = 0.5; ui_step = 0.01; ui_label = "Light colour: largest shift";
+	ui_tooltip = "How far the light colour may move any of her colour channels from neutral (before \"Match the game's lighting\" scales it).\n"
+				 "0.5: no limit but the 0.55-1.5 clamp. Lower keeps a strongly coloured surface around her (grass, sand) from painting her."; > = 0.5;
+uniform float LightSceneCast < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Light colour: ignore the scene's own cast";
+	ui_tooltip = "The colour the whole picture shares (its mean: mostly its surfaces' own colour, or the game's grade) is not counted as light\n"
+				 "where the picture around her shares it: a green floor around her is grass, not green light. A local colour that differs\n"
+				 "from it (a red lamp in a green park) stays. Her engine lights her with the game's sun when the provider sends it."; > = 0.0;
 uniform float GradeMatch < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Match the game's colour grade";
 	ui_tooltip = "Drawn at presentation only: before the game's tonemapper its own grade colours her."; > = 0.25;
 uniform float FogMatch < ui_type = "drag"; ui_min = 0.0; ui_max = 2.0; ui_step = 0.01; ui_label = "Match the game's fog";
@@ -395,15 +404,40 @@ float fog_transmittance(float z, out float3 colour)
 	return exp(-max(f.x, 0.0) * FogMatch * z);
 }
 
+/// The light's colour around her (luma 1, as her multiplier): the picture's colour there (L, of luma lum), less the cast
+/// the whole picture (its mean M) shares where the two agree (LightSceneCast), then limited in how far it may move any
+/// of her channels from neutral (LightTintMax). At LightSceneCast 0 and LightTintMax 0.5 it is the tint before both.
+float3 light_tint(float3 L, float lum, float3 M)
+{
+	float3 t = L / max(lum, 1e-3);
+	if (LightSceneCast > 0.0)
+	{
+		const float3 m = max(M / max(luma(M), 1e-3), 0.05);
+		// the share of the cast here that is the picture's own: along the mean's cast, never past it, never against
+		// it (a grey path in a green park stays grey, not magenta)
+		const float3 dt = t - 1.0, dm = m - 1.0;
+		const float agree = saturate(dot(dt, dm) / max(dot(dm, dm), 1e-4));
+		const float3 n = t / m;
+		t = lerp(t, n / max(luma(n), 1e-3), agree * LightSceneCast);
+	}
+	t = clamp(lerp(1.0, t, LightTint), 0.55, 1.5);
+	if (LightTintMax < 0.5) // (the clamp keeps every channel within 0.5 of neutral)
+	{
+		const float3 d = t - 1.0;
+		const float shift = max(max(abs(d.x), abs(d.y)), abs(d.z));
+		t = 1.0 + d * min(1.0, LightTintMax / max(shift, 1e-4));
+	}
+	return t;
+}
+
 /// Her own shading stays; the game's local light darkens and tints her a little, its grade colours her, its fog too.
 float3 relight(float3 c, float2 uv, float z)
 {
 	const float3 L = tex2Dlod(sAstraLightBlur, float4(uv, 0, 0)).rgb;
 	const float lum = luma(L);
 	const float gain = clamp(lum / LightReference, 0.42, 1.3);
-	const float3 tint = clamp(lerp(1.0, L / max(lum, 1e-3), LightTint), 0.55, 1.5);
-	c = lerp(c, c * gain * tint, LightMatch);
 	const float3 M = tex2Dfetch(sAstraLightMean, int2(0, 0)).rgb;
+	c = lerp(c, c * gain * light_tint(L, lum, M), LightMatch);
 	const float3 grade = clamp(lerp(1.0, M / max(luma(M), 1e-3), 0.6), 0.6, 1.6);
 	c = lerp(c, c * grade, AstraHdr ? 0.0 : GradeMatch); // before the tonemapper the game's own grade colours her
 	float3 fog;
