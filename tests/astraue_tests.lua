@@ -172,6 +172,50 @@ do
     end
     check(near(her.ground, 50), "misses for longer: the player's ground")
     check(her.trace.misses > 0 and her.trace.traces > her.trace.misses, "traces and misses are counted")
+
+    -- a floor at 0 everywhere and solids over it: { x from, x to, top face, bottom face (nil: it stands on the floor) }.
+    -- A trace down hits the highest top face at or below its start; a trace up the lowest bottom face above its start;
+    -- a trace starting inside a solid does not hit that solid (as Unreal's line traces).
+    local function world_with(solids)
+        return function(x, _, from, to)
+            local best
+            if from >= to then
+                if from >= 0 and to <= 0 then best = 0 end
+                for _, s in ipairs(solids) do
+                    if x >= s[1] and x <= s[2] and s[3] <= from and s[3] >= to and (best == nil or s[3] > best) then best = s[3] end
+                end
+            else
+                for _, s in ipairs(solids) do
+                    if s[4] and x >= s[1] and x <= s[2] and s[4] >= from and s[4] <= to and (best == nil or s[4] < best) then best = s[4] end
+                end
+            end
+            return best
+        end
+    end
+    -- the player stands on a balcony (its floor 2.5 m up, 20 cm thick) right over her: she stays on her floor
+    local balcony = world_with({ { -500, 500, 250, 230 } })
+    her = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }
+    p = { x = -20, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+    M.follow(her, p, 1 / 60, now, balcony)
+    p.x, p.z = 100, 250 -- he went up (stairs elsewhere) and stands over her
+    local highest = 0
+    for _ = 1, 180 do
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, balcony)
+        highest = math.max(highest, her.z)
+    end
+    check(highest < 1 and (her.trace.ceilings or 0) > 0, "a balcony over her head is a ceiling: she stays on her floor (highest " .. string.format("%.1f", highest) .. ")")
+    -- the player climbed a ledge (solid to the floor, 2 m up): walking to her spot on it, she steps up onto it
+    local ledge = world_with({ { 200, 5000, 200, nil } })
+    her = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }
+    p = { x = 100, y = -90, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+    M.follow(her, p, 1 / 60, now, ledge)
+    p.x, p.z = 800, 200
+    for _ = 1, 300 do
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, ledge)
+    end
+    check(her.x > 200 and near(her.z, 200, 2), "a ledge he climbed: she stands on it (" .. string.format("x %.0f z %.1f", her.x, her.z) .. ")")
 end
 
 -------------------------------------------------------------------------------- the sun
@@ -256,19 +300,28 @@ function make_world()
     end
     UnrealVersion = { GetMajor = function() return 5 end, GetMinor = function() return 6 end }
     EngineTickAvailable = true
-    -- two directional lights: a fill and the sun (40 degrees up, warm)
+    -- two directional lights: a fill and the sun (40 degrees up, warm). w.lights_valid = false: they are gone (a level
+    -- change). w.ue4: Unreal 4's properties - no bAtmosphereSunLight (reading it throws), bUsedAsAtmosphereSunLight on the
+    -- sun, which is the dimmer light there (picked only if that flag is read)
     w.finds = 0
-    local function light(name, intensity, pitch)
+    local function light(name, intensity, pitch, atmosphere)
         local l = object({ Intensity = intensity, bAffectsWorld = true, bVisible = true, LightColor = { R = 255, G = 240, B = 220, A = 255 },
             bUseTemperature = false, K2_GetComponentRotation = function() return { Pitch = pitch, Yaw = 30, Roll = 0 } end })
         l.GetFullName = function() return name end
+        l.IsValid = function() return w.lights_valid ~= false end
+        if w.ue4 then
+            l.bUsedAsAtmosphereSunLight = atmosphere == true
+            setmetatable(l, { __index = function(_, k)
+                if k == "bAtmosphereSunLight" then error("property bAtmosphereSunLight not found in DirectionalLightComponent") end
+            end })
+        end
         return l
     end
     FindAllOf = function(class)
         w.finds = w.finds + 1
         if class ~= "DirectionalLightComponent" then return nil end
         return { light("DirectionalLightComponent /Game/Maps/Test.Test:PersistentLevel.Fill.Light", 2, -70),
-            light("DirectionalLightComponent /Game/Maps/Test.Test:PersistentLevel.Sun.Light", 8, -40) }
+            light("DirectionalLightComponent /Game/Maps/Test.Test:PersistentLevel.Sun.Light", w.ue4 and 1 or 8, -40, true) }
     end
     return w
 end
@@ -336,6 +389,7 @@ do
 
     local all = table.concat(written)
     check(all:find("I astra.unreal TestGame\n", 1, true) ~= nil, "it says who it is")
+    check(all:find("\nE unreal\n", 1, true) ~= nil, "it says the game is an Unreal game (the add-on draws her before its tonemapper)")
     local cams, avatars, last_c = 0, 0, nil
     for l in table.concat(written, "", 1, first_five):gmatch("[^\n]+") do
         if l:sub(1, 2) == "C " then cams, last_c = cams + 1, l end
@@ -413,6 +467,22 @@ do
     for w in lines[#lines]:gmatch("%S+") do lf[#lf + 1] = w end
     check(near(tonumber(lf[9]), 0), "a roof between her and the sun: visible 0 (" .. lines[#lines] .. ")")
     world.sun_blocked = false
+    -- the sun found stays found: no search while it is valid (FindAllOf walks every object - a hitch every 5 s before)
+    for i = 1, 12 * 60 do
+        world.frame = 9000 + i
+        clock = clock + 1 / 60
+        loop()
+    end
+    check(world.finds == 1, "a valid sun is not searched for again (" .. world.finds .. " searches in 14 s)")
+    -- ...until it is gone (a level change): searched for at once
+    world.lights_valid = false
+    for i = 1, 30 do
+        world.frame = 11000 + i
+        clock = clock + 1 / 60
+        loop()
+    end
+    check(world.finds == 2, "the sun gone: searched for again (" .. world.finds .. ")")
+    world.lights_valid = true
     -- a game where the call fails: logged once, never called again, she stands on the player's ground
     world.trace_error = true
     local before = world.traces
@@ -429,6 +499,34 @@ do
     for w in a:gmatch("%S+") do f[#f + 1] = w end
     check(near(tonumber(f[3]), 1.0, 0.05), "after that: the player's ground, 1.0 m (" .. a .. ")")
     io.open, os.clock, print = real_open, real_clock, real_print
+end
+
+-------------------------------------------------------------------------------- Unreal 4: the sun's atmosphere flag under its old name
+do
+    local fake_pipe = { write = function(self) return self end, setvbuf = function() end, close = function() end }
+    local real_open, real_clock, real_print = io.open, os.clock, print
+    io.open = function(name, mode)
+        if name == M.PIPE then return fake_pipe end
+        return real_open(name, mode)
+    end
+    local clock = 700.0
+    os.clock = function() return clock end
+    local logs = {}
+    print = function(s) logs[#logs + 1] = s end
+    local world = make_world()
+    world.ue4 = true
+    local loop
+    LoopInGameThreadAfterFrames = function(_, fn) loop = fn end
+    dofile(path)
+    for i = 1, 60 do
+        world.frame = 12000 + i
+        clock = clock + 1 / 60
+        loop()
+    end
+    io.open, os.clock, print = real_open, real_clock, real_print
+    local sun = false
+    for _, s in ipairs(logs) do if s:find("the game's sun: DirectionalLightComponent /Game/Maps/Test.Test:PersistentLevel.Sun.Light", 1, true) then sun = true end end
+    check(sun, "Unreal 4: the atmosphere's sun (bUsedAsAtmosphereSunLight) is the sun, though bAtmosphereSunLight does not exist")
 end
 
 -------------------------------------------------------------------------------- no add-on: it still reads and logs the camera

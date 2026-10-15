@@ -36,11 +36,12 @@ M.STILL = 30.0                  -- the player "stands" below this speed (cm/s)
 M.TRACE_MIN, M.TRACE_MAX = 0.05, 0.25 -- never more often than this; at least this often
 M.TRACE_MOVE = 15.0             -- sooner than TRACE_MAX once she moved this far
 M.TRACE_UP, M.TRACE_DOWN = 100.0, 300.0 -- from this far above the higher of her and the player's feet, to this far below the lower
+M.STEP_UP = 50.0                -- ground higher than this above her feet is hers only with no ceiling between (a ledge, not a balcony)
 M.GROUND_KEEP = 1.0             -- a trace that misses keeps the last ground this long, then the player's
 M.TRACE_CHANNEL = 0             -- ETraceTypeQuery: 0 = TraceTypeQuery1, the Visibility channel in every UE game
 
 -- the game's sun
-M.SUN_FIND_EVERY = 5.0          -- seconds between searches for the sun (a level change, a time of day swapping lights)
+M.SUN_FIND_EVERY = 5.0          -- seconds between searches while no sun is found (one found is kept while it is valid)
 M.SUN_EVERY = 0.2               -- seconds between light lines (the add-on sends ~10 a second to her engine)
 M.SUN_LUX = nil                 -- a game's daylight in lux, if its lights use physical units: intensity = lux / SUN_LUX
                                 -- (nil: every sun is a daylight sun, 1 - her engine bounds her level, the game's exposure ours)
@@ -164,13 +165,21 @@ function M.should_trace(g, now, x, y)
     return dx * dx + dy * dy >= M.TRACE_MOVE * M.TRACE_MOVE
 end
 
---- Her ground: under her (`ground(x, y, top, bottom)` -> the height hit, or nil: a line trace down), rate-limited;
---- a miss keeps the last one GROUND_KEEP seconds; with no trace, the player's ground while he stands on it.
+--- Her ground: under her (`ground(x, y, from, to)` -> the height of the first surface a line trace from `from` to `to`
+--- hits, down or up, or nil), rate-limited; a miss keeps the last one GROUND_KEEP seconds; with no trace, the player's
+--- ground while he stands on it. The trace starts above the higher of her and the player's feet (she steps up onto the
+--- ledge he climbed); a surface more than STEP_UP above her own feet is hers only if nothing is between her and it - a
+--- balcony the player stands on over her head is a ceiling to her, and she stays on her floor.
 function M.update_ground(s, p, now, ground, force)
     s.trace = s.trace or {}
     local g = s.trace
     if ground ~= nil and now ~= nil and (force or M.should_trace(g, now, s.x, s.y)) then
-        local z = ground(s.x, s.y, math.max(s.z, p.z) + M.TRACE_UP, math.min(s.z, p.z) - M.TRACE_DOWN)
+        local bottom = math.min(s.z, p.z) - M.TRACE_DOWN
+        local z = ground(s.x, s.y, math.max(s.z, p.z) + M.TRACE_UP, bottom)
+        if z ~= nil and not force and z > s.z + M.STEP_UP and ground(s.x, s.y, s.z + M.STEP_UP * 0.5, z - 1) ~= nil then
+            z = ground(s.x, s.y, s.z + M.STEP_UP, bottom) -- under a ceiling: her own floor
+            g.ceilings = (g.ceilings or 0) + 1
+        end
         g.at, g.x, g.y, g.traces = now, s.x, s.y, (g.traces or 0) + 1
         if z ~= nil then
             g.z, g.hit_at = z, now
@@ -281,7 +290,8 @@ local function open_pipe(now)
     log("connected to the astra-reshade add-on (%s)", name)
     local version = "?"
     pcall(function() version = string.format("%d.%d", UnrealVersion.GetMajor(), UnrealVersion.GetMinor()) end)
-    send(string.format("I %s %s\nM AstraUE connected (UE %s)\n", M.INTEGRATION, name, version))
+    -- the game's engine, a raw fact: the add-on draws her before an Unreal game's tonemapper (its grade and UI over her)
+    send(string.format("I %s %s\nE unreal\nM AstraUE connected (UE %s)\n", M.INTEGRATION, name, version))
 end
 
 local function valid(o)
@@ -347,10 +357,18 @@ local function trace_down(pawn)
     return tracer
 end
 
---- The game's sun, searched again every SUN_FIND_EVERY seconds (UE4SS's FindAllOf walks every object: not each frame).
+--- The game's sun. UE4SS's FindAllOf walks every object (a hitch), so it is searched for only when there is none (then
+--- every SUN_FIND_EVERY seconds), when the one found is gone (a level change destroys it) or the player controller
+--- changed (a new level) - never while the one found is valid.
 local function find_sun(now)
-    if now - sun.find_at < M.SUN_FIND_EVERY then return sun.comp end
-    sun.find_at = now
+    local alive = false
+    if sun.comp ~= nil then
+        local ok, v = pcall(function() return sun.comp:IsValid() end)
+        alive = ok and v == true
+    end
+    if alive and sun.world == pc then return sun.comp end
+    if not alive and sun.comp == nil and sun.world == pc and now - sun.find_at < M.SUN_FIND_EVERY then return nil end
+    sun.find_at, sun.world = now, pc
     local lights, found = {}, {}
     pcall(function()
         for _, c in ipairs(FindAllOf("DirectionalLightComponent") or {}) do
@@ -360,7 +378,9 @@ local function find_sun(now)
                 pcall(function() l.intensity = c.Intensity end)
                 pcall(function() l.affects = c.bAffectsWorld end)
                 pcall(function() l.visible = c.bVisible end)
-                pcall(function() l.atmosphere = c.bAtmosphereSunLight == true or c.bUsedAsAtmosphereSunLight == true end)
+                -- UE5's name, then UE4's: a version lacking one throws on it, so each is read on its own
+                pcall(function() l.atmosphere = c.bAtmosphereSunLight == true end)
+                if not l.atmosphere then pcall(function() l.atmosphere = c.bUsedAsAtmosphereSunLight == true end) end
                 lights[#lights + 1] = l
                 found[#found + 1] = l
             end
