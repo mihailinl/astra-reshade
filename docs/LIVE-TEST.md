@@ -205,9 +205,9 @@ An adversarial review of phase 2 found eight problems; the fixes (commits `82a86
   its blue correction and gamut expansion, inverted through a table and matrices the add-on hands the effect).
   `shots3/cmp-r13.png`: her engine's own frame, at presentation (phase 1's path, `ASTRA_TONE_PATH=present`), before
   the tonemapper with phase 2's curve, and now. She is no longer washed out: her hair keeps its gold and her skin
-  its brightness as her engine draws them, with the game's UI over her (the Play and Quit buttons). What is left is
-  the light match's tint from the grass around her (`Match the game's lighting`, the same on both paths), and what
-  the curve's port does not invert (ACES's glow and red modifier: a few hundredths on saturated reds). A game that
+  its brightness as her engine draws them, with the game's UI over her (the Play and Quit buttons). What was left:
+  the light match's tint from the grass around her (`Match the game's lighting`, the same on both paths; fixed since,
+  *The light match on grass* below), and what the curve's port does not invert (ACES's glow and red modifier: a few hundredths on saturated reds). A game that
   changes Unreal's film settings or uses its own colour LUT is not matched; `[tone] Exposure` trims her.
 - **No vanishing at the first frames.** ReShade compiles her effect for the scene colour's format the first time her
   pass runs there, and that frame has no effects at all; then the Present path is held a second and tried again.
@@ -237,6 +237,22 @@ Still owed: a UE5 game with dynamic resolution or an upscaler running below the 
 Present there now - check it says so); a long session with alt-tab and a resolution change; a UE 4.27 D3D12 game;
 fast turns and her shadow's placement looked at by a person; a launch from Steam with the screen unlocked; Death
 Stranding on this foundation (its pin is still the pre-pretone `f33d736`).
+
+### The light match on grass (2026-10-15, same game, headless gamescope)
+
+The light match read the colour of the game's picture around her as the colour of its light; that picture is its
+surfaces' colour times its light, so the park's grass painted her green (skin yellow-green, the white jacket mint).
+Two guards on the estimate, effect uniforms:
+- `Light colour: largest shift` (`LightTintMax`, 0.1): how far the light's colour may move any of her channels from
+  neutral (0.5: no limit but the old clamp);
+- `Light colour: ignore the scene's own cast` (`LightSceneCast`, 1): the cast the whole picture shares (its mean) is
+  not light where the colour around her agrees with it - never past it and never against it, so a grey path in a
+  green park does not turn her magenta, and a lamp of another colour stays.
+
+The look before them is `LightTintMax=0.5` and `LightSceneCast=0` under `[AstraPassthrough.fx]` in
+`astra-reshade/AstraPreset.ini`. Seen, in shots of the same moment with the options switched every 400 ms (a test
+build of the effect): on the grass her skin pink and her jacket white again; on the dirt path, the picture around
+her still mostly green park, neither magenta nor grey.
 
 ### Remove
 

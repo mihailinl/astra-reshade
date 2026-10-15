@@ -111,14 +111,14 @@ uniform float LightMatch < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step
 uniform float LightReference < ui_type = "drag"; ui_min = 0.1; ui_max = 1.0; ui_step = 0.01; ui_label = "Neutral brightness"; > = 0.42;
 uniform float LightTint < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Light colour"; > = 0.55;
 // The game's picture around her is its surfaces' colour times its light: green grass reads as green light. Two guards
-// on that estimate (light_tint), both off at these defaults - the look before them:
+// on that estimate (light_tint); LightTintMax 0.5 with LightSceneCast 0 is the look before them:
 uniform float LightTintMax < ui_type = "drag"; ui_min = 0.0; ui_max = 0.5; ui_step = 0.01; ui_label = "Light colour: largest shift";
 	ui_tooltip = "How far the light colour may move any of her colour channels from neutral (before \"Match the game's lighting\" scales it).\n"
-				 "0.5: no limit but the 0.55-1.5 clamp. Lower keeps a strongly coloured surface around her (grass, sand) from painting her."; > = 0.5;
+				 "0.5: no limit but the 0.55-1.5 clamp. Lower keeps a strongly coloured surface around her (grass, sand) from painting her."; > = 0.1;
 uniform float LightSceneCast < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Light colour: ignore the scene's own cast";
 	ui_tooltip = "The colour the whole picture shares (its mean: mostly its surfaces' own colour, or the game's grade) is not counted as light\n"
 				 "where the picture around her shares it: a green floor around her is grass, not green light. A local colour that differs\n"
-				 "from it (a red lamp in a green park) stays. Her engine lights her with the game's sun when the provider sends it."; > = 0.0;
+				 "from it (a red lamp in a green park) stays. Her engine lights her with the game's sun when the provider sends it. 0: off."; > = 1.0;
 uniform float GradeMatch < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Match the game's colour grade";
 	ui_tooltip = "Drawn at presentation only: before the game's tonemapper its own grade colours her."; > = 0.25;
 uniform float FogMatch < ui_type = "drag"; ui_min = 0.0; ui_max = 2.0; ui_step = 0.01; ui_label = "Match the game's fog";
