@@ -109,6 +109,10 @@ uniform float MaxBias < ui_type = "drag"; ui_min = 0.1; ui_max = 10.0; ui_step =
 uniform float LightMatch < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Match the game's lighting";
 	ui_tooltip = "Darken/tint her by the game's light around her. She is already lit (MToon) by her engine, so only a little."; > = 0.3;
 uniform float LightReference < ui_type = "drag"; ui_min = 0.1; ui_max = 1.0; ui_step = 0.01; ui_label = "Neutral brightness"; > = 0.42;
+uniform float LightGainMax < ui_type = "drag"; ui_min = 1.0; ui_max = 1.3; ui_step = 0.01; ui_label = "Match the game's lighting: largest brightening";
+	ui_tooltip = "The most the light around her may brighten her. A bright surface around her (sunlit grass, sand, snow) reads as bright\n"
+				 "light and washes her pale colours out. 1: never brighter than her engine draws her; 1.3: the look before this setting.\n"
+				 "It never limits the darkening (shade, night)."; > = 1.3;
 uniform float LightTint < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Light colour"; > = 0.55;
 // The game's picture around her is its surfaces' colour times its light: green grass reads as green light. Two guards
 // on that estimate (light_tint); LightTintMax 0.5 with LightSceneCast 0 is the look before them:
@@ -435,7 +439,7 @@ float3 relight(float3 c, float2 uv, float z)
 {
 	const float3 L = tex2Dlod(sAstraLightBlur, float4(uv, 0, 0)).rgb;
 	const float lum = luma(L);
-	const float gain = clamp(lum / LightReference, 0.42, 1.3);
+	const float gain = clamp(lum / LightReference, 0.42, max(LightGainMax, 1.0)); // the darkening is never capped
 	const float3 M = tex2Dfetch(sAstraLightMean, int2(0, 0)).rgb;
 	c = lerp(c, c * gain * light_tint(L, lum, M), LightMatch);
 	const float3 grade = clamp(lerp(1.0, M / max(luma(M), 1e-3), 0.6), 0.6, 1.6);
