@@ -112,7 +112,7 @@ uniform float LightReference < ui_type = "drag"; ui_min = 0.1; ui_max = 1.0; ui_
 uniform float LightGainMax < ui_type = "drag"; ui_min = 1.0; ui_max = 1.3; ui_step = 0.01; ui_label = "Match the game's lighting: largest brightening";
 	ui_tooltip = "The most the light around her may brighten her. A bright surface around her (sunlit grass, sand, snow) reads as bright\n"
 				 "light and washes her pale colours out. 1: never brighter than her engine draws her; 1.3: the look before this setting.\n"
-				 "It never limits the darkening (shade, night)."; > = 1.3;
+				 "It never limits the darkening (shade, night)."; > = 1.0;
 uniform float LightTint < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Light colour"; > = 0.55;
 // The game's picture around her is its surfaces' colour times its light: green grass reads as green light. Two guards
 // on that estimate (light_tint); LightTintMax 0.5 with LightSceneCast 0 is the look before them:

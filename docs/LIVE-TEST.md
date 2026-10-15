@@ -254,6 +254,13 @@ The look before them is `LightTintMax=0.5` and `LightSceneCast=0` under `[AstraP
 build of the effect): on the grass her skin pink and her jacket white again; on the dirt path, the picture around
 her still mostly green park, neither magenta nor grey.
 
+The same mistake in brightness: sunlit grass read as bright light and brightened her by about 1.09, clipping her pale
+skin and white jacket. `Match the game's lighting: largest brightening` (`LightGainMax`, 1: never brighter than her
+engine draws her; 1.3 is the look before) caps only that side; the darkening is never capped. Seen, same method: the
+share of her pixels with a channel at full brightness, on the grass 26 % at 1.3, 19.5 % at 1.1, 1.9 % at 1.0 (0.8 %
+with no light match at all); on the dirt path 15 %, 7 %, 1.6 % (1.6 %); in a tree's shade her legs darkened the
+same at all three (picture brightness 0.69-0.70, 0.77 with no light match).
+
 ### Remove
 
 ```bash
