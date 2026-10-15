@@ -1,0 +1,228 @@
+#pragma once
+// pretone's rules, portable (no ReShade, no Windows): tests/core_tests.cpp runs them over recorded sequences.
+//   choose()   where her pass is drawn: before the game's tonemapper only in a game whose engine's tonemapper (its
+//              shape: passfind.h) and tone curve (tone.h) this add-on knows - Unreal - as the provider or the launcher's
+//              ini declares; everywhere else at Present, as before pretone existed
+//   Fallback   her pass at the tonemapper that did not draw: the Present path for a while, then a new try
+//   Retired    a copy of the scene colour no longer used is destroyed frames later, never while the GPU may read it
+//   CopyRing   which descriptor copies a draw reads: only the ones made since its command list's previous draw
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace pretone_rules
+{
+	/// The engines whose tonemapper this add-on can find and whose tone curve it inverts: Unreal 4.15+ and 5 (the film
+	/// tonemapper, tone.h). An engine named by a provider is a raw fact; what it allows is decided here.
+	inline bool known_engine(const std::string &engine)
+	{
+		std::string e;
+		for (const char c : engine)
+			e.push_back(c >= 'A' && c <= 'Z' ? char(c - 'A' + 'a') : c);
+		return e == "unreal";
+	}
+
+	enum class Where : uint8_t
+	{
+		present, // over the presented picture (and over the game's UI)
+		before,  // into the game's HDR scene colour, before its tonemapper (its grade, bloom and UI apply to her)
+	};
+
+	struct Facts
+	{
+		bool path_present = false;     // [tone] Path=present (ASTRA_TONE_PATH)
+		std::string declared;          // the provider's engine (astra_provider_engine, pipe line "E"); "" none
+		std::string ini;               // [tone] Engine= of the launcher's ini (ASTRA_TONE_ENGINE); "" none
+		bool hdr_output = false;       // the game presents HDR
+		bool present_callback = false; // the provider writes its camera at presentation: the tonemapper is too early
+	};
+
+	struct Choice
+	{
+		Where where;
+		const char *why;
+	};
+
+	inline Choice choose(const Facts &f)
+	{
+		if (f.path_present)
+			return {Where::present, "[tone] Path=present"};
+		if (f.hdr_output)
+			return {Where::present, "the game presents HDR"};
+		const std::string &engine = !f.declared.empty() ? f.declared : f.ini;
+		if (engine.empty())
+			return {Where::present, "no game engine declared (by the provider, or [tone] Engine=)"};
+		if (!known_engine(engine))
+			return {Where::present, "the declared engine's tonemapper is not known to this add-on"};
+		if (f.present_callback)
+			return {Where::present, "the provider reads its camera at presentation"};
+		return {Where::before, "an Unreal game"};
+	}
+
+	/// Her pass at the tonemapper that did not draw: ReShade marks the frame's effects drawn BEFORE it checks they are
+	/// ready (compiling for the scene colour's format, reloading), so that frame nothing is drawn - neither she nor the
+	/// user's other effects, at the tonemapper or at Present. After such a miss the Present path is held (1 s at 60
+	/// frames a second, doubling to 16 s while misses repeat) - the effects compile meanwhile - and the tonemapper is
+	/// tried again; after kGiveUp misses in a row, the Present path for the rest of the session. One frame per try.
+	struct Fallback
+	{
+		static constexpr uint64_t kFirstHold = 60, kMaxHold = 960;
+		static constexpr int kGiveUp = 8;
+		uint64_t until = 0, hold = 0;
+		int misses = 0;
+		bool given_up = false;
+
+		/// The Present path is held at this frame.
+		bool holding(uint64_t frame) const
+		{
+			return given_up || frame < until;
+		}
+		/// Her pass at the tonemapper in frame `frame` drew (her technique ran) or not. True: a hold began.
+		bool result(uint64_t frame, bool drawn)
+		{
+			if (drawn)
+			{
+				misses = 0;
+				hold = 0;
+				return false;
+			}
+			++misses;
+			hold = hold == 0 ? kFirstHold : std::min(hold * 2, kMaxHold);
+			until = frame + hold;
+			given_up = given_up || misses >= kGiveUp;
+			return true;
+		}
+	};
+
+	/// GPU resources the game's frames may still read (a copy made for one scene colour size, its view): destroyed
+	/// kFrames presents after they were last used, never at once (frames in flight are 2-3; kFrames is a margin).
+	template <class T>
+	struct Retired
+	{
+		static constexpr uint64_t kFrames = 8;
+		struct Item
+		{
+			T what;
+			uint64_t last_used;
+		};
+		std::vector<Item> items;
+
+		void retire(const T &what, uint64_t last_used)
+		{
+			items.push_back(Item{what, last_used});
+		}
+		/// Destroys (calls `destroy` with) the ones no frame in flight can use at frame `now`.
+		template <class F>
+		void collect(uint64_t now, F &&destroy)
+		{
+			for (size_t i = 0; i < items.size();)
+				if (now >= items[i].last_used + kFrames)
+				{
+					destroy(items[i].what);
+					items.erase(items.begin() + std::ptrdiff_t(i));
+				}
+				else
+					++i;
+		}
+	};
+
+	// ---- what a draw reads: the descriptors the game copied into the shader-visible heap for it -----------------
+
+	/// One copy (D3D12 CopyDescriptors, CPU to CPU into a shader-visible heap): `count` descriptors into slots
+	/// `off`.. of `heap`, from slots `src_off`.. of `src_heap` (where a view's ORIGINAL CPU handle is).
+	struct Copy
+	{
+		uint64_t heap = 0;
+		uint32_t off = 0, count = 0;
+		uint64_t src_heap = 0;
+		uint32_t src_off = 0;
+	};
+
+	/// One thread's recent copies, newest last.
+	struct CopyRing
+	{
+		static constexpr uint32_t kSize = 1024;
+		Copy c[kSize];
+		uint64_t next = 0;
+
+		void push(const Copy &x)
+		{
+			c[next++ % kSize] = x;
+		}
+	};
+
+	/// Where a command list's previous draw, dispatch or reset left the ring of the thread recording it.
+	struct Mark
+	{
+		const CopyRing *ring = nullptr;
+		uint64_t at = 0;
+	};
+
+	constexpr uint32_t kLookBack = 128; // a draw's own copies are a few; never more than this
+	constexpr uint32_t kSpan = 32;      // slots of one table looked at
+
+	/// How many of the ring's newest copies a draw of the list marked `m` may read: the ones made on this thread since
+	/// that list's previous draw (a game copies a draw's descriptors right before it). Older copies may name views of
+	/// textures freed since - ReShade never forgets a view, and asking a freed texture its size crashes. A list
+	/// recorded on another thread than its mark's reads none (its draw is not taken).
+	inline uint32_t window(const CopyRing &r, const Mark &m)
+	{
+		if (m.ring != &r || r.next < m.at)
+			return 0;
+		return uint32_t(std::min<uint64_t>(r.next - m.at, std::min<uint64_t>(kLookBack, CopyRing::kSize)));
+	}
+
+	/// A descriptor table bound for the draw: its heap and first slot.
+	struct Table
+	{
+		uint64_t heap = 0; // 0: none bound at this parameter
+		uint32_t base = 0;
+	};
+
+	/// A bound slot resolved to the descriptor copied there.
+	struct Slot
+	{
+		uint32_t table;  // index into the tables given
+		uint32_t slot;   // in that table
+		uint64_t src_heap;
+		uint32_t src_off;
+	};
+
+	/// The slots of the bound tables, through the newest `window` copies (the newest copy wins a slot). A table spans
+	/// up to kSpan slots and ends where the next one bound from the same heap begins (a game lays one draw's tables
+	/// side by side and declares more slots than it fills). Returns how many slots were written to `out`.
+	inline size_t resolve(const CopyRing &r, uint32_t window, const Table *tables, size_t n_tables, Slot *out, size_t cap)
+	{
+		size_t n = 0;
+		for (size_t pi = 0; pi < n_tables; ++pi)
+		{
+			if (tables[pi].heap == 0)
+				continue;
+			const uint32_t base = tables[pi].base;
+			uint32_t end = base + kSpan;
+			for (size_t q = 0; q < n_tables; ++q)
+				if (q != pi && tables[q].heap == tables[pi].heap && tables[q].base > base && tables[q].base < end)
+					end = tables[q].base;
+			uint32_t seen = 0; // slots of this table resolved already (by a newer copy)
+			for (uint32_t k = 0; k < window && k < r.next; ++k)
+			{
+				const Copy &c = r.c[(r.next - 1 - k) % CopyRing::kSize];
+				if (c.heap != tables[pi].heap || c.count == 0 || c.off >= end || c.off + c.count <= base)
+					continue;
+				for (uint32_t j = 0; j < c.count; ++j)
+				{
+					const uint32_t slot = c.off + j;
+					if (slot < base || slot >= end || (seen & (1u << (slot - base))) != 0)
+						continue;
+					seen |= 1u << (slot - base);
+					if (c.src_heap != 0 && n < cap)
+						out[n++] = Slot{uint32_t(pi), slot - base, c.src_heap, c.src_off + j};
+				}
+			}
+		}
+		return n;
+	}
+}

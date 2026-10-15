@@ -30,6 +30,7 @@
  *   L <tx> <ty> <tz> <r> <g> <b> <intensity> <visible>                                    astra_provider_light
  *   P <state> | T <token> | R                                                             astra_provider_cue
  *   I <integration> <game name ...>                                                       astra_provider_identity
+ *   E <engine>                                                                            astra_provider_engine
  *   M <text>                                                                              astra_provider_log
  * A frame's lines may come in one write ("A ...\nC ...\n"); send the avatar BEFORE the camera.
  * astra_provider_on_present has no line: a pipe cannot call back.
@@ -42,9 +43,9 @@ extern "C" {
 #endif
 
 /* 1: camera, avatar, visible, light, cue, identity.
- * 2: + camera2 (the far plane), anchor, param, log, on_present. Look a version-2 function up by name: an older
- *    add-on has none (GetProcAddress gives NULL). */
-#define ASTRA_PROVIDER_VERSION 2
+ * 2: + camera2 (the far plane), anchor, param, log, on_present.
+ * 3: + engine. Look a newer function up by name: an older add-on has none (GetProcAddress gives NULL). */
+#define ASTRA_PROVIDER_VERSION 3
 
 #ifdef ASTRA_PROVIDER_EXPORTS
 #define ASTRA_PROVIDER_API __declspec(dllexport)
@@ -102,6 +103,13 @@ ASTRA_PROVIDER_API void astra_provider_cue(const char *kind, const char *name);
 /* Who is providing (shown to Astra's owner; optional): an integration id ("astra.unreal") and the game's
  * display name. Before the first camera, or the add-on reconnects to say it. */
 ASTRA_PROVIDER_API void astra_provider_identity(const char *integration, const char *game);
+
+/* The game's engine, a raw fact: "unreal" (any Unreal 4 or 5 game). The add-on decides what it allows: in a game
+ * declared Unreal, Astra is drawn BEFORE the game's tonemapper when it finds it (the game's grade, bloom and UI then
+ * apply to her; her colours are mapped through Unreal's default tone curve) - anywhere else, and without this call,
+ * she is drawn at presentation, over the finished picture. Names: [A-Za-z0-9_.-], <= 64; kept until changed, NULL or
+ * "" = none. Version 3. */
+ASTRA_PROVIDER_API void astra_provider_engine(const char *engine);
 
 /* A line for the add-on's log (astra-reshade.log, beside Astra's settings for this game): a provider's own
  * diagnostics in the same file. Rate-limited (its first 200 lines, then every 100th). Version 2. */

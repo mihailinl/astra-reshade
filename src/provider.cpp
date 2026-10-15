@@ -152,6 +152,14 @@ extern "C" void astra_provider_identity(const char *integration, const char *gam
 	s.set_identity(integration, game);
 }
 
+extern "C" void astra_provider_engine(const char *engine)
+{
+	provider::State &s = provider::state();
+	++s.calls;
+	if (s.set_engine(engine))
+		logf("provider: the game's engine is %s", engine != nullptr && *engine != 0 ? engine : "(none)");
+}
+
 extern "C" void astra_provider_anchor(const char *point)
 {
 	provider::State &s = provider::state();

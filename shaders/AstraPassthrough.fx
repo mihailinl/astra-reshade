@@ -4,10 +4,10 @@
 // the game's presented camera, hides her behind the game's surfaces (its depth buffer: reversed Z, as Unreal's),
 // matches the game's light and fog a little, and casts her shadow from her view from the sun when there is one.
 // Always enabled (annotation): AstraActive gates it, so the game passes through untouched while she isn't out.
-// Two places it runs (the add-on picks, AstraHdr says which): onto the presented picture (8-bit, sRGB), or - when
-// the add-on finds the game's tonemapper - into the game's HDR scene colour right before it (linear, pre-exposed):
-// her picture is mapped into the scene's light there (the tone functions below), and the game's tone curve, grade,
-// bloom and UI then apply to her as to its world. No texture here has mipmaps: ReShade makes them with a compute
+// Two places it runs (the add-on picks, AstraHdr says which): onto the presented picture (8-bit, sRGB), or - in an
+// Unreal game (its provider says so), when the add-on finds the game's tonemapper - into the game's HDR scene colour
+// right before it (linear, pre-exposed): her picture is mapped into the scene's light there (the tone functions
+// below), and the game's tone curve, grade, bloom and UI then apply to her as to its world. No texture here has mipmaps: ReShade makes them with a compute
 // pass, and between a game's own draws that would clobber the game's compute state.
 // Derived from the Death Stranding add-on's AstraPassthrough.fx (same author).
 #include "ReShade.fxh"
@@ -273,28 +273,74 @@ float luma(float3 c)
 	return dot(c, float3(0.2126, 0.7152, 0.0722));
 }
 
-// ---- her picture into the game's HDR scene colour (the add-on's src/tone.h is the reference: same constants) ----
-// The game's tone curve is not read: a filmic one close to Unreal's default (ACES, Narkowicz's fit, Unreal's 0.6 into
-// it) stands in, inverted. Unreal's scene colour is pre-exposed: what is left for its tonemapper to apply is ~1.
-static const float ToneA = 2.51;
-static const float ToneB = 0.03;
-static const float ToneC = 2.43;
-static const float ToneD = 0.59;
-static const float ToneE = 0.14;
-static const float TonePre = 0.6;
-static const float ToneTop = 0.98;
+// ---- her picture into the game's HDR scene colour: the add-on's src/tone.h is the reference ----------------------
+// Unreal's DEFAULT tonemapping (the film curve, its desaturations, blue correction, the gamut expansion of bright
+// saturated colours) stands in for the game's - inverted to put her into its scene, run forward to measure the light
+// and fog around her as the game will show them. The add-on sets the matrices below and binds the curve's table
+// (ASTRATONE: N x 2, R32F - row 0 the inverse, row 1 the curve) from tone.h each time the effects run before the
+// tonemapper, so nothing here can drift from it. Unreal's scene colour is pre-exposed: its tonemapper applies ~1 more.
+texture AstraToneTex : ASTRATONE;
+sampler sAstraTone { Texture = AstraToneTex; MinFilter = POINT; MagFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
+uniform float3 ToneToAp1_0 < hidden = true; > = float3(1.0, 0.0, 0.0);
+uniform float3 ToneToAp1_1 < hidden = true; > = float3(0.0, 1.0, 0.0);
+uniform float3 ToneToAp1_2 < hidden = true; > = float3(0.0, 0.0, 1.0);
+uniform float3 ToneFromAp1_0 < hidden = true; > = float3(1.0, 0.0, 0.0);
+uniform float3 ToneFromAp1_1 < hidden = true; > = float3(0.0, 1.0, 0.0);
+uniform float3 ToneFromAp1_2 < hidden = true; > = float3(0.0, 0.0, 1.0);
+uniform float3 ToneExpand0 < hidden = true; > = float3(1.0, 0.0, 0.0);
+uniform float3 ToneExpand1 < hidden = true; > = float3(0.0, 1.0, 0.0);
+uniform float3 ToneExpand2 < hidden = true; > = float3(0.0, 0.0, 1.0);
+uniform float3 ToneFwdIn0 < hidden = true; > = float3(1.0, 0.0, 0.0);
+uniform float3 ToneFwdIn1 < hidden = true; > = float3(0.0, 1.0, 0.0);
+uniform float3 ToneFwdIn2 < hidden = true; > = float3(0.0, 0.0, 1.0);
+uniform float3 ToneInvOut0 < hidden = true; > = float3(1.0, 0.0, 0.0);
+uniform float3 ToneInvOut1 < hidden = true; > = float3(0.0, 1.0, 0.0);
+uniform float3 ToneInvOut2 < hidden = true; > = float3(0.0, 0.0, 1.0);
+uniform float3 ToneFwdOut0 < hidden = true; > = float3(1.0, 0.0, 0.0);
+uniform float3 ToneFwdOut1 < hidden = true; > = float3(0.0, 1.0, 0.0);
+uniform float3 ToneFwdOut2 < hidden = true; > = float3(0.0, 0.0, 1.0);
+uniform float3 ToneInvIn0 < hidden = true; > = float3(1.0, 0.0, 0.0);
+uniform float3 ToneInvIn1 < hidden = true; > = float3(0.0, 1.0, 0.0);
+uniform float3 ToneInvIn2 < hidden = true; > = float3(0.0, 0.0, 1.0);
+uniform float3 ToneLuma < hidden = true; > = float3(0.2722287, 0.6740818, 0.0536895);
+// the table's y max, its log10 range, and ExpandGamut
+uniform float4 ToneLut < hidden = true; > = float4(1.035, -8.0, 3.0, 1.0);
+static const int ToneUnexpand = 6; // tone::kUnexpand (tests/core_tests.cpp checks they match)
 
-float3 tone_fit(float3 x)
+float3 tone_mul(float3 r0, float3 r1, float3 r2, float3 v)
 {
-	x = max(x, 0.0);
-	return saturate(x * (ToneA * x + ToneB) / (x * (ToneC * x + ToneD) + ToneE));
+	return float3(dot(r0, v), dot(r1, v), dot(r2, v));
 }
 
-float3 tone_fit_inverse(float3 y)
+/// A row of the table at texel position pos, linearly between texels (tone::lut_at).
+float tone_lut(float pos, int row)
 {
-	y = clamp(y, 0.0, ToneTop);
-	const float3 qa = ToneC * y - ToneA, qb = ToneD * y - ToneB, qc = ToneE * y;
-	return max((-qb - sqrt(max(qb * qb - 4.0 * qa * qc, 0.0))) / (2.0 * qa), 0.0);
+	const float n = float(tex2Dsize(sAstraTone).x);
+	pos = clamp(pos, 0.0, n - 1.0);
+	const float i = min(floor(pos), n - 2.0);
+	return lerp(tex2Dfetch(sAstraTone, int2(i, row)).r, tex2Dfetch(sAstraTone, int2(i + 1.0, row)).r, pos - i);
+}
+
+/// The film curve on one working-colour channel (tone::curve_from_lut).
+float tone_curve(float x)
+{
+	const float pos = (log2(max(x, 1e-30)) * 0.30103 - ToneLut.y) / (ToneLut.z - ToneLut.y) * (float(tex2Dsize(sAstraTone).x) - 1.0);
+	return x > 0.0 ? tone_lut(pos, 1) : 0.0;
+}
+
+/// ...and its inverse (tone::curve_inverse_from_lut).
+float tone_curve_inverse(float y)
+{
+	const float pos = sqrt(saturate(y / ToneLut.x)) * (float(tex2Dsize(sAstraTone).x) - 1.0);
+	return y > 0.0 ? exp2(tone_lut(pos, 0) * 3.32192809) : 0.0;
+}
+
+/// How far the gamut expansion moves an AP1 colour (tone::expand_amount).
+float tone_expand_amount(float3 c)
+{
+	const float luma = dot(c, ToneLuma);
+	const float3 d = c / max(luma, 1e-6) - 1.0;
+	return luma > 1e-6 ? (1.0 - exp2(-4.0 * dot(d, d))) * (1.0 - exp2(-4.0 * ToneLut.w * luma * luma)) : 0.0;
 }
 
 float3 srgb_decode(float3 c)
@@ -309,17 +355,31 @@ float3 srgb_encode(float3 c)
 	return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
 }
 
-/// A shown colour (sRGB, as her picture holds it) -> the game's scene colour (linear, pre-exposed).
+/// A shown colour (sRGB, as her picture holds it) -> the game's scene colour (linear, pre-exposed), times her exposure
+/// trim (tone::display_to_scene).
 float3 display_to_scene(float3 d)
 {
-	return tone_fit_inverse(srgb_decode(d)) * ToneExposure / TonePre;
+	float3 c = clamp(tone_mul(ToneInvIn0, ToneInvIn1, ToneInvIn2, srgb_decode(d)), 0.0, ToneLut.x);
+	c = float3(tone_curve_inverse(c.x), tone_curve_inverse(c.y), tone_curve_inverse(c.z));
+	c = tone_mul(ToneInvOut0, ToneInvOut1, ToneInvOut2, c);
+	const float3 target = c;
+	[unroll] for (int k = 0; k < ToneUnexpand; ++k)
+		c = target - tone_expand_amount(c) * (tone_mul(ToneExpand0, ToneExpand1, ToneExpand2, c) - c);
+	return max(tone_mul(ToneFromAp1_0, ToneFromAp1_1, ToneFromAp1_2, c), 0.0) * ToneExposure;
 }
 
 /// The game's colour where this runs -> about what the game will show there (sRGB): the light, fog and grade around her
-/// are measured in her picture's own space wherever the effect runs.
+/// are measured in her picture's own space wherever the effect runs (tone::scene_to_display). Her exposure trim is
+/// hers: it never enters what the world measures.
 float3 host_display(float3 c)
 {
-	return AstraHdr ? srgb_encode(tone_fit(c * TonePre / max(ToneExposure, 1e-4))) : c;
+	if (!AstraHdr)
+		return c;
+	c = tone_mul(ToneToAp1_0, ToneToAp1_1, ToneToAp1_2, c);
+	c += (tone_mul(ToneExpand0, ToneExpand1, ToneExpand2, c) - c) * tone_expand_amount(c);
+	c = max(tone_mul(ToneFwdIn0, ToneFwdIn1, ToneFwdIn2, c), 0.0);
+	c = float3(tone_curve(c.x), tone_curve(c.y), tone_curve(c.z));
+	return srgb_encode(tone_mul(ToneFwdOut0, ToneFwdOut1, ToneFwdOut2, c));
 }
 
 float3 bands(float z)

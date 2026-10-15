@@ -11,14 +11,18 @@ namespace layer
 	/// Composite her this frame (the engine is linked, a provider is live and she is shown).
 	void set_active(bool active);
 	bool active();
-	/// The effects about to run draw into the game's HDR scene colour, before its tonemapper (pretone.cpp): her
-	/// picture is mapped into the scene's light (tone.h), the game's own grade applies to her after.
-	void set_hdr_pass(bool hdr);
+	/// The effects about to run draw into the game's HDR scene colour, before its tonemapper (pretone.cpp), on a game
+	/// thread recording command list `frame` presents in: her picture is mapped into the scene's light (tone.h), the
+	/// game's own grade applies to her after, and her picture is uploaded through that command list.
+	void set_hdr_pass(bool hdr, unsigned long long frame);
+	/// The tone table exists (made on the present thread, the first time the effects run there): her pass before the
+	/// tonemapper waits for it.
+	bool tone_ready();
 	/// [tone] Exposure: her brightness in the game's scene, before its tone curve (1: as her engine drew her).
 	float &tone_exposure();
-	/// How many times the effects began (ReShade's begin-effects event): tells a caller of render_effects whether
-	/// they ran (not while they compile for a new target, nor twice in a frame).
-	unsigned long long effect_runs();
+	/// How many times her technique was drawn (ReShade's render-technique event): tells a caller of render_effects
+	/// whether she was (not while the effects compile for a new target or reload, nor twice in a frame).
+	unsigned long long her_runs();
 	/// Where the engine says its frames are ("/dev/shm/astra-frame" or "Local\\AstraFrame"): mapped again at
 	/// every hello (a restarted engine's ring is a new file). Present thread only.
 	void set_frames_at(const char *where);

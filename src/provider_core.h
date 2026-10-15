@@ -240,6 +240,25 @@ namespace provider
 			game = m_game;
 		}
 
+		/// The game's engine as the provider declares it ("unreal"; "" none). False (kept as it was): not a name.
+		bool set_engine(const char *engine)
+		{
+			const bool reset = engine == nullptr || *engine == 0;
+			if (!reset && !valid_name(engine))
+			{
+				++refused;
+				return false;
+			}
+			std::lock_guard<std::mutex> lock(m_lock);
+			m_engine = reset ? "" : engine;
+			return true;
+		}
+		std::string engine()
+		{
+			std::lock_guard<std::mutex> lock(m_lock);
+			return m_engine;
+		}
+
 		/// The point of her that her placement names: "feet" or a bone. False (kept as it was): not an identifier.
 		bool set_anchor(const char *point)
 		{
@@ -312,7 +331,7 @@ namespace provider
 	private:
 		std::mutex m_lock;
 		std::vector<Cue> m_cues;
-		std::string m_integration, m_game;
+		std::string m_integration, m_game, m_engine;
 		std::string m_anchor = "feet";
 		std::vector<Param> m_params;
 		PresentCallback m_present;

@@ -97,6 +97,7 @@ namespace
 	/// reshade_present event - her picture would land one frame behind the world: a ghost on every fast turn.)
 	void on_present(command_queue *, swapchain *swap, const rect *, const rect *, uint32_t, const rect *)
 	{
+		pretone::present_begins(); // first: no pass of hers on a recording thread from here to ReShade's Present work's end
 		++g_frame;
 		if (!g_started)
 		{
@@ -227,13 +228,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 			return FALSE;
 		g_settings = config::load();
 		_wfopen_s(&g_log, g_settings.log_path.c_str(), L"a");
-		logf("---- Astra (astra-reshade) loaded; settings from %ls; engine port %d%s; tone: exposure %.2f, %s", g_settings.source.c_str(),
-			g_settings.port, g_settings.token.empty() ? "" : ", token set", g_settings.tone_exposure,
-			g_settings.tone_present ? "at presentation" : "before the tonemapper when found");
+		logf("---- Astra (astra-reshade) loaded; settings from %ls; engine port %d%s; tone: exposure %.2f, path %s%s%s", g_settings.source.c_str(),
+			g_settings.port, g_settings.token.empty() ? "" : ", token set", g_settings.tone_exposure, g_settings.tone_present ? "present" : "auto",
+			g_settings.tone_engine.empty() ? "" : ", engine ", g_settings.tone_engine.c_str());
 		guard::install();
 		load_overlay_settings();
 		layer::install();
-		pretone::install(begin_frame);
+		pretone::install(begin_frame, g_settings.tone_engine);
 		reshade::register_event<reshade::addon_event::present>(on_present);
 		reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
 		reshade::register_overlay("Astra", on_overlay);

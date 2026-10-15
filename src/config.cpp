@@ -74,6 +74,8 @@ namespace config
 			}
 			GetPrivateProfileStringW(L"tone", L"Path", L"auto", v, 64, ini.c_str());
 			s.tone_present = _wcsicmp(v, L"present") == 0;
+			GetPrivateProfileStringW(L"tone", L"Engine", L"", v, 64, ini.c_str());
+			s.tone_engine = clean_token(v);
 		}
 		else
 		{
@@ -97,6 +99,8 @@ namespace config
 			}
 			if (GetEnvironmentVariableW(L"ASTRA_TONE_PATH", v, 300) > 0)
 				s.tone_present = _wcsicmp(v, L"present") == 0;
+			if (GetEnvironmentVariableW(L"ASTRA_TONE_ENGINE", v, 300) > 0)
+				s.tone_engine = clean_token(v);
 			if (!ini.empty())
 				s.source = L"defaults (-AstraConfig file not found: " + ini + L")";
 		}

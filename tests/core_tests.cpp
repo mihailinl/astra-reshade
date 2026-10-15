@@ -2,10 +2,12 @@
 // camera math and the frame-ring reader (crop included). Run: tests/run.sh (any Linux/macOS clang++ or g++).
 #include "lines.h"
 #include "passfind.h"
+#include "pretone_rules.h"
 #include "provider_core.h"
 #include "ring.h"
 #include "tone.h"
 #include "view.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -101,6 +103,11 @@ struct Recorder : lines::Sink
 		a = i;
 		b = g;
 	}
+	void engine(const char *e) override
+	{
+		calls.push_back("engine");
+		a = e;
+	}
 	void message(const char *t) override
 	{
 		calls.push_back("message");
@@ -148,6 +155,8 @@ static void test_lines()
 	CHECK(!parse(r, "P"));
 	CHECK(parse(r, "I astra.unreal Scarlet Skips") && r.a == "astra.unreal" && r.b == "Scarlet Skips");
 	CHECK(parse(r, "I astra.unreal Scarlet Skips\r") && r.b == "Scarlet Skips");
+	CHECK(parse(r, "E unreal") && r.calls.back() == "engine" && r.a == "unreal");
+	CHECK(!parse(r, "E") && !parse(r, "E unreal 5"));
 	CHECK(parse(r, "M hello there  world") && r.a == "hello there  world");
 	CHECK(parse(r, "M") && r.a.empty());
 	CHECK(!parse(r, "X 1 2"));
@@ -239,6 +248,9 @@ static void test_provider()
 	CHECK(st.set_anchor("hips") && st.anchor() == "hips");
 	CHECK(!st.set_anchor("hi\"ps") && !st.set_anchor("9lives") && st.anchor() == "hips");
 	CHECK(st.set_anchor(nullptr) && st.anchor() == "feet");
+	// the game's engine, as declared: a name or nothing, kept until changed
+	CHECK(st.engine().empty() && st.set_engine("unreal") && st.engine() == "unreal");
+	CHECK(!st.set_engine("un\"real") && st.engine() == "unreal" && st.set_engine("") && st.engine().empty());
 	CHECK(provider::valid_ident("seated") && provider::valid_ident("_x9") && !provider::valid_ident("a-b") && !provider::valid_ident(std::string(33, 'a').c_str()));
 	CHECK(st.set_param("seated", 1.0f) && st.set_param("vspeed", -2.0f) && st.set_param("vspeed", -3.0f));
 	CHECK(!st.set_param("speed", 1.0f) && !st.set_param("airborne", 0.0f) && !st.set_param("bad name", 1.0f) && !st.set_param("x", INFINITY));
@@ -254,7 +266,7 @@ static void test_provider()
 	for (int i = 0; i < 20; ++i)
 		st.set_param(("p" + std::to_string(i)).c_str(), float(i));
 	CHECK(st.take_params().size() == provider::kMaxParams);
-	CHECK(st.refused == 2 + 2 + 4 + (20 - (provider::kMaxParams - 1))); // cues, anchors, params, the 17th on
+	CHECK(st.refused == 2 + 2 + 1 + 4 + (20 - (provider::kMaxParams - 1))); // cues, anchors, an engine, params, the 17th on
 	// the present callback: one at a time, the last registration wins, NULL unregisters
 	static int called = 0;
 	struct Cb
@@ -591,12 +603,17 @@ static void test_passfind()
 		d.reads = {tex(18, 512, 512, kRGBA16F)};
 		CHECK(d.scene() == 0);
 	}
-	// a game that tonemaps at its render resolution (same aspect, at least half size) and upscales after; not another aspect
+	// a game that tonemaps at its render resolution (same aspect, at least half size) and upscales after: shown in a
+	// trace, never drawn into - each size would be another copy and another effect permutation, and a size following
+	// dynamic resolution would free a copy the GPU still reads (she is drawn at Present there); not another aspect
 	{
-		Draw a(tex(19, 1280, 720, kBGRA8)), b(tex(20, 1280, 1024, kBGRA8));
+		Draw a(tex(19, 1280, 720, kBGRA8)), b(tex(20, 1280, 1024, kBGRA8)), c(tex(23, 1920, 1080, kBGRA8));
 		a.reads = {tex(21, 1280, 720, kRGBA16F)};
 		b.reads = {tex(22, 1280, 1024, kRGBA16F)};
-		CHECK(a.scene() == 21 && b.scene() == 0);
+		c.reads = {tex(24, 1920, 1080, kRGBA16F)};
+		CHECK(a.scene() == 0 && b.scene() == 0 && c.scene() == 24);
+		CHECK(passfind::near_presented_size(1280, 720, kOutW, kOutH) && !passfind::near_presented_size(1280, 1024, kOutW, kOutH));
+		CHECK(!passfind::presented_size(1440, 810, kOutW, kOutH) && passfind::presented_size(kOutW, kOutH, kOutW, kOutH));
 	}
 	// an HDR picture of another size, or one bound for writing, is not its input; two of them are flagged
 	{
@@ -629,56 +646,280 @@ static void test_passfind()
 	}
 }
 
+// ---- pretone's rules: where she is drawn, the fallback, what is freed when, what a draw reads ------------------------
+
+static void test_pretone_rules()
+{
+	using pretone_rules::Facts;
+	using pretone_rules::Where;
+	// before the tonemapper ONLY in a game declared Unreal (by the provider or the launcher's ini): Death Stranding's
+	// provider declares nothing (and reads its camera at presentation), a Unity game declares unity - both at Present
+	Facts f;
+	CHECK(pretone_rules::choose(f).where == Where::present);
+	f.declared = "unreal";
+	CHECK(pretone_rules::choose(f).where == Where::before);
+	Facts ds;
+	ds.present_callback = true;
+	CHECK(pretone_rules::choose(ds).where == Where::present);
+	ds.declared = "unreal";
+	CHECK(pretone_rules::choose(ds).where == Where::present); // its camera is read at presentation: too late for the tonemapper
+	Facts unity;
+	unity.declared = "unity";
+	CHECK(pretone_rules::choose(unity).where == Where::present);
+	Facts ini;
+	ini.ini = "unreal";
+	CHECK(pretone_rules::choose(ini).where == Where::before);
+	ini.path_present = true;
+	CHECK(pretone_rules::choose(ini).where == Where::present);
+	Facts hdr;
+	hdr.declared = "unreal";
+	hdr.hdr_output = true;
+	CHECK(pretone_rules::choose(hdr).where == Where::present);
+
+	// her pass at the tonemapper that did not draw (ReShade compiling the effects for the scene colour): one frame lost,
+	// then the Present path held, longer each time, then given up - never a run of frames without her
+	{
+		pretone_rules::Fallback fb;
+		int lost = 0, tries = 0;
+		// the effects compile for 5 s (300 frames): every try before that is a miss
+		for (uint64_t frame = 0; frame < 2000; ++frame)
+		{
+			if (fb.holding(frame))
+				continue;
+			++tries;
+			const bool drawn = frame >= 300;
+			lost += !drawn;
+			fb.result(frame, drawn);
+		}
+		CHECK(lost == 3 && tries > 1500 && !fb.given_up); // misses at 0, 60, 180 - three lost frames in 5 s - drawn from 420
+		pretone_rules::Fallback never;
+		lost = 0;
+		for (uint64_t frame = 0; frame < 100000; ++frame)
+			if (!never.holding(frame))
+			{
+				++lost;
+				never.result(frame, false);
+			}
+		CHECK(never.given_up && lost == pretone_rules::Fallback::kGiveUp);
+	}
+
+	// a copy of the scene colour that is replaced is destroyed only frames later (the GPU may still read it)
+	{
+		pretone_rules::Retired<int> r;
+		std::vector<int> destroyed;
+		r.retire(1, 10);
+		r.collect(12, [&](int x) { destroyed.push_back(x); });
+		CHECK(destroyed.empty());
+		r.retire(2, 15);
+		r.collect(10 + pretone_rules::Retired<int>::kFrames, [&](int x) { destroyed.push_back(x); });
+		CHECK(destroyed.size() == 1 && destroyed[0] == 1 && r.items.size() == 1);
+		r.collect(100, [&](int x) { destroyed.push_back(x); });
+		CHECK(destroyed.size() == 2 && r.items.empty());
+	}
+
+	// what a draw reads: the descriptors copied for it since its list's previous draw - never an older copy, which may
+	// name a view of a texture freed since (asking a freed texture its size crashes)
+	{
+		using pretone_rules::Copy;
+		static pretone_rules::CopyRing ring, other; // one per recording thread
+		pretone_rules::Mark list;                   // the command list's: set at its reset and at every draw
+		list.ring = &ring;
+		list.at = ring.next;
+		const pretone_rules::Table tables[2] = {{0x100, 64}, {0, 0}};
+		pretone_rules::Slot out[64];
+		// draw 1: the game copies its two textures (from heap 0x900 slots 7, 8) into slots 64, 65, then draws
+		ring.push(Copy{0x100, 64, 2, 0x900, 7});
+		size_t n = pretone_rules::resolve(ring, pretone_rules::window(ring, list), tables, 2, out, 64);
+		CHECK(n == 2 && out[0].src_off == 7 && out[1].src_off == 8 && out[0].slot == 0);
+		list.at = ring.next; // the draw
+		// draw 2 reuses the same table without copying (the game's descriptor cache hit): no fresh copy, nothing read
+		n = pretone_rules::resolve(ring, pretone_rules::window(ring, list), tables, 2, out, 64);
+		CHECK(n == 0);
+		// draw 3: a copy into slot 65 only: slot 64's old descriptor is not looked up
+		ring.push(Copy{0x100, 65, 1, 0x900, 12});
+		n = pretone_rules::resolve(ring, pretone_rules::window(ring, list), tables, 2, out, 64);
+		CHECK(n == 1 && out[0].slot == 1 && out[0].src_off == 12);
+		list.at = ring.next;
+		// a list recorded on another thread than its mark's reads nothing
+		other.push(Copy{0x100, 64, 2, 0x900, 7});
+		CHECK(pretone_rules::window(other, list) == 0);
+		// many copies since: at most kLookBack, the newest win
+		for (int i = 0; i < 500; ++i)
+			ring.push(Copy{0x100, 64, 1, 0x900, uint32_t(i)});
+		CHECK(pretone_rules::window(ring, list) == pretone_rules::kLookBack);
+		n = pretone_rules::resolve(ring, pretone_rules::window(ring, list), tables, 2, out, 64);
+		CHECK(n == 1 && out[0].src_off == 499);
+	}
+}
+
 // ---- tone: her picture into the scene's light -----------------------------------------------------------------
+
+/// The largest channel difference.
+static double off3(const double a[3], const float b[3])
+{
+	return std::max({std::fabs(a[0] - b[0]), std::fabs(a[1] - b[1]), std::fabs(a[2] - b[2])});
+}
+
+/// Her shown colour through the model's inverse, then through the port of Unreal's whole default tonemapping: what the
+/// game will show of her.
+static void through_unreal(const float *lut, const tone::Matrices &m, const float d[3], double shown[3], float exposure = 1.0f)
+{
+	float s[3];
+	tone::display_to_scene(lut, m, d, exposure, s);
+	const double sd[3] = {s[0], s[1], s[2]};
+	tone::ue_reference(sd, shown);
+}
 
 static void test_tone()
 {
-	// the fit and its inverse are each other's inverse over her range, monotonic, 0 at 0
-	CHECK(tone::fit(0.0f) == 0.0f && tone::fit_inverse(0.0f) == 0.0f);
-	float prev = -1.0f;
-	bool monotonic = true, round = true;
-	for (int i = 0; i <= 98; ++i)
+	// Unreal's film curve with its defaults: 0.18 -> 0.18, 0 -> 0, rising to 1 + WhiteClip; the inverse inverts it
+	CHECK(near(tone::film_curve(0.18), 0.18, 1e-6) && tone::film_curve(0.0) == 0.0 && near(tone::film_curve(1e4), 1.04, 1e-3));
+	bool monotonic = true, inverse = true;
+	double prev = -1.0;
+	for (int i = 0; i <= 2200; ++i)
 	{
-		const float y = float(i) / 100.0f;
-		const float x = tone::fit_inverse(y);
-		monotonic = monotonic && x > prev;
-		prev = x;
-		round = round && near(tone::fit(x), y, 1e-4);
+		const double x = std::pow(10.0, -8.0 + 11.0 * i / 2200.0), y = tone::film_curve(x);
+		monotonic = monotonic && y > prev;
+		prev = y;
+		inverse = inverse && (y < 1e-9 || y > 1.035 || near(std::log10(tone::film_curve_inverse(y)), std::log10(x), 1e-6));
 	}
-	CHECK(monotonic && round);
-	// a shown colour into the scene and back is itself, at any exposure (light and fog are measured that way)
-	bool back = true;
-	for (float e : {0.5f, 1.0f, 2.0f})
-		for (int i = 0; i <= 95; ++i)
-		{
-			const float d = float(i) / 100.0f;
-			back = back && near(tone::scene_to_display(tone::display_to_scene(d, e), e), d, 2e-3);
-		}
-	CHECK(back);
-	// exposure scales her in the scene linearly; her whitest white stays finite (the fit's asymptote is cut at kTop)
-	CHECK(near(tone::display_to_scene(0.6f, 2.0f), 2.0f * tone::display_to_scene(0.6f, 1.0f), 1e-5));
-	const float white = tone::display_to_scene(1.0f, 1.0f);
-	CHECK(std::isfinite(white) && white > 2.0f && white < 50.0f);
-	// mid grey (sRGB 0.46, linear 0.18) lands near the scene's mid grey: she is not lit like another world
-	const float grey = tone::display_to_scene(0.46f, 1.0f);
-	CHECK(grey > 0.1f && grey < 0.6f);
+	CHECK(monotonic && inverse);
+	// the matrices: sRGB -> AP1 is ACEScg's (Bradford D65 -> D60), and each inverse is one
+	const tone::Matrices m = tone::matrices();
+	CHECK(near(m.to_ap1.m[0][0], 0.6131, 1e-3) && near(m.to_ap1.m[1][1], 0.9164, 1e-3) && near(m.to_ap1.m[2][2], 0.8698, 1e-3));
+	const tone::M3 one = tone::mul(m.fwd_in, m.inv_out), two = tone::mul(m.fwd_out, m.inv_in);
+	bool identity = true;
+	for (int i = 0; i < 3; ++i)
+		for (int j = 0; j < 3; ++j)
+			identity = identity && near(one.m[i][j], i == j, 1e-9) && near(two.m[i][j], i == j, 1e-9);
+	CHECK(identity);
+
+	std::vector<float> lut(2 * tone::kLutN);
+	tone::fill_lut(lut.data());
+	// the table's curve is the curve; its inverse the inverse (log10 within 0.003) from the darkest value an 8-bit
+	// picture holds (sRGB 1/255: linear 0.0003) to the table's top (kYMax: past it the inverse is clamped)
+	bool table = true;
+	for (int i = 1; i < 400; ++i)
+	{
+		const float x = std::pow(10.0f, -4.0f + 6.0f * float(i) / 400.0f);
+		const float y = float(tone::film_curve(x));
+		table = table && near(tone::curve_from_lut(lut.data(), x), y, 2e-4) &&
+				(y < 3e-4f || y > 1.03f || near(std::log10(tone::curve_inverse_from_lut(lut.data(), y)), std::log10(x), 3e-3));
+	}
+	CHECK(table);
+
+	// Unreal shows her as her engine drew her. Greys: exact (the review's: sRGB 0.50 came out 0.558 with the old
+	// curve - Narkowicz's ACES fit, per channel in sRGB)
+	bool greys = true;
+	for (int i = 1; i <= 20; ++i)
+	{
+		const float g = float(i) / 20.0f, d[3] = {g, g, g};
+		double shown[3];
+		through_unreal(lut.data(), m, d, shown);
+		greys = greys && off3(shown, d) < 0.004;
+	}
+	CHECK(greys);
+	// skin and hair within about a hundredth, cloth (a saturated red, the review's cyan) within a few: what is left is
+	// ACES's red modifier, not inverted (the old curve: skin 1.0 0.885 0.838, cyan 0.459 0.853 0.922)
+	const float skin[][3] = {{0.98f, 0.85f, 0.78f}, {0.6f, 0.45f, 0.35f}, {0.35f, 0.2f, 0.15f}, {0.95f, 0.8f, 0.85f}, {0.55f, 0.35f, 0.25f}};
+	const float cloth[][3] = {{0.2f, 0.25f, 0.45f}, {0.8f, 0.7f, 0.9f}, {0.9f, 0.3f, 0.3f}, {0.3f, 0.8f, 0.9f}};
+	double worst_skin = 0.0, worst_cloth = 0.0;
+	for (const auto &d : skin)
+	{
+		double shown[3];
+		through_unreal(lut.data(), m, d, shown);
+		worst_skin = std::max(worst_skin, off3(shown, d));
+	}
+	for (const auto &d : cloth)
+	{
+		double shown[3];
+		through_unreal(lut.data(), m, d, shown);
+		worst_cloth = std::max(worst_cloth, off3(shown, d));
+	}
+	std::printf("tone: through Unreal's default tonemapping, skin and hair off by %.4f at worst, cloth %.4f\n", worst_skin, worst_cloth);
+	CHECK(worst_skin < 0.02 && worst_cloth < 0.05);
+	// a grid of every colour up to 0.9 and saturation 0.6 (saturated: (max - min) / max): the mean within a hundredth;
+	// the worst - bright saturated colours near the curve's top, which the game itself can only show lighter - bounded
+	double sum = 0.0, grid_worst = 0.0;
+	int n = 0;
+	for (int r = 0; r <= 18; ++r)
+		for (int g = 0; g <= 18; ++g)
+			for (int b = 0; b <= 18; ++b)
+			{
+				const float d[3] = {r * 0.05f, g * 0.05f, b * 0.05f};
+				const float hi = std::max({d[0], d[1], d[2]}), lo = std::min({d[0], d[1], d[2]});
+				if (hi <= 0.0f || (hi - lo) / hi > 0.6f + 1e-4f)
+					continue;
+				double shown[3];
+				through_unreal(lut.data(), m, d, shown);
+				const double e = off3(shown, d);
+				sum += e;
+				grid_worst = std::max(grid_worst, e);
+				++n;
+			}
+	std::printf("tone: %d grid colours through Unreal's default tonemapping: mean %.4f, worst %.4f\n", n, sum / n, grid_worst);
+	CHECK(sum / n < 0.01 && grid_worst < 0.08);
+
+	// the model both ways (what the effect computes): shown -> scene -> shown is itself over the same grid
+	double back = 0.0;
+	for (int r = 0; r <= 18; r += 2)
+		for (int g = 0; g <= 18; g += 2)
+			for (int b = 0; b <= 18; b += 2)
+			{
+				const float d[3] = {r * 0.05f, g * 0.05f, b * 0.05f};
+				const float hi = std::max({d[0], d[1], d[2]}), lo = std::min({d[0], d[1], d[2]});
+				if (hi <= 0.0f || (hi - lo) / hi > 0.6f + 1e-4f)
+					continue;
+				float s[3], again[3];
+				tone::display_to_scene(lut.data(), m, d, 1.0f, s);
+				tone::scene_to_display(lut.data(), m, s, again);
+				const double dd[3] = {d[0], d[1], d[2]};
+				back = std::max(back, off3(dd, again));
+			}
+	CHECK(back < 0.05);
+
+	// her exposure trim scales HER scene colour; the world's light is measured without it (it used to be divided by it,
+	// so raising her trim made the world measure darker and the light match cancelled the trim)
+	const float d[3] = {0.6f, 0.5f, 0.4f};
+	float s1[3], s2[3];
+	tone::display_to_scene(lut.data(), m, d, 1.0f, s1);
+	tone::display_to_scene(lut.data(), m, d, 2.0f, s2);
+	CHECK(near(s2[0], 2.0 * s1[0], 1e-5) && near(s2[1], 2.0 * s1[1], 1e-5) && near(s2[2], 2.0 * s1[2], 1e-5));
+	// her whitest white stays finite (the curve's top is cut at kYMax), black stays black
+	const float white[3] = {1, 1, 1}, black[3] = {0, 0, 0};
+	float sw[3], sb[3];
+	tone::display_to_scene(lut.data(), m, white, 1.0f, sw);
+	tone::display_to_scene(lut.data(), m, black, 1.0f, sb);
+	CHECK(std::isfinite(sw[0]) && sw[1] > 2.0f && sw[1] < 100.0f && sb[0] == 0.0f && sb[1] == 0.0f && sb[2] == 0.0f);
 }
 
-/// AstraPassthrough.fx carries tone.h's curve in HLSL: the same constants, or her colours drift between the two.
-static void test_tone_constants_in_effect()
+/// AstraPassthrough.fx takes tone.h's model from the add-on: it must declare every uniform tone.h sets, the curve's
+/// table, the same number of fixed-point steps - and its measure of the world must not use her exposure trim.
+static void test_tone_in_effect()
 {
 	std::ifstream f(ASTRA_FX);
 	CHECK(f.good());
 	std::stringstream ss;
 	ss << f.rdbuf();
 	const std::string fx = ss.str();
-	const auto constant = [&](const char *name) {
-		const std::regex re(std::string("static const float ") + name + R"(\s*=\s*([0-9.]+)\s*;)");
-		std::smatch m;
-		return std::regex_search(fx, m, re) ? std::stof(m[1].str()) : -1.0f;
-	};
-	CHECK(constant("ToneA") == tone::kA && constant("ToneB") == tone::kB && constant("ToneC") == tone::kC);
-	CHECK(constant("ToneD") == tone::kD && constant("ToneE") == tone::kE && constant("TonePre") == tone::kPre && constant("ToneTop") == tone::kTop);
+	tone::Uniform u[tone::kUniforms];
+	tone::uniforms(u);
+	bool all = true;
+	for (const tone::Uniform &x : u)
+		all = all && std::regex_search(fx, std::regex(std::string(R"(uniform\s+float3\s+)") + x.name + R"(\b)"));
+	CHECK(all);
+	CHECK(std::regex_search(fx, std::regex(R"(uniform\s+float4\s+ToneLut\b)")) && std::regex_search(fx, std::regex(R"(texture\s+AstraToneTex\s*:\s*ASTRATONE\s*;)")));
+	std::smatch m;
+	CHECK(std::regex_search(fx, m, std::regex(R"(static const int ToneUnexpand\s*=\s*([0-9]+)\s*;)")) && std::stoi(m[1].str()) == tone::kUnexpand);
+	const size_t at = fx.find("float3 host_display(float3 c)");
+	CHECK(at != std::string::npos);
+	if (at != std::string::npos)
+	{
+		const std::string body = fx.substr(at, fx.find("\n}\n", at) - at);
+		CHECK(body.find("ToneExposure") == std::string::npos && body.find("tone_curve(") != std::string::npos);
+	}
+	// no curve constant of its own (the old Narkowicz fit's)
+	CHECK(fx.find("ToneA") == std::string::npos && fx.find("TonePre") == std::string::npos);
 }
 
 int main(int argc, char **argv)
@@ -688,8 +929,9 @@ int main(int argc, char **argv)
 	test_view();
 	test_ring();
 	test_passfind();
+	test_pretone_rules();
 	test_tone();
-	test_tone_constants_in_effect();
+	test_tone_in_effect();
 	if (argc > 1)
 		test_lua_lines(argv[1]);
 	std::printf("%d checks, %d failed\n", g_checks, g_failed);

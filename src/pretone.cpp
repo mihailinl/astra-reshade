@@ -2,6 +2,8 @@
 #include "layer.h"
 #include "log.h"
 #include "passfind.h"
+#include "pretone_rules.h"
+#include "provider.h"
 #include <windows.h>
 #include <d3d12.h>
 #include <algorithm>
@@ -26,6 +28,8 @@ namespace pretone
 		struct __declspec(uuid("7c3f5a52-2d1e-4c8b-9e64-5b1a0f3d2e71")) ListState
 		{
 			passfind::Tracker find;
+			uint64_t epoch = 0;        // g_onEpoch when this list was reset with pretone on (0: not tracked from its start)
+			pretone_rules::Mark mark; // where its previous draw left the recording thread's descriptor copies
 			std::vector<resource_view> rtvs;
 			resource_view dsv = {0};
 			pipeline pso = {0};
@@ -79,6 +83,8 @@ namespace pretone
 			void clear()
 			{
 				find.reset();
+				epoch = 0;
+				mark = pretone_rules::Mark();
 				rtvs.clear();
 				dsv = {0};
 				pso = {0};
@@ -100,21 +106,46 @@ namespace pretone
 		std::atomic<effect_runtime *> g_runtime{nullptr};
 		std::atomic<uint32_t> g_outW{0}, g_outH{0};
 		std::atomic<bool> g_hdrOutput{false};
-		std::atomic<uint64_t> g_presents{0}, g_drawnAt{~uint64_t(0)}, g_foundAt{~uint64_t(0)};
+		std::atomic<uint64_t> g_presents{0}, g_drawnAt{~uint64_t(0)}, g_ranAt{~uint64_t(0)}, g_foundAt{~uint64_t(0)};
 		int g_path = 0;
+		std::string g_iniEngine; // [tone] Engine= of the launcher's ini
 
-		// her pass's own target: a copy of the game's scene colour (same size and format)
+		// pretone_rules::choose, once per Present: on only in a game declared Unreal. Off, every command-stream event
+		// below returns at once - the game's frames are handled exactly as before pretone existed. A list is tracked
+		// only if pretone was on since its reset (g_onEpoch): what it bound before is unknown, and her pass puts back
+		// what it saw bound.
+		std::atomic<bool> g_on{false};
+		std::atomic<uint64_t> g_onEpoch{1};
+		const char *g_why = "";
+
+		// ReShade picks her effects' target by whether ANY thread is inside Present (a runtime-wide flag): a pass drawn
+		// on a recording thread while the present thread is in ReShade's Present would draw into the back buffer's
+		// copy, and both would race ReShade's per-frame state. The present thread holds g_presenting from the add-on's
+		// present event until reshade_present (and waits there for a pass in flight); a recording thread draws her pass
+		// only while it holds g_recording - one at a time - and Present is not in progress (else: Present path).
+		std::atomic<bool> g_presenting{false}, g_recording{false};
+
+		// her pass's own target: a copy of the game's scene colour (same size and format); a replaced one is destroyed
+		// only frames later (the GPU may still read it)
+		struct Copy
+		{
+			resource tex = {0};
+			resource_view rtv = {0};
+		};
 		std::mutex g_targetLock;
 		device *g_device = nullptr;
 		resource g_copy = {0};
 		resource_view g_copyRtv = {0};
 		resource_desc g_copyDesc;
+		pretone_rules::Retired<Copy> g_retired;
+		pretone_rules::Fallback g_fallback; // touched only by the thread holding g_recording
 
 		// what happened, for the log and the overlay
-		std::atomic<uint64_t> g_before{0}, g_atPresent{0}, g_found{0}, g_periodBefore{0}, g_periodPresent{0};
+		std::atomic<uint64_t> g_before{0}, g_atPresent{0}, g_lost{0}, g_found{0}, g_contended{0}, g_periodBefore{0}, g_periodPresent{0}, g_periodLost{0};
 		ULONGLONG g_nextStats = 0;
-		bool g_loggedFound = false, g_loggedAmbiguous = false, g_loggedCompute = false, g_loggedHdr = false, g_loggedNone = false, g_loggedApi = false, g_loggedFail = false;
-		char g_status[220] = "drawn at presentation (over the game's UI): no frame yet";
+		bool g_loggedFound = false, g_loggedAmbiguous = false, g_loggedCompute = false, g_loggedHdr = false, g_loggedNone = false, g_loggedApi = false,
+			 g_loggedFail = false, g_loggedHold = false, g_loggedGiveUp = false;
+		char g_status[260] = "drawn at presentation (over the game's UI): no frame yet";
 
 		// ASTRA_PRETONE_TRACE=<frame>: that frame's command stream as the finder sees it, into the log (a game whose
 		// tonemapper is not found: what its post-processing looks like)
@@ -152,9 +183,26 @@ namespace pretone
 			return t;
 		}
 
+		/// The recording thread's descriptor copies (pretone_rules::CopyRing).
+		thread_local pretone_rules::CopyRing t_ring;
+
+		/// A list starts (made, or reset): tracked from here if pretone is on.
+		void start_list(ListState &s)
+		{
+			s.clear();
+			s.epoch = g_on.load(std::memory_order_relaxed) ? g_onEpoch.load(std::memory_order_relaxed) : 0;
+			s.mark = pretone_rules::Mark{&t_ring, t_ring.next};
+		}
+
+		bool on()
+		{
+			return g_on.load(std::memory_order_relaxed);
+		}
+
 		void on_init_command_list(command_list *cmd)
 		{
-			cmd->create_private_data<ListState>();
+			if (ListState *s = cmd->create_private_data<ListState>())
+				start_list(*s);
 		}
 
 		void on_destroy_command_list(command_list *cmd)
@@ -165,11 +213,13 @@ namespace pretone
 		void on_reset_command_list(command_list *cmd)
 		{
 			if (ListState *s = state(cmd))
-				s->clear();
+				start_list(*s);
 		}
 
 		void on_bind_render_targets(command_list *cmd, uint32_t count, const resource_view *rtvs, resource_view dsv)
 		{
+			if (!on())
+				return;
 			ListState *s = state(cmd);
 			if (s == nullptr)
 				return;
@@ -186,6 +236,8 @@ namespace pretone
 
 		bool on_begin_render_pass(command_list *cmd, uint32_t, const render_pass_render_target_desc *, const render_pass_depth_stencil_desc *, render_pass_flags)
 		{
+			if (!on())
+				return false;
 			if (ListState *s = state(cmd))
 				s->find.in_pass = true;
 			return false;
@@ -193,6 +245,8 @@ namespace pretone
 
 		bool on_end_render_pass(command_list *cmd)
 		{
+			if (!on())
+				return false;
 			if (ListState *s = state(cmd))
 				s->find.in_pass = false;
 			return false;
@@ -200,6 +254,8 @@ namespace pretone
 
 		void on_bind_pipeline(command_list *cmd, pipeline_stage stages, pipeline p)
 		{
+			if (!on())
+				return;
 			ListState *s = state(cmd);
 			if (s != nullptr && (stages & (pipeline_stage::all_graphics | pipeline_stage::all_compute)) != 0)
 			{
@@ -210,6 +266,8 @@ namespace pretone
 
 		void on_bind_pipeline_states(command_list *cmd, uint32_t count, const dynamic_state *states, const uint32_t *values)
 		{
+			if (!on())
+				return;
 			ListState *s = state(cmd);
 			if (s == nullptr)
 				return;
@@ -243,6 +301,8 @@ namespace pretone
 
 		void on_bind_viewports(command_list *cmd, uint32_t first, uint32_t count, const viewport *vps)
 		{
+			if (!on())
+				return;
 			ListState *s = state(cmd);
 			if (s == nullptr)
 				return;
@@ -256,6 +316,8 @@ namespace pretone
 
 		void on_bind_scissor_rects(command_list *cmd, uint32_t first, uint32_t count, const rect *rects)
 		{
+			if (!on())
+				return;
 			ListState *s = state(cmd);
 			if (s == nullptr)
 				return;
@@ -268,6 +330,8 @@ namespace pretone
 		void on_bind_descriptor_tables(command_list *cmd, shader_stage stages, pipeline_layout layout, uint32_t first, uint32_t count,
 			const descriptor_table *tables, uint32_t, const uint32_t *)
 		{
+			if (!on())
+				return;
 			ListState *s = state(cmd);
 			ListState::Root *r = s != nullptr ? s->root(stages) : nullptr;
 			if (r == nullptr)
@@ -287,6 +351,8 @@ namespace pretone
 
 		void on_push_descriptors(command_list *cmd, shader_stage stages, pipeline_layout layout, uint32_t index, const descriptor_table_update &update)
 		{
+			if (!on())
+				return;
 			ListState *s = state(cmd);
 			ListState::Root *r = s != nullptr ? s->root(stages) : nullptr;
 			if (r == nullptr || update.count != 1 || update.descriptors == nullptr)
@@ -313,6 +379,8 @@ namespace pretone
 
 		void on_push_constants(command_list *cmd, shader_stage stages, pipeline_layout layout, uint32_t index, uint32_t first, uint32_t count, const void *values)
 		{
+			if (!on())
+				return;
 			ListState *s = state(cmd);
 			ListState::Root *r = s != nullptr ? s->root(stages) : nullptr;
 			if (r == nullptr || values == nullptr)
@@ -333,6 +401,8 @@ namespace pretone
 
 		void on_barrier(command_list *cmd, uint32_t count, const resource *resources, const resource_usage *, const resource_usage *new_states)
 		{
+			if (!on())
+				return;
 			constexpr resource_usage writes = resource_usage::render_target | resource_usage::unordered_access | resource_usage::depth_stencil_write |
 											  resource_usage::copy_dest | resource_usage::vertex_buffer;
 			for (uint32_t i = 0; i < count; ++i)
@@ -361,25 +431,9 @@ namespace pretone
 		}
 
 		// What a draw reads: Direct3D 12 games copy the descriptors of a draw's textures into the shader-visible heap
-		// right before it, on the thread recording it (Unreal's descriptor cache does). A ring of this thread's recent
-		// copies maps a bound table's slots back to the views copied there, and the views to their textures.
-		struct Copy
-		{
-			uint64_t heap;     // the destination heap (the original ID3D12DescriptorHeap, as ReShade hands it out)
-			uint32_t off;      // the first destination slot
-			uint32_t count;
-			uint64_t src_heap; // where the first source descriptor is: ReShade names a view by its ORIGINAL CPU handle
-			uint32_t src_off;
-		};
-		// copies kept per thread; how far back a draw looks (its own descriptors were copied right before it); slots of a
-		// table looked at
-		constexpr uint32_t kRing = 1024, kLookBack = 128, kSpan = 32;
-		struct Ring
-		{
-			Copy c[kRing];
-			uint32_t next;
-		};
-		thread_local Ring t_ring;
+		// right before it, on the thread recording it (Unreal's descriptor cache does). The thread's ring of copies maps a
+		// bound table's slots back to the views copied there - only the copies since the list's previous draw
+		// (pretone_rules::window) - and the views to their textures.
 
 		// Which slots of each root signature's tables are written (unordered-access views): a compute tonemapper writes
 		// its output through one. Root signatures are made at load; looked up only for a draw or dispatch of interest.
@@ -436,7 +490,7 @@ namespace pretone
 
 		bool on_copy_descriptor_tables(device *dev, uint32_t count, const descriptor_table_copy *copies)
 		{
-			if (dev->get_api() != device_api::d3d12)
+			if (!on() || dev->get_api() != device_api::d3d12)
 				return false;
 			uint32_t inc = g_increment;
 			if (inc == 0)
@@ -455,23 +509,18 @@ namespace pretone
 				uint32_t off = 0, src_off = 0;
 				dev->get_descriptor_heap_offset(c.dest_table, c.dest_binding, 0, &heap, &off);
 				dev->get_descriptor_heap_offset(c.source_table, c.source_binding, 0, &src_heap, &src_off);
-				Copy &slot = t_ring.c[t_ring.next++ % kRing];
-				slot.heap = heap.handle;
-				slot.off = off;
-				slot.count = c.count;
-				slot.src_heap = src_heap.handle;
-				slot.src_off = src_off;
+				t_ring.push(pretone_rules::Copy{heap.handle, off, c.count, src_heap.handle, src_off});
 			}
 			return false;
 		}
 
-		/// The textures the draw about to be recorded reads, through the tables bound for it (newest copy wins a slot).
-		size_t draw_reads(command_list *cmd, const ListState::Root &s, passfind::Tex *out, size_t cap)
+		/// The textures the draw about to be recorded reads, through the tables bound for it: only the descriptors copied
+		/// since this list's previous draw (`window`), each looked up through ReShade's view of it.
+		size_t draw_reads(command_list *cmd, const ListState::Root &s, uint32_t window, passfind::Tex *out, size_t cap)
 		{
 			device *dev = cmd->get_device();
 			const uint32_t inc = g_increment;
-			size_t n = 0;
-			if (inc == 0)
+			if (inc == 0 || window == 0)
 				return 0;
 			std::vector<std::vector<Range>> ranges; // this root signature's table ranges (a copy: the lock is not held long)
 			{
@@ -479,87 +528,75 @@ namespace pretone
 				if (const auto it = g_layouts.find(s.layout.handle); it != g_layouts.end())
 					ranges = it->second;
 			}
-			// where each table starts: a table's slots end where the next one bound from the same heap begins (a game
-			// lays the tables of one draw side by side, and declares more slots than it fills)
 			constexpr size_t kTables = 16;
-			uint64_t heaps[kTables] = {};
-			uint32_t bases[kTables] = {};
-			const size_t tables = std::min(s.params.size(), kTables);
-			for (size_t pi = 0; pi < tables; ++pi)
+			pretone_rules::Table tables[kTables];
+			const size_t n_tables = std::min(s.params.size(), kTables);
+			for (size_t pi = 0; pi < n_tables; ++pi)
 				if (s.params[pi].kind == ListState::Arg::table && s.params[pi].table.handle != 0)
 				{
 					descriptor_heap heap = {0};
-					dev->get_descriptor_heap_offset(s.params[pi].table, 0, 0, &heap, &bases[pi]);
-					heaps[pi] = heap.handle;
+					dev->get_descriptor_heap_offset(s.params[pi].table, 0, 0, &heap, &tables[pi].base);
+					tables[pi].heap = heap.handle;
 				}
-			for (size_t pi = 0; pi < tables; ++pi)
+			pretone_rules::Slot slots[kTables * pretone_rules::kSpan];
+			const size_t n_slots = pretone_rules::resolve(t_ring, window, tables, n_tables, slots, kTables * pretone_rules::kSpan);
+			size_t n = 0;
+			for (size_t i = 0; i < n_slots; ++i)
 			{
-				if (heaps[pi] == 0)
+				const pretone_rules::Slot &sl = slots[i];
+				// the view's original CPU handle: its heap's start + its slot (the heap is the original object)
+				const D3D12_CPU_DESCRIPTOR_HANDLE start = reinterpret_cast<ID3D12DescriptorHeap *>(sl.src_heap)->GetCPUDescriptorHandleForHeapStart();
+				const resource r = dev->get_resource_from_view(resource_view{start.ptr + uint64_t(sl.src_off) * inc});
+				passfind::Tex t = describe(dev, r);
+				if (t.id == 0)
 					continue;
-				const uint32_t base = bases[pi];
-				uint32_t end = base + kSpan;
-				for (size_t q = 0; q < tables; ++q)
-					if (q != pi && heaps[q] == heaps[pi] && bases[q] > base && bases[q] < end)
-						end = bases[q];
-				uint32_t seen = 0; // slots of this table resolved already (by a newer copy)
-				for (uint32_t k = 0; k < kLookBack && k < t_ring.next && seen != ~0u; ++k)
-				{
-					const Copy &c = t_ring.c[(t_ring.next - 1 - k) % kRing];
-					if (c.heap != heaps[pi] || c.count == 0 || c.off >= end || c.off + c.count <= base)
-						continue;
-					for (uint32_t j = 0; j < c.count; ++j)
+				t.written = slot_written(&ranges, sl.table, sl.slot);
+				bool dup = false;
+				for (size_t q = 0; q < n; ++q)
+					if (out[q].id == t.id)
 					{
-						const uint32_t slot = c.off + j;
-						if (slot < base || slot >= end || (seen & (1u << (slot - base))) != 0)
-							continue;
-						seen |= 1u << (slot - base);
-						if (c.src_heap == 0)
-							continue;
-						// the view's original CPU handle: its heap's start + its slot (the heap is the original object)
-						const D3D12_CPU_DESCRIPTOR_HANDLE start =
-							reinterpret_cast<ID3D12DescriptorHeap *>(c.src_heap)->GetCPUDescriptorHandleForHeapStart();
-						const resource r = dev->get_resource_from_view(resource_view{start.ptr + uint64_t(c.src_off + j) * inc});
-						passfind::Tex t = describe(dev, r);
-						if (t.id == 0)
-							continue;
-						t.written = slot_written(&ranges, pi, slot - base);
-						bool dup = false;
-						for (size_t q = 0; q < n; ++q)
-							if (out[q].id == t.id)
-							{
-								dup = true;
-								out[q].written = out[q].written || t.written;
-							}
-						if (!dup && n < cap)
-							out[n++] = t;
+						dup = true;
+						out[q].written = out[q].written || t.written;
 					}
-				}
+				if (!dup && n < cap)
+					out[n++] = t;
 			}
 			return n;
 		}
 
-		void destroy_copy()
+		void destroy_now(const Copy &c)
 		{
-			if (g_device != nullptr)
-			{
-				if (g_copyRtv.handle != 0)
-					g_device->destroy_resource_view(g_copyRtv);
-				if (g_copy.handle != 0)
-					g_device->destroy_resource(g_copy);
-			}
+			if (g_device == nullptr)
+				return;
+			if (c.rtv.handle != 0)
+				g_device->destroy_resource_view(c.rtv);
+			if (c.tex.handle != 0)
+				g_device->destroy_resource(c.tex);
+		}
+
+		/// The copy in use is replaced: destroyed only once no frame in flight can read it (pretone_rules::Retired).
+		void retire_copy(uint64_t frame)
+		{
+			if (g_copy.handle != 0 || g_copyRtv.handle != 0)
+				g_retired.retire(Copy{g_copy, g_copyRtv}, frame);
 			g_copy = {0};
 			g_copyRtv = {0};
 		}
 
 		/// Her pass's target: like the game's scene colour (its size, its format typed), and writable by ReShade.
-		bool ensure_copy(device *dev, resource scene)
+		bool ensure_copy(device *dev, resource scene, uint64_t frame)
 		{
 			const resource_desc d = dev->get_resource_desc(scene);
 			const format typed = format(passfind::typed_hdr(uint32_t(d.texture.format)));
 			if (g_copy.handle != 0 && g_device == dev && g_copyDesc.texture.width == d.texture.width && g_copyDesc.texture.height == d.texture.height &&
 				g_copyDesc.texture.format == typed)
 				return true;
-			destroy_copy();
+			if (g_device != dev)
+			{
+				retire_copy(0); // another device: its runtime went (and waited for its GPU)
+				g_retired.collect(~uint64_t(0) >> 1, destroy_now);
+			}
+			retire_copy(frame);
 			g_device = dev;
 			g_copyDesc = resource_desc(d.texture.width, d.texture.height, 1, 1, typed, 1, memory_heap::default_,
 				resource_usage::render_target | resource_usage::shader_resource | resource_usage::copy_source | resource_usage::copy_dest);
@@ -571,60 +608,58 @@ namespace pretone
 			dev->set_resource_name(g_copy, "Astra: the game's scene colour, her pass");
 			if (!dev->create_resource_view(g_copy, resource_usage::render_target, resource_view_desc(typed), &g_copyRtv))
 			{
-				destroy_copy();
+				dev->destroy_resource(g_copy); // never used by the GPU
+				g_copy = {0};
+				g_copyRtv = {0};
 				return false;
 			}
 			return true;
 		}
 
-		/// The game's graphics state back, as it was bound before her pass (the tonemapper draws right after).
-		void restore(command_list *cmd, const ListState &s)
+		/// One root signature's arguments back (ReShade's effects set their own heaps and root signatures, which leaves
+		/// the game's bound tables undefined - graphics AND compute).
+		void restore_root(command_list *cmd, shader_stage stage, const ListState::Root &r)
 		{
-			const ListState::Root &g = s.gfx;
-			if (g.layout.handle != 0)
+			if (r.layout.handle == 0)
+				return;
+			// no tables: ReShade puts the game's descriptor heaps and this root signature back
+			cmd->bind_descriptor_tables(stage, r.layout, 0, 0, nullptr);
+			const bool compute = stage == shader_stage::all_compute;
+			auto *native = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native());
+			for (uint32_t i = 0; i < uint32_t(r.params.size()); ++i)
 			{
-				// no tables: ReShade puts the game's descriptor heaps and this root signature back
-				cmd->bind_descriptor_tables(shader_stage::all_graphics, g.layout, 0, 0, nullptr);
-				auto *native = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native());
-				for (uint32_t i = 0; i < uint32_t(g.params.size()); ++i)
+				const ListState::Param &p = r.params[i];
+				switch (p.kind)
 				{
-					const ListState::Param &p = g.params[i];
-					switch (p.kind)
-					{
-					case ListState::Arg::table:
-						cmd->bind_descriptor_tables(shader_stage::all_graphics, g.layout, i, 1, &p.table);
-						break;
-					case ListState::Arg::cbv:
-						cmd->push_descriptors(shader_stage::all_graphics, g.layout, i, descriptor_table_update{{}, 0, 0, 1, descriptor_type::constant_buffer, &p.cbv});
-						break;
-					case ListState::Arg::srv: // ReShade's push_descriptors cannot take a raw address back: native
-						native->SetGraphicsRootShaderResourceView(i, p.va);
-						break;
-					case ListState::Arg::uav:
-						native->SetGraphicsRootUnorderedAccessView(i, p.va);
-						break;
-					case ListState::Arg::constants:
-						cmd->push_constants(shader_stage::all_graphics, g.layout, i, 0, uint32_t(p.constants.size()), p.constants.data());
-						break;
-					case ListState::Arg::none:
-						break;
-					}
+				case ListState::Arg::table:
+					cmd->bind_descriptor_tables(stage, r.layout, i, 1, &p.table);
+					break;
+				case ListState::Arg::cbv:
+					cmd->push_descriptors(stage, r.layout, i, descriptor_table_update{{}, 0, 0, 1, descriptor_type::constant_buffer, &p.cbv});
+					break;
+				case ListState::Arg::srv: // ReShade's push_descriptors cannot take a raw address back: native
+					compute ? native->SetComputeRootShaderResourceView(i, p.va) : native->SetGraphicsRootShaderResourceView(i, p.va);
+					break;
+				case ListState::Arg::uav:
+					compute ? native->SetComputeRootUnorderedAccessView(i, p.va) : native->SetGraphicsRootUnorderedAccessView(i, p.va);
+					break;
+				case ListState::Arg::constants:
+					cmd->push_constants(stage, r.layout, i, 0, uint32_t(p.constants.size()), p.constants.data());
+					break;
+				case ListState::Arg::none:
+					break;
 				}
 			}
-			else if (s.cmp.layout.handle != 0)
-			{
-				// no graphics root signature in this list yet (a compute tonemapper): the game's heaps back through one of
-				// its compute tables, bound again as it was - the same root signature, so its other arguments stay (ReShade's
-				// effects never touch the compute root)
-				for (uint32_t i = 0; i < uint32_t(s.cmp.params.size()); ++i)
-					if (s.cmp.params[i].kind == ListState::Arg::table)
-					{
-						cmd->bind_descriptor_tables(shader_stage::all_compute, s.cmp.layout, i, 1, &s.cmp.params[i].table);
-						break;
-					}
-			}
+		}
+
+		/// The game's state back, as it was bound before her pass (the tonemapper draws right after): both root
+		/// signatures with their arguments, the pipeline, the dynamic states, viewports, scissors, targets.
+		void restore(command_list *cmd, const ListState &s)
+		{
+			restore_root(cmd, shader_stage::all_compute, s.cmp);
+			restore_root(cmd, shader_stage::all_graphics, s.gfx); // last: its heaps are the ones the next draw uses
 			if (s.pso.handle != 0)
-				cmd->bind_pipeline(s.pso_stages, s.pso); // last: the slot is shared, the game's next draw or dispatch uses it
+				cmd->bind_pipeline(s.pso_stages, s.pso); // the slot is shared, the game's next draw or dispatch uses it
 			if (s.has_topology)
 				cmd->bind_pipeline_state(dynamic_state::primitive_topology, s.topology);
 			if (s.has_blend)
@@ -643,13 +678,36 @@ namespace pretone
 			cmd->bind_render_targets_and_depth_stencil(uint32_t(s.rtvs.size()), s.rtvs.data(), s.dsv);
 		}
 
+		/// Holds g_recording for one pass (released when it goes out of scope).
+		struct Recording
+		{
+			bool held = false;
+			Recording()
+			{
+				bool idle = false;
+				if (g_presenting.load() || !g_recording.compare_exchange_strong(idle, true))
+					return;
+				if (g_presenting.load()) // Present began between the two: it waits for us, but let it go first
+				{
+					g_recording.store(false);
+					return;
+				}
+				held = true;
+			}
+			~Recording()
+			{
+				if (held)
+					g_recording.store(false);
+			}
+		};
+
 		/// The tonemapper is about to draw: her pass into its input (a copy of it, copied back).
 		void draw_before(command_list *cmd, ListState &s, const passfind::Tex &scene, uint32_t scene_state)
 		{
 			++g_found;
 			const uint64_t frame = g_presents.load();
-			if (g_drawnAt.load() == frame || g_path != 0 || g_hdrOutput)
-				return; // drawn this frame already (a second view, a scene capture), or not wanted here
+			if (g_drawnAt.load() == frame || !on() || s.epoch != g_onEpoch.load())
+				return; // tried this frame already (a second view, a scene capture); pretone off; a list not tracked whole
 			device *dev = cmd->get_device();
 			effect_runtime *runtime = g_runtime.load();
 			if (runtime == nullptr || runtime->get_device() != dev)
@@ -663,12 +721,20 @@ namespace pretone
 				}
 				return;
 			}
+			const Recording rec;
+			if (!rec.held)
+			{
+				++g_contended; // Present is in ReShade now, or another thread draws her pass: at Present this frame
+				return;
+			}
+			if (g_drawnAt.load() == frame || g_fallback.holding(frame))
+				return;
 			g_beginFrame(); // this is the frame being drawn: its camera now (its picture is waited for in the effect)
-			if (!layer::active())
-				return; // she is not out: nothing to draw, the game's picture passes through at Present
+			if (!layer::active() || !layer::tone_ready())
+				return; // she is not out (the game's picture passes through at Present), or no Present ran the effects yet
 			const resource game = {scene.id};
 			std::lock_guard<std::mutex> lock(g_targetLock);
-			if (!ensure_copy(dev, game))
+			if (!ensure_copy(dev, game, frame))
 			{
 				if (!g_loggedFail)
 				{
@@ -693,11 +759,14 @@ namespace pretone
 			}
 			cmd->copy_texture_region(game, 0, nullptr, g_copy, 0, nullptr);
 			cmd->barrier(g_copy, resource_usage::copy_dest, resource_usage::render_target);
-			const unsigned long long runs = layer::effect_runs();
-			layer::set_hdr_pass(true);
+			const unsigned long long runs = layer::her_runs();
+			layer::set_hdr_pass(true, frame);
 			runtime->render_effects(cmd, g_copyRtv, g_copyRtv);
-			layer::set_hdr_pass(false);
-			const bool ran = layer::effect_runs() != runs; // not: effects still compiling for this target, or drawn this frame
+			layer::set_hdr_pass(false, frame);
+			// her technique drew - not: the effects compile for this target or reload. ReShade has marked this frame's
+			// effects drawn either way, so nothing is drawn at Present this frame: one lost frame, then the Present
+			// path is held a while (pretone_rules::Fallback)
+			const bool ran = layer::her_runs() != runs;
 			{
 				const resource r[2] = {g_copy, game};
 				const resource_usage from[2] = {resource_usage::render_target, resource_usage::copy_source},
@@ -714,8 +783,25 @@ namespace pretone
 			g_drawnAt = frame;
 			if (ran)
 			{
+				g_ranAt = frame;
 				++g_before;
 				++g_periodBefore;
+			}
+			if (g_fallback.result(frame, ran))
+			{
+				if (!g_loggedHold)
+				{
+					g_loggedHold = true;
+					logf("pretone: her pass before the tonemapper did not draw (the effects are compiling for its %ux%u scene colour): one frame "
+						 "without effects; she is drawn at presentation for %llu frames, then tried again",
+						scene.w, scene.h, (unsigned long long)g_fallback.hold);
+				}
+				if (g_fallback.given_up && !g_loggedGiveUp)
+				{
+					g_loggedGiveUp = true;
+					logf("pretone: her pass before the tonemapper did not draw %d times in a row: she is drawn at presentation from now on",
+						g_fallback.misses);
+				}
 			}
 		}
 
@@ -731,20 +817,31 @@ namespace pretone
 			logf("trace %lu %p: %s binding [%s ] -> %s", GetCurrentThreadId(), (void *)cmd, what, list, verdict);
 		}
 
+		/// This draw's descriptor copies: the ones since the list's previous draw (and the mark moves on).
+		uint32_t take_window(ListState &s)
+		{
+			const uint32_t w = pretone_rules::window(t_ring, s.mark);
+			s.mark = pretone_rules::Mark{&t_ring, t_ring.next};
+			return w;
+		}
+
 		bool on_draw_any(command_list *cmd, uint32_t vertices, uint32_t instances)
 		{
+			if (!on())
+				return false;
 			ListState *s = state(cmd);
 			if (s == nullptr)
 				return false;
+			const uint32_t window = take_window(*s);
 			const bool shape = passfind::tonemapper_shape(s->find, vertices, instances, g_outW, g_outH);
 			const bool trace = tracing() && vertices <= 6 && s->find.target.id != 0 &&
-							   passfind::presented_size(s->find.target.w, s->find.target.h, g_outW, g_outH);
+							   passfind::near_presented_size(s->find.target.w, s->find.target.h, g_outW, g_outH);
 			if (!shape && !trace)
 				return false;
 			if (shape && !trace && g_foundAt.load() == g_presents.load())
 				return false; // the tonemapper was this frame's already (the UI's quads come after it)
 			passfind::Tex reads[24];
-			const size_t n = draw_reads(cmd, s->gfx, reads, 24);
+			const size_t n = draw_reads(cmd, s->gfx, window, reads, 24);
 			bool ambiguous = false;
 			const passfind::Tex scene = shape ? passfind::scene_read(s->find, reads, n, &ambiguous) : passfind::Tex();
 			if (trace)
@@ -769,16 +866,21 @@ namespace pretone
 		/// A compute tonemapper: a dispatch that writes the presented size's 8/10-bit picture from its HDR one.
 		bool on_dispatch(command_list *cmd, uint32_t, uint32_t, uint32_t)
 		{
+			if (!on())
+				return false;
 			ListState *s = state(cmd);
-			if (s == nullptr || s->cmp.layout.handle == 0 || !tracing())
+			if (s == nullptr)
+				return false;
+			const uint32_t window = take_window(*s);
+			if (s->cmp.layout.handle == 0 || !tracing())
 				return false; // only looked at in a trace: a game's frame has hundreds of dispatches
 			passfind::Tex bound[24];
-			const size_t n = draw_reads(cmd, s->cmp, bound, 24);
+			const size_t n = draw_reads(cmd, s->cmp, window, bound, 24);
 			bool ambiguous = false, sized = false;
 			const passfind::Tex scene = passfind::compute_scene(bound, n, g_outW, g_outH, &ambiguous);
 			for (size_t i = 0; i < n; ++i)
-				sized = sized || passfind::presented_size(bound[i].w, bound[i].h, g_outW, g_outH);
-			if (tracing() && sized)
+				sized = sized || passfind::near_presented_size(bound[i].w, bound[i].h, g_outW, g_outH);
+			if (sized)
 				trace_pass(cmd, "dispatch", bound, n, scene.id != 0 ? "a compute tonemapper (not drawn into)" : "-");
 			// recognised (in a trace), not drawn into: no game with one has been run, and a pass taken for it wrongly
 			// breaks the game's GPU state - she is drawn at presentation unless a tonemapper draw is found
@@ -802,6 +904,16 @@ namespace pretone
 			return on_draw_any(cmd, indices, instances);
 		}
 
+		/// An indirect draw or dispatch is never the tonemapper, but its descriptors were copied before it like any.
+		bool on_draw_or_dispatch_indirect(command_list *cmd, indirect_command, resource, uint64_t, uint32_t, uint32_t)
+		{
+			if (!on())
+				return false;
+			if (ListState *s = state(cmd))
+				take_window(*s);
+			return false;
+		}
+
 		void on_init_effect_runtime(effect_runtime *runtime)
 		{
 			g_runtime = runtime;
@@ -814,15 +926,46 @@ namespace pretone
 			std::lock_guard<std::mutex> lock(g_targetLock);
 			if (g_device == runtime->get_device())
 			{
-				destroy_copy();
+				runtime->get_command_queue()->wait_idle(); // nothing in flight reads a copy any more
+				retire_copy(0);
+				g_retired.collect(~uint64_t(0) >> 1, destroy_now);
 				g_device = nullptr;
+			}
+		}
+
+		/// After ReShade's Present work (its effects at Present, its overlay): recording threads may draw her pass again.
+		void on_reshade_present(effect_runtime *)
+		{
+			g_presenting.store(false);
+		}
+
+		/// Where she is drawn, decided again each Present (pretone_rules::choose); a change is logged.
+		void decide()
+		{
+			pretone_rules::Facts f;
+			f.path_present = g_path != 0;
+			f.declared = provider::state().engine();
+			f.ini = g_iniEngine;
+			f.hdr_output = g_hdrOutput;
+			f.present_callback = provider::state().present_callback().fn != nullptr;
+			const pretone_rules::Choice c = pretone_rules::choose(f);
+			const bool before = c.where == pretone_rules::Where::before;
+			if (before != g_on.load() || c.why != g_why)
+			{
+				if (before && !g_on.load())
+					++g_onEpoch; // lists reset from now on are tracked whole
+				g_on.store(before);
+				g_why = c.why;
+				logf("pretone: %s: %s%s", before ? "her pass goes before the game's tonemapper when it is found" : "she is drawn at presentation", c.why,
+					before ? (f.declared.empty() ? " ([tone] Engine= of the launcher's ini)" : " (declared by the provider)") : "");
 			}
 		}
 	}
 
-	void install(void (*begin_frame)())
+	void install(void (*begin_frame)(), const std::string &ini_engine)
 	{
 		g_beginFrame = begin_frame;
+		g_iniEngine = ini_engine;
 		char trace[32] = "";
 		if (GetEnvironmentVariableA("ASTRA_PRETONE_TRACE", trace, sizeof(trace)) > 0)
 			g_traceFrame = std::strtoull(trace, nullptr, 10);
@@ -845,9 +988,18 @@ namespace pretone
 		reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(on_destroy_pipeline_layout);
 		reshade::register_event<reshade::addon_event::draw>(on_draw);
 		reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
+		reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(on_draw_or_dispatch_indirect);
 		reshade::register_event<reshade::addon_event::dispatch>(on_dispatch);
 		reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
 		reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
+		reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
+	}
+
+	void present_begins()
+	{
+		g_presenting.store(true);
+		while (g_recording.load()) // a pass on a recording thread: let it finish before ReShade's Present work
+			SwitchToThread();
 	}
 
 	void presented(swapchain *swap, uint32_t width, uint32_t height)
@@ -855,11 +1007,16 @@ namespace pretone
 		g_outW = width;
 		g_outH = height;
 		const uint64_t frame = g_presents.load();
-		const bool drawn = g_drawnAt.load() == frame;
-		if (!drawn && layer::active())
+		const bool tried = g_drawnAt.load() == frame, ran = g_ranAt.load() == frame;
+		if (!tried && layer::active())
 		{
 			++g_atPresent;
 			++g_periodPresent;
+		}
+		if (tried && !ran)
+		{
+			++g_lost;
+			++g_periodLost;
 		}
 		if (swap != nullptr)
 		{
@@ -875,28 +1032,34 @@ namespace pretone
 				}
 			}
 		}
+		decide();
+		{
+			std::lock_guard<std::mutex> lock(g_targetLock);
+			g_retired.collect(frame, destroy_now);
+		}
 		const ULONGLONG now = GetTickCount64();
 		if (g_nextStats == 0)
 			g_nextStats = now + 30000;
 		if (now >= g_nextStats)
 		{
 			g_nextStats = now + 30000;
-			const uint64_t b = g_periodBefore.exchange(0), p = g_periodPresent.exchange(0);
-			if (b + p > 0)
-				logf("pretone: last 30 s: %llu frames drawn before the tonemapper, %llu at presentation", (unsigned long long)b, (unsigned long long)p);
-			if (g_found == 0 && !g_loggedNone && g_path == 0 && !g_hdrOutput)
+			const uint64_t b = g_periodBefore.exchange(0), p = g_periodPresent.exchange(0), l = g_periodLost.exchange(0), c = g_contended.exchange(0);
+			if (b + p + l > 0)
+				logf("pretone: last 30 s: %llu frames drawn before the tonemapper, %llu at presentation, %llu without effects (compiling); %llu "
+					 "tonemapper passes met Present in progress",
+					(unsigned long long)b, (unsigned long long)p, (unsigned long long)l, (unsigned long long)c);
+			if (g_found == 0 && !g_loggedNone && g_on.load())
 			{
 				g_loggedNone = true;
 				logf("pretone: no tonemapper pass found in 30 s: she is drawn at presentation (over the game's UI)");
 			}
 		}
-		if (g_path != 0)
-			std::snprintf(g_status, sizeof(g_status), "drawn at presentation (over the game's UI): [tone] Path=present");
-		else if (g_hdrOutput)
-			std::snprintf(g_status, sizeof(g_status), "drawn at presentation (over the game's UI): the game presents HDR");
+		if (!g_on.load())
+			std::snprintf(g_status, sizeof(g_status), "drawn at presentation (over the game's UI): %s", g_why);
 		else if (g_before > 0)
-			std::snprintf(g_status, sizeof(g_status), "drawn before the game's tonemapper (its grade, bloom and UI apply): %llu frames, %llu at presentation",
-				(unsigned long long)g_before.load(), (unsigned long long)g_atPresent.load());
+			std::snprintf(g_status, sizeof(g_status),
+				"drawn before the game's tonemapper (its grade, bloom and UI apply): %llu frames, %llu at presentation, %llu without effects",
+				(unsigned long long)g_before.load(), (unsigned long long)g_atPresent.load(), (unsigned long long)g_lost.load());
 		else
 			std::snprintf(g_status, sizeof(g_status), "drawn at presentation (over the game's UI): %s",
 				g_found > 0 ? "a tonemapper is found, her pass is not drawn there yet" : "no tonemapper pass found yet");

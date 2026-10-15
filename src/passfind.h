@@ -89,9 +89,17 @@ namespace passfind
 		}
 	};
 
-	/// The target is the presented picture's size, or the same aspect and at least half of it (a game that tonemaps
-	/// at its render resolution and upscales after).
+	/// The target is exactly the presented picture's size: the only size her pass is drawn at. One size means one copy
+	/// of the scene colour and one effect permutation; a size that follows a game's dynamic resolution would make a
+	/// new copy (and a new permutation, compiled and never freed) every time it changes.
 	inline bool presented_size(uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h)
+	{
+		return out_w != 0 && out_h != 0 && w == out_w && h == out_h;
+	}
+
+	/// ...or the same aspect and at least half of it (a game that tonemaps at its render resolution and upscales
+	/// after): only shown in a trace (ASTRA_PRETONE_TRACE), never drawn into - she is drawn at Present in such a game.
+	inline bool near_presented_size(uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h)
 	{
 		if (out_w == 0 || out_h == 0 || w == 0 || h == 0)
 			return false;
@@ -101,8 +109,8 @@ namespace passfind
 		return std::abs(a - b) <= 0.01 * b && w * 2 >= out_w && w <= out_w;
 	}
 
-	/// Could this draw be the tonemapper by its SHAPE (a full-screen draw into one 8/10-bit target of the presented
-	/// size)? Cheap: asked of every draw before what it reads is looked up. `vertices`: its vertex (or index) count.
+	/// Could this draw be the tonemapper by its SHAPE (a full-screen draw into one 8/10-bit target of exactly the
+	/// presented size)? Cheap: asked of every draw before what it reads is looked up. `vertices`: its vertex (or index) count.
 	inline bool tonemapper_shape(const Tracker &t, uint32_t vertices, uint32_t instances, uint32_t out_w, uint32_t out_h)
 	{
 		if (t.in_pass || t.target.id == 0 || t.target.kind != Kind::ldr)

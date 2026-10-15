@@ -20,6 +20,7 @@ namespace lines
 		virtual void light(const float toward[3], const float color[3], float intensity, float visible) = 0;
 		virtual void cue(const char *kind, const char *name) = 0;
 		virtual void identity(const char *integration, const char *game) = 0;
+		virtual void engine(const char *engine) = 0;
 		virtual void message(const char *text) = 0;
 	};
 

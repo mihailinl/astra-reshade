@@ -42,6 +42,7 @@ namespace pipeserver
 				astra_provider_identity(integration, game);
 				logf("provider: %s, %s", integration, game);
 			}
+			void engine(const char *engine) override { astra_provider_engine(engine); }
 			void message(const char *text) override { astra_provider_log(text); }
 		};
 

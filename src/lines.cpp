@@ -183,6 +183,12 @@ namespace lines
 			sink.identity(f.f[1], game);
 			return true;
 		}
+		case 'E':
+			// E <engine>
+			if (f.n != 2)
+				return false;
+			sink.engine(f.f[1]);
+			return true;
 		case 'M':
 		{
 			char copy[256];
