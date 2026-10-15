@@ -1,6 +1,7 @@
 // Native tests of the add-on's portable core: the pipe's line protocol, the provider's seqlocked state, the
 // camera math and the frame-ring reader (crop included). Run: tests/run.sh (any Linux/macOS clang++ or g++).
 #include "lines.h"
+#include "outbox.h"
 #include "passfind.h"
 #include "pretone_rules.h"
 #include "provider_core.h"
@@ -703,6 +704,43 @@ static void test_pretone_rules()
 		CHECK(never.given_up && lost == pretone_rules::Fallback::kGiveUp);
 	}
 
+	// ReShade's effects switched off by the user: no tries (each would be a miss - 8 gave pretone up for the session);
+	// switched on again, her pass is drawn at the tonemapper at once
+	{
+		pretone_rules::Fallback fb;
+		uint64_t first_drawn = 0;
+		for (uint64_t frame = 0; frame < 3000 && first_drawn == 0; ++frame)
+		{
+			const bool effects_on = frame >= 2000;
+			if (pretone_rules::should_try(fb, frame, effects_on))
+			{
+				fb.result(frame, effects_on); // with the effects off nothing draws
+				if (effects_on)
+					first_drawn = frame;
+			}
+		}
+		CHECK(!fb.given_up && first_drawn == 2000);
+	}
+
+	// the upload buffers her pass fills: one pass a frame always finds one, and none is reused (or freed to grow)
+	// sooner than the scene colour's copies are freed - kGpuFrames presents after the GPU was given it
+	{
+		pretone_rules::Staging st;
+		std::vector<uint64_t> last(pretone_rules::Staging::kSlots, ~uint64_t(0));
+		bool always = true, late = true;
+		for (uint64_t frame = 100; frame < 400; ++frame)
+		{
+			const int i = st.pick(frame);
+			always = always && i >= 0;
+			if (i < 0)
+				continue;
+			late = late && (last[i] == ~uint64_t(0) || frame >= last[i] + pretone_rules::Retired<int>::kFrames);
+			last[i] = frame;
+			st.use(i, frame);
+		}
+		CHECK(always && late);
+	}
+
 	// a copy of the scene colour that is replaced is destroyed only frames later (the GPU may still read it)
 	{
 		pretone_rules::Retired<int> r;
@@ -750,6 +788,74 @@ static void test_pretone_rules()
 		n = pretone_rules::resolve(ring, pretone_rules::window(ring, list), tables, 2, out, 64);
 		CHECK(n == 1 && out[0].src_off == 499);
 	}
+}
+
+// ---- the link's outbox: a frame never waits for the network ---------------------------------------------------
+
+static void test_outbox()
+{
+	using clock = std::chrono::steady_clock;
+	std::mutex lock;
+	std::vector<std::string> got;
+	std::atomic<int> generation{1};
+	std::atomic<bool> slow{true};
+	Outbox box;
+	box.start(
+		[&](const std::string &m) {
+			if (slow)
+				std::this_thread::sleep_for(std::chrono::milliseconds(300)); // a peer that takes a while (a send's timeout)
+			std::lock_guard<std::mutex> hold(lock);
+			got.push_back(m);
+			return true;
+		},
+		[&] { return generation.load(); });
+	// three messages from a thread that must not wait (the present thread, a recording thread): queued at once
+	const auto t0 = clock::now();
+	CHECK(box.push("a", 1) && box.push("b", 1) && box.push("c", 1));
+	const auto pushed = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count();
+	CHECK(pushed < 20);
+	for (int i = 0; i < 300 && box.sent() < 3; ++i)
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		CHECK(got.size() == 3 && got[0] == "a" && got[1] == "b" && got[2] == "c"); // in order
+	}
+	// a message for a connection that is gone is not sent on the next one (a new connection starts with its hello)
+	slow = false;
+	generation = 2;
+	box.push("old", 1);
+	box.push("hello", 2);
+	for (int i = 0; i < 300 && box.sent() < 4; ++i)
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		CHECK(got.size() == 4 && got[3] == "hello" && box.dropped() == 1);
+	}
+	// a peer that stopped taking them: the queue is bounded, a push still never waits
+	slow = true;
+	const auto t1 = clock::now();
+	int refused = 0;
+	for (size_t i = 0; i < Outbox::kMax + 20; ++i)
+		refused += !box.push("x", 2);
+	CHECK(refused >= 19 && std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t1).count() < 50);
+	box.stop(); // after the send in flight
+	std::printf("outbox: 3 pushes to a slow peer took %lld ms\n", (long long)pushed);
+}
+
+/// The link sends every message through its outbox: the one call of the WebSocket's send is the outbox's sink.
+static void test_link_sends_through_the_outbox()
+{
+	std::ifstream f(std::string(ASTRA_SRC) + "/link.cpp");
+	CHECK(f.good());
+	std::string line;
+	int sends = 0, in_sink = 0;
+	while (std::getline(f, line))
+		if (line.find("g_ws.send(") != std::string::npos)
+		{
+			++sends;
+			in_sink += line.find("g_outbox.start(") != std::string::npos;
+		}
+	CHECK(sends == 1 && in_sink == 1);
 }
 
 // ---- tone: her picture into the scene's light -----------------------------------------------------------------
@@ -930,6 +1036,8 @@ int main(int argc, char **argv)
 	test_ring();
 	test_passfind();
 	test_pretone_rules();
+	test_outbox();
+	test_link_sends_through_the_outbox();
 	test_tone();
 	test_tone_in_effect();
 	if (argc > 1)

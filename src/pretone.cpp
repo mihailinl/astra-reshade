@@ -727,7 +727,7 @@ namespace pretone
 				++g_contended; // Present is in ReShade now, or another thread draws her pass: at Present this frame
 				return;
 			}
-			if (g_drawnAt.load() == frame || g_fallback.holding(frame))
+			if (g_drawnAt.load() == frame || !pretone_rules::should_try(g_fallback, frame, runtime->get_effects_state()))
 				return;
 			g_beginFrame(); // this is the frame being drawn: its camera now (its picture is waited for in the effect)
 			if (!layer::active() || !layer::tone_ready())

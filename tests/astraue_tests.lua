@@ -291,11 +291,21 @@ function make_world()
         CameraCachePrivate = { POV = { bConstrainAspectRatio = false, AspectRatio = 1.7778, PerspectiveNearClipPlane = 10 } },
     })
     -- what a real UE 5.6 offers: no IsPaused on the PlayerController (plain C++), GameplayStatics' IsGamePaused
-    local pc = object({ PlayerCameraManager = pcm, Pawn = pawn, Player = { AspectRatioAxisConstraint = 1 } })
+    -- w.level: bumped by a test, a new level - the old PlayerController is gone, a new one is found
+    w.level = 1
+    local pc
+    local function make_pc()
+        local level = w.level
+        pc = object({ PlayerCameraManager = pcm, Pawn = pawn, Player = { AspectRatioAxisConstraint = 1 } })
+        pc.IsValid = function() return w.level == level end
+        return pc
+    end
+    make_pc()
     local statics = object({ IsGamePaused = function(_, context) return context == pc and w.paused == true end })
     package.loaded["UEHelpers"] = nil
     package.preload["UEHelpers"] = function()
-        return { GetKismetSystemLibrary = function() return kismet end, GetPlayerController = function() return pc end,
+        return { GetKismetSystemLibrary = function() return kismet end,
+            GetPlayerController = function() if not pc:IsValid() then make_pc() end return pc end,
             GetGameplayStatics = function() return statics end }
     end
     UnrealVersion = { GetMajor = function() return 5 end, GetMinor = function() return 6 end }
@@ -319,7 +329,7 @@ function make_world()
     end
     FindAllOf = function(class)
         w.finds = w.finds + 1
-        if class ~= "DirectionalLightComponent" then return nil end
+        if class ~= "DirectionalLightComponent" or w.no_lights then return nil end
         return { light("DirectionalLightComponent /Game/Maps/Test.Test:PersistentLevel.Fill.Light", 2, -70),
             light("DirectionalLightComponent /Game/Maps/Test.Test:PersistentLevel.Sun.Light", w.ue4 and 1 or 8, -40, true) }
     end
@@ -498,6 +508,41 @@ do
     f = {}
     for w in a:gmatch("%S+") do f[#f + 1] = w end
     check(near(tonumber(f[3]), 1.0, 0.05), "after that: the player's ground, 1.0 m (" .. a .. ")")
+    io.open, os.clock, print = real_open, real_clock, real_print
+end
+
+-------------------------------------------------------------------------------- a level with no directional light
+do
+    local fake_pipe = { write = function(self) return self end, setvbuf = function() end, close = function() end }
+    local real_open, real_clock, real_print = io.open, os.clock, print
+    io.open = function(name, mode)
+        if name == M.PIPE then return fake_pipe end
+        return real_open(name, mode)
+    end
+    local clock = 900.0
+    os.clock = function() return clock end
+    print = function() end
+    local world = make_world()
+    world.no_lights = true
+    local loop
+    LoopInGameThreadAfterFrames = function(_, fn) loop = fn end
+    dofile(path)
+    local function run(seconds)
+        for _ = 1, math.floor(seconds * 30) do
+            world.frame = world.frame + 1
+            clock = clock + 1 / 30
+            loop()
+        end
+    end
+    run(130)
+    local in_130 = world.finds
+    check(in_130 <= 6, "no sun in the level: searched for less and less often (" .. in_130 .. " searches in 130 s, every 5 s would be 26)")
+    -- a new level: searched for at once, the wait starts over
+    world.level = world.level + 1
+    run(3)
+    check(world.finds == in_130 + 1, "a new level: the sun searched for again at once (" .. (world.finds - in_130) .. ")")
+    run(6)
+    check(world.finds == in_130 + 2, "...and again 5 s later, the wait started over (" .. (world.finds - in_130) .. ")")
     io.open, os.clock, print = real_open, real_clock, real_print
 end
 

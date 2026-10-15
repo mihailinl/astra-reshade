@@ -42,8 +42,9 @@ camera at presentation - and no tonemapper found, HDR output, another API or `[t
 exactly as before pretone (its command-stream hooks return at once). Not quite "as before" in one case: a frame whose
 pass at the tonemapper could not draw because ReShade was still compiling the effects for the scene colour has NO
 effects at all (ReShade has marked the frame's effects drawn); after such a frame the Present path is held for a
-while (1 s, then longer, given up after 8 tries), so it costs a frame or a few, not a stretch. The log and the
-overlay say which path is used and why (`pretone: ...`).
+while (1 s, then longer, given up after 8 tries), so it costs a frame or a few, not a stretch. And a frame where
+the path changes may show her once in the wrong colour space (ReShade's one uniform buffer per effect: LIVE-TEST.md,
+*Review 13*, known limit). The log and the overlay say which path is used and why (`pretone: ...`).
 
 ## What is in here
 

@@ -5,6 +5,7 @@
 //              ini declares; everywhere else at Present, as before pretone existed
 //   Fallback   her pass at the tonemapper that did not draw: the Present path for a while, then a new try
 //   Retired    a copy of the scene colour no longer used is destroyed frames later, never while the GPU may read it
+//   Staging    the upload buffers her picture goes through on a recording thread: reused only as late
 //   CopyRing   which descriptor copies a draw reads: only the ones made since its command list's previous draw
 #include <algorithm>
 #include <cstddef>
@@ -97,12 +98,23 @@ namespace pretone_rules
 		}
 	};
 
+	/// Try her pass at the tonemapper this frame? Not while the Present path is held - and not while the user has
+	/// ReShade's effects switched off (nothing would draw anywhere; counted as misses, that gave pretone up for good).
+	inline bool should_try(const Fallback &f, uint64_t frame, bool effects_on)
+	{
+		return effects_on && !f.holding(frame);
+	}
+
+	/// How many presents the GPU may still be behind the CPU with something we handed it - frames in flight are 2-3 (a
+	/// game's, vkd3d's): every resource of ours a frame used waits this long before it is reused or freed.
+	constexpr uint64_t kGpuFrames = 8;
+
 	/// GPU resources the game's frames may still read (a copy made for one scene colour size, its view): destroyed
 	/// kFrames presents after they were last used, never at once (frames in flight are 2-3; kFrames is a margin).
 	template <class T>
 	struct Retired
 	{
-		static constexpr uint64_t kFrames = 8;
+		static constexpr uint64_t kFrames = kGpuFrames;
 		struct Item
 		{
 			T what;
@@ -126,6 +138,30 @@ namespace pretone_rules
 				}
 				else
 					++i;
+		}
+	};
+
+	/// Upload buffers her pass fills on the CPU and a game's command list copies from on the GPU later: one is reused (or
+	/// freed to grow) only kGpuFrames presents after the frame it was given to; kSlots = kGpuFrames + 1, so a pass a
+	/// frame always finds one.
+	struct Staging
+	{
+		static constexpr int kSlots = int(kGpuFrames) + 1;
+		bool used[kSlots] = {};
+		uint64_t used_at[kSlots] = {};
+
+		/// A slot free at `frame`, or -1.
+		int pick(uint64_t frame) const
+		{
+			for (int i = 0; i < kSlots; ++i)
+				if (!used[i] || frame >= used_at[i] + kGpuFrames)
+					return i;
+			return -1;
+		}
+		void use(int i, uint64_t frame)
+		{
+			used[i] = true;
+			used_at[i] = frame;
 		}
 	};
 

@@ -41,7 +41,8 @@ M.GROUND_KEEP = 1.0             -- a trace that misses keeps the last ground thi
 M.TRACE_CHANNEL = 0             -- ETraceTypeQuery: 0 = TraceTypeQuery1, the Visibility channel in every UE game
 
 -- the game's sun
-M.SUN_FIND_EVERY = 5.0          -- seconds between searches while no sun is found (one found is kept while it is valid)
+M.SUN_FIND_EVERY = 5.0          -- seconds before searching again when no sun was found, doubling while none is (a level
+M.SUN_FIND_MAX = 60.0           -- with no directional light), up to this; a new level starts over. A sun found is kept
 M.SUN_EVERY = 0.2               -- seconds between light lines (the add-on sends ~10 a second to her engine)
 M.SUN_LUX = nil                 -- a game's daylight in lux, if its lights use physical units: intensity = lux / SUN_LUX
                                 -- (nil: every sun is a daylight sun, 1 - her engine bounds her level, the game's exposure ours)
@@ -358,8 +359,9 @@ local function trace_down(pawn)
 end
 
 --- The game's sun. UE4SS's FindAllOf walks every object (a hitch), so it is searched for only when there is none (then
---- every SUN_FIND_EVERY seconds), when the one found is gone (a level change destroys it) or the player controller
---- changed (a new level) - never while the one found is valid.
+--- after SUN_FIND_EVERY seconds, doubling up to SUN_FIND_MAX while there still is none), when the one found is gone (a
+--- level change destroys it) or the player controller changed (a new level: the wait starts over) - never while the
+--- one found is valid.
 local function find_sun(now)
     local alive = false
     if sun.comp ~= nil then
@@ -367,7 +369,8 @@ local function find_sun(now)
         alive = ok and v == true
     end
     if alive and sun.world == pc then return sun.comp end
-    if not alive and sun.comp == nil and sun.world == pc and now - sun.find_at < M.SUN_FIND_EVERY then return nil end
+    if sun.world ~= pc then sun.wait = nil end
+    if not alive and sun.comp == nil and sun.world == pc and now - sun.find_at < (sun.wait or M.SUN_FIND_EVERY) then return nil end
     sun.find_at, sun.world = now, pc
     local lights, found = {}, {}
     pcall(function()
@@ -388,6 +391,7 @@ local function find_sun(now)
     end)
     local i = M.pick_sun(lights)
     sun.comp = i and lights[i].comp or nil
+    sun.wait = sun.comp == nil and math.min((sun.wait or M.SUN_FIND_EVERY / 2) * 2, M.SUN_FIND_MAX) or nil
     local said = sun.comp and lights[i].name or "none"
     if said ~= sun.said then
         sun.said = said

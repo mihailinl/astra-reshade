@@ -258,17 +258,12 @@ namespace layer
 		// Her pass before the game's tonemapper runs on a game thread recording a command list. ReShade's
 		// update_texture_region goes through its immediate command list, which the game's submitting thread flushes
 		// under a lock this thread does not hold - so there her picture is copied by the pass's own command list, from
-		// an upload buffer of a small ring, each reused only kReuse frames after the GPU was given it.
-		struct Staging
-		{
-			resource buf = {0};
-			uint64_t size = 0;
-			uint64_t used_at = 0;
-			bool used = false;
-		};
-		constexpr int kStaging = 5;
-		constexpr uint64_t kReuse = 4;
-		Staging g_staging[kStaging];
+		// an upload buffer of a small ring, each reused (or freed to grow) only pretone_rules::kGpuFrames presents after
+		// the frame the GPU was given it.
+		// one buffer per slot of pretone_rules::Staging (which says when a slot may be reused)
+		pretone_rules::Staging g_slots;
+		resource g_stagingBuf[pretone_rules::Staging::kSlots] = {};
+		uint64_t g_stagingSize[pretone_rules::Staging::kSlots] = {};
 		std::atomic<uint64_t> g_passFrame{0}; // the frame her pass before the tonemapper draws (pretone's count)
 
 		struct Plane
@@ -294,31 +289,25 @@ namespace layer
 				offsets[i] = total;
 				total += (pitch_of(planes[i].w) * planes[i].h + 511) & ~uint64_t(511); // D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT
 			}
-			Staging *slot = nullptr;
-			for (Staging &st : g_staging)
-				if (!st.used || frame >= st.used_at + kReuse)
-				{
-					slot = &st;
-					break;
-				}
-			if (slot == nullptr)
+			const int slot = g_slots.pick(frame);
+			if (slot < 0)
 				return false;
-			if (slot->size < total)
+			resource &buf = g_stagingBuf[slot];
+			if (g_stagingSize[slot] < total)
 			{
-				if (slot->buf.handle != 0)
-					dev->destroy_resource(slot->buf); // not in flight: its last use is kReuse frames back
-				slot->buf = {0};
-				slot->size = 0;
-				if (!dev->create_resource(resource_desc(total, memory_heap::upload, resource_usage::copy_source), nullptr, resource_usage::cpu_access,
-						&slot->buf))
+				if (buf.handle != 0)
+					dev->destroy_resource(buf); // not in flight: its last use is kGpuFrames presents back
+				buf = {0};
+				g_stagingSize[slot] = 0;
+				if (!dev->create_resource(resource_desc(total, memory_heap::upload, resource_usage::copy_source), nullptr, resource_usage::cpu_access, &buf))
 				{
-					slot->buf = {0};
+					buf = {0};
 					return false;
 				}
-				slot->size = total;
+				g_stagingSize[slot] = total;
 			}
 			void *mapped = nullptr;
-			if (!dev->map_buffer_region(slot->buf, 0, UINT64_MAX, map_access::write_only, &mapped) || mapped == nullptr)
+			if (!dev->map_buffer_region(buf, 0, UINT64_MAX, map_access::write_only, &mapped) || mapped == nullptr)
 				return false;
 			for (int i = 0; i < n; ++i)
 			{
@@ -327,26 +316,27 @@ namespace layer
 				for (uint32_t y = 0; y < p.h; ++y)
 					std::memcpy(static_cast<uint8_t *>(mapped) + offsets[i] + y * pitch, p.data->data() + size_t(y) * p.w * 4, size_t(p.w) * 4);
 			}
-			dev->unmap_buffer_region(slot->buf);
+			dev->unmap_buffer_region(buf);
 			for (int i = 0; i < n; ++i)
 			{
 				cmd->barrier(planes[i].layer->tex, resource_usage::shader_resource, resource_usage::copy_dest);
-				cmd->copy_buffer_to_texture(slot->buf, offsets[i], 0, 0, planes[i].layer->tex, 0, nullptr);
+				cmd->copy_buffer_to_texture(buf, offsets[i], 0, 0, planes[i].layer->tex, 0, nullptr);
 				cmd->barrier(planes[i].layer->tex, resource_usage::copy_dest, resource_usage::shader_resource);
 			}
-			slot->used = true;
-			slot->used_at = frame;
+			g_slots.use(slot, frame);
 			return true;
 		}
 
 		void destroy_staging(device *dev)
 		{
-			for (Staging &st : g_staging)
+			for (int i = 0; i < pretone_rules::Staging::kSlots; ++i)
 			{
-				if (st.buf.handle != 0)
-					dev->destroy_resource(st.buf);
-				st = Staging();
+				if (g_stagingBuf[i].handle != 0)
+					dev->destroy_resource(g_stagingBuf[i]);
+				g_stagingBuf[i] = {0};
+				g_stagingSize[i] = 0;
 			}
+			g_slots = pretone_rules::Staging();
 		}
 
 		/// The newest published frame, if not shown yet: on the present thread through ReShade's upload, before the

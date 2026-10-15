@@ -1,6 +1,7 @@
 #include "link.h"
 #include "layer.h"
 #include "log.h"
+#include "outbox.h"
 #include "provider.h"
 #include "ws.h"
 #include <windows.h>
@@ -24,6 +25,7 @@ namespace enginelink
 		constexpr ULONGLONG kLightEveryMs = 100;
 
 		WsClient g_ws;
+		Outbox g_outbox; // every message goes out through it: a frame never waits for the network
 		std::string g_token;
 		int g_generation = -1;
 		bool g_answered = false; // the engine's hello came for this connection
@@ -65,8 +67,8 @@ namespace enginelink
 			va_start(args, fmt);
 			const int n = std::vsnprintf(buffer, sizeof(buffer), fmt, args);
 			va_end(args);
-			if (n > 0 && n < int(sizeof(buffer)) && g_ws.send(buffer))
-				++g_stats.sent;
+			if (n > 0 && n < int(sizeof(buffer)))
+				g_outbox.push(std::string(buffer, size_t(n)), g_ws.generation());
 		}
 
 		/// The game's name when no provider gave one: the exe's, without Unreal's "-Win64-Shipping".
@@ -161,11 +163,13 @@ namespace enginelink
 	{
 		g_token = token;
 		g_ws.start("127.0.0.1", port);
+		g_outbox.start([](const std::string &m) { return g_ws.send(m); }, [] { return g_ws.generation(); });
 		logf("link: engine bridge at 127.0.0.1:%d", port);
 	}
 
 	void stop()
 	{
+		g_outbox.stop(); // after the send in flight (its timeout bounds it)
 		g_ws.stop();
 	}
 
@@ -376,6 +380,7 @@ namespace enginelink
 	Stats stats()
 	{
 		Stats s = g_stats;
+		s.sent = g_outbox.sent();
 		s.answered = g_answered && g_ws.connected();
 		return s;
 	}

@@ -226,6 +226,13 @@ An adversarial review of phase 2 found eight problems; the fixes (commits `82a86
   client's bounded waits (under Wine, against peers that never answer or never read), AstraUE's sun searched only
   when gone and its ground not snapping up to a balcony over her.
 
+Known limit, not fixed: **a frame of her in the wrong colour space when her pass changes paths** (a hold of the
+Present path begins or ends, the effects reload, pretone is switched on or off). ReShade keeps ONE uniform buffer per
+effect and rewrites it on the CPU at every run of the effects; the GPU reads it when it executes that run. When a run
+before the tonemapper (scene-colour values, `AstraHdr` on) and a run at Present (display values) are recorded within
+the frames the GPU is behind, the earlier one may execute with the later one's uniforms - one frame of her too bright
+or too dark. Fixing it needs a uniform buffer per run, which ReShade does not offer to an add-on.
+
 Still owed: a UE5 game with dynamic resolution or an upscaler running below the output size (she is drawn at
 Present there now - check it says so); a long session with alt-tab and a resolution change; a UE 4.27 D3D12 game;
 fast turns and her shadow's placement looked at by a person; a launch from Steam with the screen unlocked; Death

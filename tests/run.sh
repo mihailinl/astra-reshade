@@ -23,7 +23,7 @@ if [ -n "$LUA" ]; then
 else
 	echo "no lua: the AstraUE tests were skipped"
 fi
-$CXX -std=c++20 -O1 -Wall -Wextra -pthread -I"$HERE/src" -DASTRA_FX="\"$HERE/shaders/AstraPassthrough.fx\"" "$HERE/tests/core_tests.cpp" "$HERE/src/lines.cpp" "$HERE/src/ring.cpp" -o "$OUT/core_tests"
+$CXX -std=c++20 -O1 -Wall -Wextra -pthread -I"$HERE/src" -DASTRA_FX="\"$HERE/shaders/AstraPassthrough.fx\"" -DASTRA_SRC="\"$HERE/src\"" "$HERE/tests/core_tests.cpp" "$HERE/src/lines.cpp" "$HERE/src/ring.cpp" -o "$OUT/core_tests"
 "$OUT/core_tests" $LINES
 "$HERE/tools/fxcheck.sh"
 # ...and with every game hook defined (tests/hooks/AstraGame.fxh in place of the foundation's empty one)
