@@ -12,6 +12,7 @@
 --   pause <0|1>                           GameplayStatics.SetGamePaused
 --   restore                               the game's own view target back, swing and walk stopped
 --   state                                 a log line: view target, camera, pawn
+--   quit                                  KismetSystemLibrary.QuitGame: the game quits as from its own menu
 
 local UEHelpers = require("UEHelpers")
 -- beside this mod's Scripts folder (the process's working directory is the game's, not UE4SS's)
@@ -82,6 +83,10 @@ local function command(line, pc, pawn)
         swing, walk = nil, nil
         if own_view ~= nil and own_view:IsValid() then pc:SetViewTargetWithBlend(own_view, 0.0, 0, 0.0, false) end
         own_view = nil
+    elseif verb == "quit" then
+        log("did: quit")
+        UEHelpers.GetKismetSystemLibrary():QuitGame(pc, pc, 0, false) -- EQuitPreference::Quit
+        return
     elseif verb ~= "state" then
         log("unknown or impossible now: %s", line)
         return

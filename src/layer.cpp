@@ -35,6 +35,7 @@ namespace layer
 		std::atomic<unsigned long long> g_herRuns{0};
 		Layer g_toneLut; // tone.h's curve and its inverse (ASTRATONE), for her pass before the game's tonemapper
 		bool g_toneFailed = false;
+		std::atomic<bool> g_toneWanted{false};
 		float g_toneExposure = 1.0f;
 		std::mutex g_lock; // host pose, shadow strength (written by the link on the present thread; the effects may run elsewhere)
 		view::Pose g_host;
@@ -458,7 +459,7 @@ namespace layer
 			set_bool(runtime, "AstraHdr", hdr);
 			if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "ToneExposure"); v.handle != 0)
 				runtime->set_uniform_value_float(v, g_toneExposure);
-			if (!hdr)
+			if (!hdr && g_toneWanted)
 				make_tone_lut(runtime); // on the present thread only (an upload): pretone waits for it (tone_ready)
 			bool on = g_active && (!hdr || g_toneLut.tex.handle != 0) && open_mapping();
 			if (hdr && on)
@@ -571,6 +572,11 @@ namespace layer
 	{
 		g_passFrame = frame;
 		g_hdrPass = hdr;
+	}
+
+	void set_tone_wanted(bool wanted)
+	{
+		g_toneWanted = wanted;
 	}
 
 	bool tone_ready()

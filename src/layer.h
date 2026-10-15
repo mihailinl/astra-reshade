@@ -15,8 +15,10 @@ namespace layer
 	/// thread recording command list `frame` presents in: her picture is mapped into the scene's light (tone.h), the
 	/// game's own grade applies to her after, and her picture is uploaded through that command list.
 	void set_hdr_pass(bool hdr, unsigned long long frame);
-	/// The tone table exists (made on the present thread, the first time the effects run there): her pass before the
-	/// tonemapper waits for it.
+	/// pretone may draw her pass before the tonemapper (an Unreal game): only then is the tone table made - on the
+	/// present thread, the next time the effects run there. Elsewhere nothing of it exists.
+	void set_tone_wanted(bool wanted);
+	/// The tone table exists: her pass before the tonemapper waits for it.
 	bool tone_ready();
 	/// [tone] Exposure: her brightness in the game's scene, before its tone curve (1: as her engine drew her).
 	float &tone_exposure();

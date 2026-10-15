@@ -955,6 +955,7 @@ namespace pretone
 				if (before && !g_on.load())
 					++g_onEpoch; // lists reset from now on are tracked whole
 				g_on.store(before);
+				layer::set_tone_wanted(before);
 				g_why = c.why;
 				logf("pretone: %s: %s%s", before ? "her pass goes before the game's tonemapper when it is found" : "she is drawn at presentation", c.why,
 					before ? (f.declared.empty() ? " ([tone] Engine= of the launcher's ini)" : " (declared by the provider)") : "");
