@@ -1,6 +1,10 @@
 # astra-reshade
 
-> **Experimental — phase 2.** First run in a game on 2026-10-14: Scarlet Skips (UE 5.6) under Proton, Astra in the game with its depth, glued on camera cuts, hidden on pause; then drawn before the game's tonemapper (its grade, bloom and UI over her), standing on the ground under her, lit by the game's sun — what was seen and what it took is in [docs/LIVE-TEST.md](docs/LIVE-TEST.md).
+> **Experimental — phase 2.** First run in a game on 2026-10-14: Scarlet Skips (UE 5.6) under Proton, Astra in the game with its depth, glued on camera cuts, hidden on pause; then drawn before the game's tonemapper (its grade, bloom and UI over her), standing on the ground under her, lit by the game's sun — what was seen and what it took is in [docs/LIVE-TEST.md](docs/LIVE-TEST.md). Phase 2 as first run washed her out (a stand-in tone curve, not Unreal's); review 13's fixes (Unreal's own curve, pretone only in Unreal games, thread and lifetime races) are in [docs/LIVE-TEST.md](docs/LIVE-TEST.md) *Review 13*.
+
+> **Before pushing this repo, push its submodule's branch.** `extern/minecraft-in-death-stranding` is pinned at a
+> commit of that repo's branch `astra-reshade-fixes` that may exist only locally; a clone of this repo fails with
+> "not our ref" until it is pushed. (Death Stranding's integration pins the branch `astra-ds2-shared-guard` the same way.)
 
 
 Astra, the Astra companion's 3D avatar, inside **any D3D11/D3D12 game ReShade
@@ -24,13 +28,22 @@ the game's process (Proton or Windows)                       Astra avatar engine
   pretone.cpp           ...right before the game's tonemapper, into its HDR scene colour (else at Present)
 ```
 
-**Before the tonemapper.** ReShade runs effects at Present, over the game's UI and past its tone curve.
-`src/pretone.cpp` finds the game's tonemapper in its Direct3D 12 command stream - a full-screen draw into an 8/10-bit
-target of the presented size that reads an HDR texture of that size (`src/passfind.h`; what a draw reads comes from
-the descriptors the game copied for it) - and runs the effects there, into a copy of that scene colour, copied back,
-the game's state put back after. Her 8-bit picture is mapped into the scene's light by an inverted filmic curve
-(`src/tone.h`; `[tone] Exposure` in the `-AstraConfig` ini, the overlay's "her exposure"). Not found, HDR output,
-another API or `[tone] Path=present`: at Present as before; the log and the overlay say which.
+**Before the tonemapper — Unreal games only.** ReShade runs effects at Present, over the game's UI and past its tone
+curve. In a game whose provider declares it Unreal (`astra_provider_engine("unreal")`, AstraUE's `E unreal` line) or
+whose launcher ini says `[tone] Engine=unreal`, `src/pretone.cpp` finds the game's tonemapper in its Direct3D 12
+command stream - a full-screen draw into an 8/10-bit target of exactly the presented size that reads an HDR texture
+of that size (`src/passfind.h`; what a draw reads comes from the descriptors the game copied for it since the draw
+before) - and runs the effects there, on the game's recording thread (never while Present is inside ReShade), into a
+copy of that scene colour, copied back, the game's state put back after. Her 8-bit picture is mapped into the scene's
+light by inverting **Unreal's default** tonemapping (`src/tone.h`: its film curve, desaturations, blue correction and
+gamut expansion; a game's own film settings or colour LUT are not read - `[tone] Exposure` in the `-AstraConfig` ini,
+the overlay's "her exposure", trims her). Every other game - Death Stranding, a Unity game, a provider that reads its
+camera at presentation - and no tonemapper found, HDR output, another API or `[tone] Path=present`: at Present,
+exactly as before pretone (its command-stream hooks return at once). Not quite "as before" in one case: a frame whose
+pass at the tonemapper could not draw because ReShade was still compiling the effects for the scene colour has NO
+effects at all (ReShade has marked the frame's effects drawn); after such a frame the Present path is held for a
+while (1 s, then longer, given up after 8 tries), so it costs a frame or a few, not a stretch. The log and the
+overlay say which path is used and why (`pretone: ...`).
 
 ## What is in here
 
@@ -40,7 +53,7 @@ another API or `[tone] Path=present`: at Present as before; the log and the over
 | `include/astra_provider.h` | the provider API: a C ABI and the pipe's line protocol |
 | `shaders/AstraPassthrough.fx` | the compositing effect |
 | `runners/unreal/` | the Unreal runner: the AstraUE UE4SS mod, ReShade.ini, the UE4SS mod list, the `astra-gi.toml` manifest draft |
-| `tests/` | `tests/run.sh`: the core in native C++, AstraUE against a stub of UE4SS, the effect through ReShade's own FX compiler |
+| `tests/` | `tests/run.sh`: the core in native C++ (incl. the pass finder and pretone's rules over recorded sequences, the tone mapping through a port of Unreal's tonemapper), AstraUE against a stub of UE4SS, the effect through ReShade's own FX compiler and Wine's d3dcompiler, the WebSocket client under Wine |
 | `docs/LIVE-TEST.md` | how to try it in a real game (Scarlet Skips, S.T.A.L.K.E.R. 2) and what proves each piece |
 
 The add-on was lifted from the (private) Death Stranding add-on — its game-agnostic half: the frame-ring reader,
@@ -94,6 +107,13 @@ astra_provider_param("seated", 1.0f);   // more raw facts for her animation set 
 astra_provider_log("...");              // a line in astra-reshade.log
 astra_provider_on_present(fn, ctx);     // a provider that reads the camera from memory at presentation: fn runs at
                                         // the start of every Present, and the camera it writes IS the presented one
+```
+
+Version 3:
+
+```c
+astra_provider_engine("unreal");        // the game's engine, a raw fact: in an Unreal game she is drawn before its
+                                        // tonemapper (pipe line "E unreal"); anything else, or nothing: at Present
 ```
 
 A game whose integration needs more of the compositor (the game's UI laid back over her, another mod's world in front

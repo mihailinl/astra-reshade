@@ -10,6 +10,11 @@ to the game.
 Build once (Linux, this repo): `./build.sh && tools/package-unreal.sh` — `build/astra-gi/` is then the whole
 install, laid out as the launcher would place it.
 
+**Before anyone else builds this: push the submodule's branch first.** `extern/minecraft-in-death-stranding` is
+pinned at a commit of that repo's branch `astra-reshade-fixes` (the WebSocket client and the fault guard) that may
+exist only on this machine; `git clone --recursive` of this repo fails with "not our ref" until it is pushed. Death
+Stranding's integration pins that repo's branch `astra-ds2-shared-guard` the same way.
+
 ## Scarlet Skips (UE 5.6, Steam app 4513480, no anti-cheat)
 
 ```bash
@@ -150,9 +155,14 @@ linked as in step 3.
    draw into the back buffer (R10G10B10A2) plus a second target, reading the post-TSR scene colour (R11G11B10F), bloom
    at half size and a 60x34 exposure texture. Where it is not found the log says `no tonemapper pass found in 30 s:
    she is drawn at presentation (over the game's UI)`; HDR output says so too. To see what a game's post-processing
-   looks like: `ASTRA_PRETONE_TRACE=600` (frame number) logs every candidate pass of frames 600-603.
+   looks like: `ASTRA_PRETONE_TRACE=600` (frame number) logs every candidate pass of frames 600-603 (since review 13
+   only where pretone is on: an Unreal game, or `ASTRA_TONE_ENGINE=unreal`).
    Her brightness in the game's light: overlay `her exposure in the game's light` (`[tone] Exposure` in the
    `-AstraConfig` ini, or `ASTRA_TONE_EXPOSURE`); `[tone] Path=present` (`ASTRA_TONE_PATH=present`) forces the old path.
+   **What this run did not say: she was visibly over-exposed** - washed out, her hair and skin paler than her engine
+   draws them (`shots2/cmp-before-after.png`, right). The curve inverted was a stand-in (Narkowicz's ACES fit, per
+   channel in sRGB), not Unreal's: a mid grey she draws at sRGB 0.50 came out of the game at 0.558, her skin at
+   about 1.0 / 0.89 / 0.84. Fixed by review 13 (below).
    `timing: last 30 s, 70 of 1373 frames got a newer game camera between her pass and Present` - her pass runs ~1 ms
    before Present; whether that ever shows as a frame of slip on fast turns is the morning's visual check.
 2. **She stands on the ground under her**: `[AstraUE] frame ... player -1600 580 0  her -1314 515 45  ground 45 (325
@@ -177,6 +187,49 @@ installed (`appmanifest_<app>.acf` `StateFlags` 4, no update queued - the tool's
 when Steam may show a dialog (watch `console_log.txt` for `waiting for user response to <task>` and bring Steam's
 window forward); and never launch while the game already runs (`AppError_16`). Which dialog it was is the morning's
 check: launch from Steam with the screen unlocked.
+
+### Review 13 (2026-10-15 morning, same game, headless gamescope; screenshots in `shots3/`)
+
+An adversarial review of phase 2 found eight problems; the fixes (commits `82a86d6`, `8277b71`, `d745842`, submodule
+`3b1f6a1`) and what the game showed after them:
+
+- **Her pass before the tonemapper only in an Unreal game.** Phase 2 took it in every D3D12 game (Death Stranding, a
+  Unity game with the same full-screen HDR-to-8-bit pass). Now AstraUE declares the engine (`E unreal`, provider API
+  3: `astra_provider_engine`), or the launcher's ini does (`[tone] Engine=unreal`); anywhere else the add-on's
+  command-stream hooks return at once. Seen: `pretone: she is drawn at presentation: no game engine declared (by the
+  provider, or [tone] Engine=)` at load, then two seconds later with AstraUE `provider: the game's engine is unreal`
+  and `pretone: her pass goes before the game's tonemapper when it is found: an Unreal game (declared by the
+  provider)`. With the phase-2 AstraUE (no declaration) the first line stayed and every frame was at presentation
+  (`0 frames drawn before the tonemapper, 837 at presentation`).
+- **Her colours.** The curve inverted is now Unreal's own default (`src/tone.h`: a port of its film tonemapper with
+  its blue correction and gamut expansion, inverted through a table and matrices the add-on hands the effect).
+  `shots3/cmp-r13.png`: her engine's own frame, at presentation (phase 1's path, `ASTRA_TONE_PATH=present`), before
+  the tonemapper with phase 2's curve, and now. She is no longer washed out: her hair keeps its gold and her skin
+  its brightness as her engine draws them, with the game's UI over her (the Play and Quit buttons). What is left is
+  the light match's tint from the grass around her (`Match the game's lighting`, the same on both paths), and what
+  the curve's port does not invert (ACES's glow and red modifier: a few hundredths on saturated reds). A game that
+  changes Unreal's film settings or uses its own colour LUT is not matched; `[tone] Exposure` trims her.
+- **No vanishing at the first frames.** ReShade compiles her effect for the scene colour's format the first time her
+  pass runs there, and that frame has no effects at all; then the Present path is held a second and tried again.
+  Seen: `pretone: her pass before the tonemapper did not draw (the effects are compiling for its 1920x1080 scene
+  colour): one frame without effects; she is drawn at presentation for 60 frames, then tried again` and `last 30 s:
+  1093 frames drawn before the tonemapper, 178 at presentation, 2 without effects (compiling)` on a fresh shader
+  cache, `1269 ... 59 at presentation, 1 without effects` on a warm one, then `0 without effects` every 30 s.
+- **Clean quit with her engine linked** (the test driver's `quit`: Unreal's own QuitGame): `the device the link
+  started for is gone: its threads stopped`, the process gone 2.6-5.1 s after the command, in all five runs.
+- **A 3-minute run** with the player walked 15 m and back, the camera spun and the game paused: 10 000 frames, all
+  before the tonemapper after the first second, `0 tonemapper passes met Present in progress`, no fault, no Vulkan
+  error in Proton's log.
+- Not live-checkable here, tested offline (`tests/run.sh`, each fix broken once to see it fail): the scene colour's
+  copy and her textures destroyed only 8 frames after their last use, her pass only at exactly the presented size,
+  only the descriptors copied since the draw before looked up, the compute root signature put back, the WebSocket
+  client's bounded waits (under Wine, against peers that never answer or never read), AstraUE's sun searched only
+  when gone and its ground not snapping up to a balcony over her.
+
+Still owed: a UE5 game with dynamic resolution or an upscaler running below the output size (she is drawn at
+Present there now - check it says so); a long session with alt-tab and a resolution change; a UE 4.27 D3D12 game;
+fast turns and her shadow's placement looked at by a person; a launch from Steam with the screen unlocked; Death
+Stranding on this foundation (its pin is still the pre-pretone `f33d736`).
 
 ### Remove
 
