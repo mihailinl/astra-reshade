@@ -8,7 +8,9 @@
 #   4. the HLSL ReShade makes of it through Wine's d3dcompiler_47 - what it compiles with under Proton when the game
 #      ships none (tools/winecheck.sh; skipped without wine or the xwin SDK);
 #   5. the WebSocket client (the link to her engine) against peers that misbehave, built for Windows and run under Wine
-#      (tools/wstest.sh; skipped the same way).
+#      (tools/wstest.sh; skipped the same way);
+#   6. the release packer (tools/gi-pack.py) refuses a game file without a digest: Astra's launcher checks every file
+#      it placed beside the game's exe against its digest at each Play.
 set -e
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 OUT="$HERE/build/tests"
@@ -32,3 +34,13 @@ cp "$HERE/shaders/AstraPassthrough.fx" "$HERE/tests/hooks/AstraGame.fxh" "$OUT/h
 "$HERE/tools/fxcheck.sh" "$OUT/hooks/AstraPassthrough.fx"
 "$HERE/tools/winecheck.sh" "$HERE"/shaders/*.fx "$OUT/hooks/AstraPassthrough.fx"
 "$HERE/tools/wstest.sh"
+GP="$OUT/gipack"
+rm -rf "$GP" && mkdir -p "$GP/staged" && printf 'x' > "$GP/staged/a.dll"
+printf 'schema = 1\n[[game_files]]\nfrom = "a.dll"\nto = "${game}/a.dll"\n' > "$GP/undigested.toml"
+printf 'schema = 1\n[[game_files]]\nfrom = "a.dll"\nto = "${game}/a.dll"\nsha256 = "@sha256:a.dll@"\n' > "$GP/digested.toml"
+python3 "$HERE/tools/gi-pack.py" "$GP/digested.toml" "$GP/staged" "$GP/ok.zip" >/dev/null
+if python3 "$HERE/tools/gi-pack.py" "$GP/undigested.toml" "$GP/staged" "$GP/bad.zip" >/dev/null 2>&1; then
+	echo "gi-pack: a game file without a digest was packed"
+	exit 1
+fi
+echo "gi-pack: a game file without a digest is refused"

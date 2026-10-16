@@ -50,10 +50,10 @@ the path changes may show her once in the wrong colour space (ReShade's one unif
 
 | path | what |
 |---|---|
-| `src/` | the add-on (`astra.addon64`): the provider API (`provider.cpp`), its pipe (`pipe.cpp`), the engine link (`link.cpp`), the frame ring reader and compositor (`layer.cpp`, `ring.cpp`) |
+| `src/` | the add-on (`astra.addon64`): the provider API (`provider.cpp`), its pipe (`pipe.cpp`), the engine link (`link.cpp`), the frame ring reader and compositor (`layer.cpp`, `ring.cpp`), its settings (`config.cpp`, the rules in `config_rules.h`) |
 | `include/astra_provider.h` | the provider API: a C ABI and the pipe's line protocol |
 | `shaders/AstraPassthrough.fx` | the compositing effect |
-| `runners/unreal/` | the Unreal runner: the AstraUE UE4SS mod, ReShade.ini, the UE4SS mod list, the `astra-gi.toml` manifest draft |
+| `runners/unreal/` | the Unreal runner: the AstraUE UE4SS mod, the UE4SS mod list, the `astra-gi.toml` manifest Astra's game launcher installs |
 | `tests/` | `tests/run.sh`: the core in native C++ (incl. the pass finder and pretone's rules over recorded sequences, the tone mapping through a port of Unreal's tonemapper), AstraUE against a stub of UE4SS, the effect through ReShade's own FX compiler and Wine's d3dcompiler, the WebSocket client under Wine |
 | `docs/LIVE-TEST.md` | how to try it in a real game (Scarlet Skips, S.T.A.L.K.E.R. 2) and what proves each piece |
 
@@ -121,46 +121,72 @@ A game whose integration needs more of the compositor (the game's UI laid back o
 of her) ships its own `AstraGame.fxh` beside `AstraPassthrough.fx`, in place of the foundation's empty one: the hooks
 are listed at the top of the effect.
 
-## Install by hand (until Astra's launcher does it)
+## Install
 
-Everything goes into the folder of the game's REAL executable (Unreal: `<Project>/Binaries/Win64/`, beside
-`<Project>-Win64-Shipping.exe`), see `docs/LIVE-TEST.md` for the exact steps:
+### Through Astra's launcher (how a user gets it)
 
-- ReShade 6.8.0 **with full add-on support**: its `ReShade64.dll` as `dxgi.dll`, and `runners/unreal/ReShade.ini`;
-- `astra-reshade/astra.addon64` and `astra-reshade/Shaders/{AstraPassthrough.fx, AstraGame.fxh, ReShade.fxh}`;
-- for Unreal: UE4SS (`dwmapi.dll` + `ue4ss/`) with `runners/unreal/AstraUE` in `ue4ss/Mods/` and our `mods.txt`.
+`tools/package-unreal.sh` builds `build/astra-gi.zip`, the release asset Astra's game launcher
+(`astra-game-launcher`, driven by the Astra daemon's Games section) installs into any Unreal game the user picks:
 
-Under Proton, the game's launch options: `WINEDLLOVERRIDES="dwmapi=n,b;dxgi=n,b" %command%`.
+- into the launcher's **profile** for that game: UE4SS whole, with `AstraUE` in its `Mods/` and our `mods.txt`;
+- beside the game's **real** exe (`<Project>/Binaries/Win64/`, the `*-Win64-Shipping.exe` the launcher detects, never
+  the root launcher stub): `dwmapi.dll` (UE4SS's proxy), `dxgi.dll` (ReShade 6.8.0 Addon), `astra.addon64` and
+  `astra-reshade/Shaders/{AstraPassthrough.fx, AstraGame.fxh, ReShade.fxh}` — every one digest-pinned in the manifest;
+- at every Play: the engine's port and this session's token into `<profile>/astra-reshade.ini` (`[bridge] Port=`,
+  `Token=`), the Proton overrides `dwmapi`/`dxgi` = `native,builtin` for the Shipping exe in the prefix's `user.reg`,
+  and the launch `steam -applaunch <app> --ue4ss-path <profile>\ue4ss\UE4SS.dll -AstraConfig <profile>\astra-reshade.ini`
+  (Windows paths, `Z:\...` under Proton; the token is never on the command line).
 
-The add-on logs to `astra-reshade.log` beside the game's exe (or beside the `-AstraConfig=` ini). ReShade's overlay
+**No `ReShade.ini` ships**: ReShade rewrites it while the game runs, and the launcher checks every file it placed
+against its digest at each Play. ReShade's defaults load the add-on (with no `AddonPath`, add-ons are loaded from
+ReShade's own folder, so `astra.addon64` sits beside `dxgi.dll`), and the add-on sets at load, only where missing,
+what her effect needs and ReShade's defaults lack (`src/config_rules.h`): `.\astra-reshade\Shaders\**` added to
+`EffectSearchPaths`, `PresetPath=.\astra-reshade\AstraPreset.ini`, `TutorialProgress=4`. It does so while ReShade loads
+add-ons at the game's first device, before the effect runtime reads its config at the swap chain; ReShade then writes
+the file itself. Seen 2026-10-16 under Wine 11.19 (D3D12 through vkd3d, a hidden-window test program, no game): no
+`ReShade.ini` → `Loading add-on from '...\astra.addon64'`, `Successfully compiled '...\astra-reshade\Shaders\AstraPassthrough.fx'`,
+and a `ReShade.ini` written with the three keys; a second start sets nothing; a person's own `EffectSearchPaths` and
+`PresetPath` are kept (ours appended). The technique needs no preset: it is `enabled = true`.
+
+Uninstall removes what the launcher placed and puts back the Proton overrides; what ReShade wrote itself
+(`ReShade.ini`, `ReShade.log`, `astra-reshade/AstraPreset.ini`) stays, inert without `dxgi.dll`.
+
+### By hand (the developer path)
+
+Lay `build/astra-gi/` out the same way, see `docs/LIVE-TEST.md` for the exact steps: `dwmapi.dll`, `dxgi.dll`,
+`astra.addon64` and `astra-reshade/` beside the game's real exe, and for Unreal UE4SS's `ue4ss/` folder there too
+(UE4SS finds it beside its proxy with no `--ue4ss-path`). Under Proton, the game's launch options:
+`WINEDLLOVERRIDES="dwmapi=n,b;dxgi=n,b" %command%`. A manual install from before 2026-10-16 (a `ReShade.ini` with
+`AddonPath=.\astra-reshade\`, the add-on inside `astra-reshade\`) must be removed first, or ReShade keeps loading the
+old add-on from there.
+
+The add-on logs to `astra-reshade.log` beside the game's exe (or beside the `-AstraConfig` ini). ReShade's overlay
 (Home) has an **Astra** tab: the engine link, the provider, "camera delay" and "wait for her picture".
 
-The engine's port and token come from `-AstraConfig=<ini>` on the game's command line (`[bridge] Port=`, `Token=`
-— Astra's launcher writes it), else `ASTRA_BRIDGE_PORT` / `ASTRA_BRIDGE_TOKEN`, else 25600 with no token.
+The engine's port and token come from the first of: the ini named by `-AstraConfig <path>` (or `-AstraConfig=<path>`)
+on the game's command line (`[bridge] Port=`, `Token=` — Astra's launcher writes it; by hand it is the developer's
+override); `ASTRA_BRIDGE_PORT` / `ASTRA_BRIDGE_TOKEN`; `ReShade.ini`'s `[ASTRA] Port=` / `Token=`; else 25600 with no
+token. The first source that is there decides both; a named ini that is missing or unreadable is skipped and the
+load line says so. The token is never logged, only whether there is one. `ReShade.ini`'s other `[ASTRA]` keys are the
+overlay's sliders, as before.
 
 ## The Unreal runner (`runners/unreal/`)
 
-`astra-gi.toml` (schema 1 of `astra-bepinex/docs/GAME-INTEGRATION-MANIFEST.md`) installs, for any UE game:
-UE4SS whole into the launcher's profile (loaded from there by its proxy's `--ue4ss-path`), and into the game's exe
-folder only the two proxies (`dwmapi.dll`, `dxgi.dll`), `ReShade.ini`, the add-on and its two shader files.
-Upstream binaries are digest-pinned; `tools/package-unreal.sh` fills in our files' digests and checks them all.
+`astra-gi.toml` (schema 1 of `astra-bepinex/docs/GAME-INTEGRATION-MANIFEST.md`, as `astra-game-launcher` reads it)
+installs what *Through Astra's launcher* lists. Upstream binaries are digest-pinned; `tools/package-unreal.sh` fills in
+our files' digests, checks them all, and refuses a game file without one (`tools/gi-pack.py`).
 
-What the launcher needs that schema 1 does not say yet:
+Still open on the launcher's side:
 
-1. **`${game}` for `engine = "unreal"` must be the REAL exe's folder** — `<Project>/Binaries/Win64/` (the
-   `*-Win64-Shipping.exe`), not the root folder with the small launcher stub the user may pick. Both proxies must
-   sit beside the process that loads them.
-2. **Our own files in the game folder change every release** (the add-on, the .fx): as `[[game_files]]` each update
-   asks the user again. ReShade can only find them relative to its `ReShade.ini`, which must sit in the game
-   folder; a `${profile}` placeholder expanded inside a game file (a rendered `ReShade.ini` with
-   `AddonPath=<profile>`) would let them live in the profile as `[[files]]`.
-3. **Files the tools write themselves**: ReShade rewrites `ReShade.ini` and creates `AstraPreset.ini` and its
-   cache; UE4SS writes its log and cache in the profile. The ledger should know a file it placed may change
-   (no digest, `ReShade.ini`) and what to remove that it did not place (`astra-reshade/AstraPreset.ini`).
-4. **A rolling upstream**: UE 5.6+ needs RE-UE4SS's experimental line, whose release tag is replaced at every
+1. **Our own files in the game folder change every release** (the add-on, the .fx): as `[[game_files]]` each update
+   asks the user again.
+2. **Files the tools write themselves** stay after uninstall: ReShade's `ReShade.ini`, `ReShade.log` and
+   `astra-reshade/AstraPreset.ini` beside the exe (inert without `dxgi.dll`); UE4SS's log and cache are in the
+   profile, which uninstall removes.
+3. **A rolling upstream**: UE 5.6+ needs RE-UE4SS's experimental line, whose release tag is replaced at every
    upstream commit; the zip must be mirrored as our own release asset (MIT allows it) for the pinned URL to live.
-5. **An existing ReShade or UE4SS** in the game folder (a user's own ReShade without add-on support, or another
-   UE4SS) is "another mod loader": the launcher should say so, not replace it.
+4. **An existing ReShade or UE4SS** in the game folder: a foreign `dxgi.dll` is refused as another mod loader; a
+   foreign `dwmapi.dll` (another UE4SS) is not on the launcher's list and would be backed up and replaced.
 
 ## Licence
 

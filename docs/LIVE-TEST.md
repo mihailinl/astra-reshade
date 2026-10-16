@@ -7,8 +7,22 @@ Each step proves one piece and says what you should see; stop at the first step 
 after three fixes, all generic (see *What the first run found* at the end). Nothing in the foundation is specific
 to the game.
 
-Build once (Linux, this repo): `./build.sh && tools/package-unreal.sh` — `build/astra-gi/` is then the whole
-install, laid out as the launcher would place it.
+Build once (Linux, this repo): `./build.sh && tools/package-unreal.sh` — `build/astra-gi.zip` is the release asset
+Astra's game launcher installs, and `build/astra-gi/` the same files unpacked.
+
+**Through Astra's launcher** (a user's way; README *Install*): the daemon's Games section installs the zip into the
+game the user picks and starts it. **The steps below are the developer's way**: by hand, one piece at a time, with
+UE4SS's `ue4ss/` beside its proxy in the game folder instead of the launcher's profile.
+
+A zip can be checked without a game, with the launcher's own CLI over scratch folders (nothing starts; `launch
+--dry-run` only prints the command): `astra-game-launcher inspect build/astra-gi.zip --sha256 <hex>`, then `plan` /
+`install --yes` / `launch --dry-run --vars-stdin` / `uninstall` with `--game` a fake Steam library folder holding
+`<Game>.exe` and `<Project>/Binaries/Win64/<Project>-Win64-Shipping.exe` + `<Project>/Content/Paks/x.pak`, `--exe` the
+Shipping exe, `--appid` any number, `--platform linux-proton`, `--proton-prefix` a folder with an empty `user.reg`, and
+`--profile` a scratch folder. Seen 2026-10-16: the six game files `add`, 21 profile files, the dry run's argv
+`-applaunch <app> --ue4ss-path Z:\...\profile\ue4ss\UE4SS.dll -AstraConfig Z:\...\profile\astra-reshade.ini`, the
+profile's ini `[bridge] Port = ... Token = ...`, the overrides under the Shipping exe's `AppDefaults` key; a second
+Play after ReShade wrote its own files beside the exe still passes; uninstall removes the six and the overrides.
 
 **Before anyone else builds this: push the submodule's branch first.** `extern/minecraft-in-death-stranding` is
 pinned at a commit of that repo's branch `astra-reshade-fixes` (the WebSocket client and the fault guard) that may
@@ -59,12 +73,17 @@ milliseconds under Wine, so it is an average of 0s and 1s - read it over several
 ### 2. ReShade + the add-on, and the game's depth
 
 ```bash
-cp "$A/dxgi.dll" "$A/ReShade.ini" "$G/" && cp -r "$A/astra-reshade" "$G/"
+cp "$A/dxgi.dll" "$A/astra.addon64" "$G/" && cp -r "$A/astra-reshade" "$G/"
 ```
+No `ReShade.ini`: ReShade loads `astra.addon64` from its own folder, and the add-on adds what her effect needs to the
+`ReShade.ini` ReShade writes (README *Install*). A manual install from before 2026-10-16 (`ReShade.ini` with
+`AddonPath=.\astra-reshade\`, the add-on in `astra-reshade\`) must go first (*Remove*), or ReShade keeps loading the
+old add-on.
 Launch options: `WINEDLLOVERRIDES="dwmapi=n,b;dxgi=n,b" %command%`. In game press **Home**:
 - the overlay opens; its **Add-ons** tab lists **Astra**; the **Astra** tab says `Provider: live ... pipe: connected`
   and `Engine: waiting (is Astra running?)`;
-- `$G/astra-reshade.log`: `---- Astra (astra-reshade) loaded`, `pipe: serving \\.\pipe\astra-provider`,
+- `$G/astra-reshade.log`: `---- Astra (astra-reshade) loaded`, on a first start `ReShade.ini: set what her effect
+  needs and it lacked: EffectSearchPaths PresetPath TutorialProgress`, `pipe: serving \\.\pipe\astra-provider`,
   `pipe: a provider connected`, `provider says: AstraUE connected (UE 5.6)`.
 
 **Depth** (the part most likely to need work on UE5): Home → Home tab → AstraPassthrough → `DebugView` = "Game
@@ -79,7 +98,7 @@ depth (1 m bands)". Expect stripes 1 m apart that sit still on walls and the flo
 
 Set `DebugView` back to "Composite".
 
-Seen 2026-10-14 with no depth setting changed (`ReShade.ini` as shipped, native resolution, TSR at the game's
+Seen 2026-10-14 with no depth setting changed (the `ReShade.ini` the manual install shipped then, the keys the add-on now sets; native resolution, TSR at the game's
 defaults): the bands sat still on the ground and the trees, finer near the camera, the sky clear; no Generic Depth
 pick, no copy before clears, no `r.RDG.TransientAllocator=0`. `DebugView` can be set without the overlay:
 `astra-reshade/AstraPreset.ini` = `Techniques=AstraPassthrough@AstraPassthrough.fx`, `[AstraPassthrough.fx]`,
@@ -264,7 +283,7 @@ same at all three (picture brightness 0.69-0.70, 0.77 with no light match).
 ### Remove
 
 ```bash
-cd "$G" && rm -rf dwmapi.dll dxgi.dll ReShade.ini astra-reshade ue4ss astra-reshade.log ReShade.log
+cd "$G" && rm -rf dwmapi.dll dxgi.dll astra.addon64 ReShade.ini astra-reshade ue4ss astra-reshade.log ReShade.log
 ```
 and clear the launch options (or delete the `AppDefaults\ScarletSkips-Win64-Shipping.exe\DllOverrides` key from
 the prefix's `user.reg`, with the game closed).

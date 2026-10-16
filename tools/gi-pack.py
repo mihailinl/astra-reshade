@@ -5,8 +5,9 @@
 
 The manifest (schema 1, astra-bepinex/docs/GAME-INTEGRATION-MANIFEST.md) may say "@sha256:<path in the zip>@"
 where a digest of OUR file belongs (it changes with every build): it is filled in from the staged file. Then every
-file the manifest names must be staged, and every digest it pins must match - an upstream file (ReShade's dxgi.dll)
-that is not the release it pins stops the build here, not at a player's install. The zip holds the filled manifest
+file the manifest names must be staged, every [[game_files]] entry must pin a digest (the launcher checks the files it
+placed against them at each Play), and every digest must match - an upstream file (ReShade's dxgi.dll) that is not
+the release it pins stops the build here, not at a player's install. The zip holds the filled manifest
 and the whole staged folder (licences included: the launcher extracts only what the manifest names, a reader of the
 zip sees them all), in a fixed order with fixed timestamps: the same files give the same zip, byte for byte.
 """
@@ -42,7 +43,9 @@ def main(manifest, staged, out):
         p = os.path.join(staged, f["from"])
         if not os.path.isfile(p):
             sys.exit("not staged: " + f["from"])
-        if "sha256" in f and digest(p) != f["sha256"]:
+        if "sha256" not in f:
+            sys.exit("no digest: %s (every file placed beside the game's exe carries one)" % f["from"])
+        if digest(p) != f["sha256"]:
             sys.exit("digest mismatch: %s is not the file the manifest pins" % f["from"])
     entries = [("astra-gi.toml", text.encode("utf-8"))]
     for d, dirs, files in os.walk(staged):

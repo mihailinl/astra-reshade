@@ -1,8 +1,9 @@
 #!/bin/bash
 # Builds the Unreal runner's release asset: build/astra-gi.zip (astra-gi.toml + every file it names), from
-#   our build (./build.sh -> build/astra.addon64), shaders/, runners/unreal/ (AstraUE, ReShade.ini, the manifest);
+#   our build (./build.sh -> build/astra.addon64), shaders/, runners/unreal/ (AstraUE, the UE4SS mod list, the manifest);
 #   UE4SS (downloaded, digest-checked), ReShade 6.8.0 Addon + ReShade.fxh (the submodule's fetch_deps.sh).
-# Fills the manifest's @sha256:<path>@ with our files' digests and checks every upstream digest it pins.
+# Fills the manifest's @sha256:<path>@ with our files' digests and checks every upstream digest it pins. No ReShade.ini:
+# the add-on sets what her effect needs (src/config_rules.h), and sits beside dxgi.dll where ReShade looks by default.
 set -e
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 TP="$HERE/extern/minecraft-in-death-stranding/third_party"
@@ -39,8 +40,7 @@ PY
 cp -r "$HERE/runners/unreal/ue4ss-overlay/." "$OUT/ue4ss/"
 cp -r "$HERE/runners/unreal/AstraUE" "$OUT/ue4ss/Mods/AstraUE"
 cp "$TP/reshade-6.8.0-addon/ReShade64.dll" "$OUT/dxgi.dll"
-cp "$HERE/runners/unreal/ReShade.ini" "$OUT/ReShade.ini"
-cp "$HERE/build/astra.addon64" "$OUT/astra-reshade/astra.addon64"
+cp "$HERE/build/astra.addon64" "$OUT/astra.addon64"
 cp "$HERE/shaders/AstraPassthrough.fx" "$HERE/shaders/AstraGame.fxh" "$TP/shaders/ReShade.fxh" "$OUT/astra-reshade/Shaders/"
 cp "$HERE/LICENSE" "$OUT/LICENSES/astra-reshade-MIT.txt"
 cp "$OUT/ue4ss/LICENSE" "$OUT/LICENSES/RE-UE4SS-MIT.txt"
