@@ -69,35 +69,58 @@ uniform bool AstraOccluderActive = false; // set by the integration: the other c
 // loop on every compiler (tools/winecheck.sh compiles this effect with Wine's).
 uniform int3 AstraLoops < hidden = true; > = int3(24, 7, 3); // march steps, halvings, settling steps
 
-// set by the add-on
-uniform bool AstraActive = false;
-// drawn into the game's HDR scene colour, before its tonemapper (else onto the presented picture)
-uniform bool AstraHdr < hidden = true; > = false;
 // [tone] Exposure: her brightness in the game's scene, before its tone curve (1: as her engine drew her)
 uniform float ToneExposure < hidden = true; > = 1.0;
+
+// What changes with every frame, set by the add-on as a texture it copies through the same command list as her picture
+// (its src/frame_meta.h is the layout), never as uniforms: ReShade keeps one constant buffer per effect, rewritten on
+// the CPU at every run of the effects, and the GPU reads it when it executes that run - which, for her pass before
+// Unreal's tonemapper, is after the next frame's values were written: her picture drawn with the next frame's rectangle
+// and camera. A copy in the command stream is executed in order with the draw. Zeros (no add-on, or no texture): she is
+// not drawn.
+texture AstraFrameTex : ASTRAFRAME;
+sampler sAstraFrame { Texture = AstraFrameTex; MinFilter = POINT; MagFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
+static const int AstraFrameRect = 0;
+static const int AstraFramePlanes = 1;
+static const int AstraFrameHost = 2;
+static const int AstraFrameWarp0 = 3;
+static const int AstraFrameWarp1 = 4;
+static const int AstraFrameWarp2 = 5;
+static const int AstraFrameWarpT = 6;
+static const int AstraFrameWarpTan = 7;
+static const int AstraFrameSunCenter = 8;
+static const int AstraFrameSunRight = 9;
+static const int AstraFrameSunUp = 10;
+static const int AstraFrameSunDir = 11;
+static const int AstraFrameSunParams = 12;
+#define ASTRA_FRAME(i) tex2Dfetch(sAstraFrame, int2(i, 0))
+// she is drawn this frame
+#define AstraActive (ASTRA_FRAME(AstraFramePlanes).w > 0.5)
+// drawn into the game's HDR scene colour, before its tonemapper (else onto the presented picture)
+#define AstraHdr (ASTRA_FRAME(AstraFrameHost).z > 0.5)
 // near, far, flags (1: [0,1] depth, 2: rows bottom-up, 4: reversed Z, 8: depth is linear metres along the view axis)
-uniform float3 AstraPlanes = float3(0.05, 300.0, 24.0);
+#define AstraPlanes ASTRA_FRAME(AstraFramePlanes).xyz
 // the game's near and far clip (metres) for its reversed-Z depth buffer (Unreal: no far plane, a huge far stands in)
-uniform float3 HostPlanes = float3(0.1, 1.0e7, 0.0);
+#define HostPlanes ASTRA_FRAME(AstraFrameHost).xy
 // her rectangle of the whole picture in uv (x, y, width, height): the textures hold only that (1: no crop)
-uniform float4 AstraRect = float4(0.0, 0.0, 1.0, 1.0);
+#define AstraRect ASTRA_FRAME(AstraFrameRect)
 // rows of R_her^T R_game (game camera ray -> her picture's camera ray), the game's camera in her picture's camera
 // space, x = tan(game vertical fov / 2), y = tan(her picture's vertical fov / 2), z = her picture's aspect
-uniform float3 AstraWarpRow0 = float3(1.0, 0.0, 0.0);
-uniform float3 AstraWarpRow1 = float3(0.0, 1.0, 0.0);
-uniform float3 AstraWarpRow2 = float3(0.0, 0.0, 1.0);
-uniform float3 AstraWarpT = float3(0.0, 0.0, 0.0);
-uniform bool AstraWarpIdentity = false; // her picture is of this very camera: no re-projection
-uniform float3 AstraWarpTan = float3(0.42, 0.42, 1.7778);
+#define AstraWarpRow0 ASTRA_FRAME(AstraFrameWarp0).xyz
+#define AstraWarpRow1 ASTRA_FRAME(AstraFrameWarp1).xyz
+#define AstraWarpRow2 ASTRA_FRAME(AstraFrameWarp2).xyz
+#define AstraWarpT ASTRA_FRAME(AstraFrameWarpT).xyz
+#define AstraWarpIdentity (ASTRA_FRAME(AstraFrameHost).w > 0.5) // her picture is of this very camera: no re-projection
+#define AstraWarpTan ASTRA_FRAME(AstraFrameWarpTan).xyz
 // her view from the sun, in the game's camera space: centre, right (+u), up (+v), the way the light travels;
 // half width, near, N; and how dark her shadow may be (0: no sun on her)
-uniform bool SunVActive = false;
-uniform float3 SunVCenter = float3(0.0, 0.0, -5.0);
-uniform float3 SunVRight = float3(1.0, 0.0, 0.0);
-uniform float3 SunVUp = float3(0.0, 1.0, 0.0);
-uniform float3 SunVDir = float3(0.0, -1.0, 0.0);
-uniform float3 SunVParams = float3(1.0, 0.0, 512.0);
-uniform float AstraShadow = 0.0;
+#define SunVActive (ASTRA_FRAME(AstraFrameSunParams).w > 0.5)
+#define SunVCenter ASTRA_FRAME(AstraFrameSunCenter).xyz
+#define SunVRight ASTRA_FRAME(AstraFrameSunRight).xyz
+#define SunVUp ASTRA_FRAME(AstraFrameSunUp).xyz
+#define SunVDir ASTRA_FRAME(AstraFrameSunDir).xyz
+#define SunVParams ASTRA_FRAME(AstraFrameSunParams).xyz
+#define AstraShadow ASTRA_FRAME(AstraFrameSunCenter).w
 
 uniform float2 DepthUvScale < ui_type = "drag"; ui_min = 0.1; ui_max = 1.0; ui_step = 0.001; ui_label = "Depth buffer part used";
 	ui_tooltip = "Under upscaling (TSR, DLSS, FSR) a game may draw its depth into the top-left part of a larger buffer.\n"
@@ -272,7 +295,7 @@ bool reproject(float2 uv, float zFar, out float2 suv, out float zs)
 /// The game's depth -> metres along its view axis (reversed Z; with no far plane, near / depth).
 float host_linear(float d)
 {
-	const float n = HostPlanes.x, f = HostPlanes.y;
+	const float n = max(HostPlanes.x, 1e-3), f = max(HostPlanes.y, n + 1.0); // (zeros: no add-on - never a NaN in the fog's history)
 	return d > 0.0 ? n * f / (n + d * (f - n)) : 1e9;
 }
 

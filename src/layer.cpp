@@ -1,4 +1,5 @@
 #include "layer.h"
+#include "frame_meta.h"
 #include "guard.h"
 #include "link.h"
 #include "log.h"
@@ -51,6 +52,8 @@ namespace layer
 		ULONGLONG g_nextOpen = 0;
 
 		Layer g_world, g_depth, g_sunMap;
+		Layer g_frameMeta; // frame_meta.h: what the effect reads in step with the frame it draws (ASTRAFRAME)
+		bool g_frameMetaFailed = false;
 		uint32_t g_texW = 0, g_texH = 0, g_sunN = 0;
 		std::vector<uint8_t> g_colourCopy, g_depthCopy, g_sunCopy;
 		ring::Frame g_frame;     // the picture shown
@@ -155,6 +158,8 @@ namespace layer
 			destroy(dev, g_depth);
 			destroy(dev, g_sunMap);
 			destroy(dev, g_toneLut);
+			destroy(dev, g_frameMeta);
+			g_frameMetaFailed = false;
 			g_retiredLayers.collect(~uint64_t(0) >> 1, [dev](Layer &l) { destroy(dev, l); }); // the GPU was waited for
 			g_toneFailed = false;
 			destroy_staging(dev);
@@ -182,18 +187,13 @@ namespace layer
 				runtime->set_uniform_value_float(v, x, y, z, w);
 		}
 
-		void set_bool(effect_runtime *runtime, const char *name, bool b)
-		{
-			if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, name); v.handle != 0)
-				runtime->set_uniform_value_bool(v, b);
-		}
-
 		void bind(effect_runtime *runtime)
 		{
 			runtime->update_texture_bindings("ASTRAWORLD", g_world.srv, g_world.srv);
 			runtime->update_texture_bindings("ASTRADEPTH", g_depth.srv, g_depth.srv);
 			runtime->update_texture_bindings("ASTRASUN", g_sunMap.srv, g_sunMap.srv);
 			runtime->update_texture_bindings("ASTRATONE", g_toneLut.srv, g_toneLut.srv);
+			runtime->update_texture_bindings("ASTRAFRAME", g_frameMeta.srv, g_frameMeta.srv);
 		}
 
 		/// tone.h's model into the effect's uniforms (only her pass before the tonemapper reads them).
@@ -215,15 +215,15 @@ namespace layer
 
 		/// On the present thread: through ReShade's immediate command list (as ReShade uploads its own textures - out of
 		/// the shader-resource state and back around the copy).
-		void upload_plane(effect_runtime *runtime, Layer &l, const void *data, uint32_t w, uint32_t h)
+		void upload_plane(effect_runtime *runtime, Layer &l, const void *data, uint32_t w, uint32_t h, uint32_t texel_bytes = 4)
 		{
 			command_list *imm = runtime->get_command_queue()->get_immediate_command_list();
 			if (imm == nullptr)
 				return;
 			subresource_data d;
 			d.data = const_cast<void *>(data);
-			d.row_pitch = w * 4;
-			d.slice_pitch = w * h * 4;
+			d.row_pitch = w * texel_bytes;
+			d.slice_pitch = w * h * texel_bytes;
 			imm->barrier(l.tex, resource_usage::shader_resource, resource_usage::copy_dest);
 			imm->update_texture_region(d, l.tex, 0);
 			imm->barrier(l.tex, resource_usage::copy_dest, resource_usage::shader_resource);
@@ -269,25 +269,26 @@ namespace layer
 		struct Plane
 		{
 			Layer *layer;
-			const std::vector<uint8_t> *data;
+			const uint8_t *data;
 			uint32_t w, h;
+			uint32_t texel_bytes; // 4: her planes (RGBA8, R32F), 16: the frame's values (RGBA32F)
 		};
 
-		uint64_t pitch_of(uint32_t w)
+		uint64_t pitch_of(uint64_t row_bytes)
 		{
-			return (uint64_t(w) * 4 + 255) & ~uint64_t(255); // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
+			return (row_bytes + 255) & ~uint64_t(255); // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
 		}
 
 		/// The planes into their textures through `cmd`. False: no upload buffer free (the GPU still reads them all) or
-		/// none could be made - the textures keep the last picture.
+		/// none could be made - the textures keep what they held.
 		bool upload_through(device *dev, command_list *cmd, const Plane *planes, int n)
 		{
 			const uint64_t frame = g_passFrame;
-			uint64_t offsets[3] = {}, total = 0;
+			uint64_t offsets[4] = {}, total = 0;
 			for (int i = 0; i < n; ++i)
 			{
 				offsets[i] = total;
-				total += (pitch_of(planes[i].w) * planes[i].h + 511) & ~uint64_t(511); // D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT
+				total += (pitch_of(uint64_t(planes[i].w) * planes[i].texel_bytes) * planes[i].h + 511) & ~uint64_t(511); // D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT
 			}
 			const int slot = g_slots.pick(frame);
 			if (slot < 0)
@@ -312,9 +313,10 @@ namespace layer
 			for (int i = 0; i < n; ++i)
 			{
 				const Plane &p = planes[i];
-				const uint64_t pitch = pitch_of(p.w);
+				const size_t row = size_t(p.w) * p.texel_bytes;
+				const uint64_t pitch = pitch_of(row);
 				for (uint32_t y = 0; y < p.h; ++y)
-					std::memcpy(static_cast<uint8_t *>(mapped) + offsets[i] + y * pitch, p.data->data() + size_t(y) * p.w * 4, size_t(p.w) * 4);
+					std::memcpy(static_cast<uint8_t *>(mapped) + offsets[i] + y * pitch, p.data + size_t(y) * row, row);
 			}
 			dev->unmap_buffer_region(buf);
 			for (int i = 0; i < n; ++i)
@@ -339,9 +341,16 @@ namespace layer
 			g_slots = pretone_rules::Staging();
 		}
 
-		/// The newest published frame, if not shown yet: on the present thread through ReShade's upload, before the
-		/// game's tonemapper through `cmd` (upload_through).
-		void upload(effect_runtime *runtime, command_list *cmd)
+		/// A picture read from the ring this run, not in its textures yet (commit puts it there).
+		struct Fetched
+		{
+			bool ok = false;
+			bool sun = false; // its sun view goes into ASTRASUN
+			ring::Frame frame;
+		};
+
+		/// The newest published frame, if not shown yet, out of the ring into the copies (its textures made at its size).
+		void fetch(effect_runtime *runtime, Fetched &out)
 		{
 			if (*reinterpret_cast<const volatile uint32_t *>(g_view) != ring::kMagic)
 			{
@@ -383,25 +392,63 @@ namespace layer
 					g_sunN = create_layer(dev, g_sunMap, f.sun.n, f.sun.n, format::r32_float) ? f.sun.n : 0;
 					bind(runtime);
 				}
-				const bool sun = f.sun.valid && g_sunN == f.sun.n;
-				if (g_hdrPass)
-				{
-					Plane planes[3] = {{&g_world, &g_colourCopy, f.rw, f.rh}, {&g_depth, &g_depthCopy, f.rw, f.rh}, {&g_sunMap, &g_sunCopy, f.sun.n, f.sun.n}};
-					if (!upload_through(dev, cmd, planes, sun ? 3 : 2))
-						return; // read again next time (g_lastPublish not advanced): the last picture is re-projected
-				}
-				else
-				{
-					upload_plane(runtime, g_world, g_colourCopy.data(), f.rw, f.rh);
-					upload_plane(runtime, g_depth, g_depthCopy.data(), f.rw, f.rh);
-					if (sun)
-						upload_plane(runtime, g_sunMap, g_sunCopy.data(), f.sun.n, f.sun.n);
-				}
+				out.sun = f.sun.valid && g_sunN == f.sun.n;
 			}
-			g_lastPublish = f.publish;
-			g_frame = f;
-			g_hasFrame = true;
-			++g_frames;
+			out.frame = f;
+			out.ok = true;
+		}
+
+		/// The fetched picture (if any) and the frame's values into their textures, in the command stream the effects are
+		/// drawn in: on the present thread through ReShade's upload, before the game's tonemapper through `cmd`
+		/// (upload_through). False: nothing went (no upload buffer free) - the textures keep the last picture and values,
+		/// which belong together, and the fetched picture is read again next time.
+		bool commit(effect_runtime *runtime, command_list *cmd, const Fetched &next, const float *values)
+		{
+			Plane planes[4];
+			int n = 0;
+			if (next.ok && !next.frame.empty)
+			{
+				const ring::Frame &f = next.frame;
+				planes[n++] = {&g_world, g_colourCopy.data(), f.rw, f.rh, 4};
+				planes[n++] = {&g_depth, g_depthCopy.data(), f.rw, f.rh, 4};
+				if (next.sun)
+					planes[n++] = {&g_sunMap, g_sunCopy.data(), f.sun.n, f.sun.n, 4};
+			}
+			planes[n++] = {&g_frameMeta, reinterpret_cast<const uint8_t *>(values), frame_meta::kTexels, 1, 16};
+			if (g_hdrPass)
+			{
+				if (!upload_through(runtime->get_device(), cmd, planes, n))
+					return false;
+			}
+			else
+				for (int i = 0; i < n; ++i)
+					upload_plane(runtime, *planes[i].layer, planes[i].data, planes[i].w, planes[i].h, planes[i].texel_bytes);
+			if (next.ok)
+			{
+				g_lastPublish = next.frame.publish;
+				g_frame = next.frame;
+				g_hasFrame = true;
+				++g_frames;
+			}
+			return true;
+		}
+
+		/// ASTRAFRAME, made once per device; false: it cannot be made (she is not drawn: the effect reads zeros).
+		bool make_frame_meta(effect_runtime *runtime)
+		{
+			if (g_frameMeta.tex.handle != 0)
+				return true;
+			if (g_frameMetaFailed)
+				return false;
+			if (!create_layer(runtime->get_device(), g_frameMeta, frame_meta::kTexels, 1, format::r32g32b32a32_float))
+			{
+				destroy(runtime->get_device(), g_frameMeta);
+				g_frameMetaFailed = true;
+				logf("layer: cannot make the texture of the frame's values: she is not drawn");
+				return false;
+			}
+			bind(runtime);
+			return true;
 		}
 
 		/// Her picture for the camera being presented is usually a millisecond or two away: wait for it (bounded)
@@ -446,78 +493,91 @@ namespace layer
 			}
 			// into the game's HDR scene colour (before its tonemapper), or onto the presented picture
 			const bool hdr = g_hdrPass;
-			set_bool(runtime, "AstraHdr", hdr);
 			if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "ToneExposure"); v.handle != 0)
 				runtime->set_uniform_value_float(v, g_toneExposure);
 			if (!hdr && g_toneWanted)
 				make_tone_lut(runtime); // on the present thread only (an upload): pretone waits for it (tone_ready)
+			if (!make_frame_meta(runtime))
+				return; // the effect reads zeros: she is not drawn, the game passes through
 			bool on = g_active && (!hdr || g_toneLut.tex.handle != 0) && open_mapping();
 			if (hdr && on)
 				set_tone(runtime);
+			Fetched next;
 			if (on)
 			{
 				wait_for_frame();
-				upload(runtime, cmd);
+				fetch(runtime, next);
+			}
+			const ring::Frame &shown = next.ok ? next.frame : g_frame; // the picture this frame draws, once committed
+
+			frame_meta::Values v;
+			v.run = g_runs;
+			v.hdr = hdr;
+			view::Pose host;
+			float shadow;
+			{
+				std::lock_guard<std::mutex> lock(g_lock);
+				host = g_host;
+				v.host_near = g_hostNear;
+				v.host_far = g_hostFar > g_hostNear ? g_hostFar : kHostFar;
+				shadow = g_shadow;
 			}
 			// the camera her picture was drawn with (the link remembers the cameras it sent)
 			view::Pose from;
 			float aspect = 1.0f;
 			double origin[3] = {};
-			on = on && g_hasFrame && !g_frame.empty && g_texW != 0 && enginelink::pose_of(g_frame.host_frame, from, aspect, origin);
-			set_bool(runtime, "AstraActive", on);
-			if (!on)
-				return;
-			view::Pose host;
-			float host_near, host_far, shadow;
+			v.active = on && (next.ok || g_hasFrame) && !shown.empty && g_texW != 0 && enginelink::pose_of(shown.host_frame, from, aspect, origin);
+			if (v.active)
 			{
-				std::lock_guard<std::mutex> lock(g_lock);
-				host = g_host;
-				host_near = g_hostNear;
-				host_far = g_hostFar > host_near ? g_hostFar : kHostFar;
-				shadow = g_shadow;
-			}
-			if (!host.valid)
-				host = from;
-			from.tan_half_v = std::tan(g_frame.vfov_deg * 3.14159265f / 360.0f); // what it was drawn at
-			// she moved on since her picture (running, riding): as if its camera had moved along with her
-			double moved[3] = {0, 0, 0};
-			enginelink::moved_since(g_frame.host_frame, moved);
-			const view::Warp w = view::warp(host, from, moved);
+				if (!host.valid)
+					host = from;
+				from.tan_half_v = std::tan(shown.vfov_deg * 3.14159265f / 360.0f); // what it was drawn at
+				// she moved on since her picture (running, riding): as if its camera had moved along with her
+				double moved[3] = {0, 0, 0};
+				enginelink::moved_since(shown.host_frame, moved);
+				const view::Warp w = view::warp(host, from, moved);
 
-			set_float3(runtime, "AstraPlanes", g_frame.near_m, g_frame.far_m, float(g_frame.flags));
-			set_float3(runtime, "HostPlanes", host_near, host_far, 0.0f);
-			// the planes hold her rectangle of the whole picture (flag 128), or all of it
-			set_float4(runtime, "AstraRect", float(g_frame.rx) / float(g_frame.w), float(g_frame.ry) / float(g_frame.h), float(g_frame.rw) / float(g_frame.w),
-				float(g_frame.rh) / float(g_frame.h));
-			set_bool(runtime, "AstraWarpIdentity", w.identity);
-			set_float3(runtime, "AstraWarpRow0", w.row[0][0], w.row[0][1], w.row[0][2]);
-			set_float3(runtime, "AstraWarpRow1", w.row[1][0], w.row[1][1], w.row[1][2]);
-			set_float3(runtime, "AstraWarpRow2", w.row[2][0], w.row[2][1], w.row[2][2]);
-			set_float3(runtime, "AstraWarpT", w.t[0], w.t[1], w.t[2]);
-			set_float3(runtime, "AstraWarpTan", host.tan_half_v, from.tan_half_v, aspect);
+				v.near_m = shown.near_m;
+				v.far_m = shown.far_m;
+				v.flags = float(shown.flags);
+				// the planes hold her rectangle of the whole picture (flag 128), or all of it
+				v.rect[0] = float(shown.rx) / float(shown.w);
+				v.rect[1] = float(shown.ry) / float(shown.h);
+				v.rect[2] = float(shown.rw) / float(shown.w);
+				v.rect[3] = float(shown.rh) / float(shown.h);
+				v.identity = w.identity;
+				for (int i = 0; i < 3; ++i)
+				{
+					for (int j = 0; j < 3; ++j)
+						v.warp[i][j] = w.row[i][j];
+					v.warp_t[i] = w.t[i];
+				}
+				v.tan_host = host.tan_half_v;
+				v.tan_from = from.tan_half_v;
+				v.aspect = aspect;
 
-			// her shadow on the game's ground: her view from the sun, in the presented camera's space
-			const bool sun_map = g_frame.sun.valid && g_sunN != 0 && shadow > 0.0f;
-			if (sun_map)
-			{
-				const ring::SunView &s = g_frame.sun;
-				// the engine's world in that frame is absolute - origin; moved along with her like her picture
-				const float cd[3] = {float(s.center[0] + origin[0] + moved[0] - host.pos[0]), float(s.center[1] + origin[1] + moved[1] - host.pos[1]),
-					float(s.center[2] + origin[2] + moved[2] - host.pos[2])};
-				float c[3], r[3], u[3], d[3];
-				to_camera(host, cd, c);
-				to_camera(host, s.right, r);
-				to_camera(host, s.up, u);
-				to_camera(host, s.dir, d);
-				set_float3(runtime, "SunVCenter", c[0], c[1], c[2]);
-				set_float3(runtime, "SunVRight", r[0], r[1], r[2]);
-				set_float3(runtime, "SunVUp", u[0], u[1], u[2]);
-				set_float3(runtime, "SunVDir", d[0], d[1], d[2]);
-				set_float3(runtime, "SunVParams", s.half, s.near_dist, float(g_sunN));
+				// her shadow on the game's ground: her view from the sun, in the presented camera's space
+				const bool sun_map = shown.sun.valid && g_sunN != 0 && shadow > 0.0f;
+				if (sun_map)
+				{
+					const ring::SunView &s = shown.sun;
+					// the engine's world in that frame is absolute - origin; moved along with her like her picture
+					const float cd[3] = {float(s.center[0] + origin[0] + moved[0] - host.pos[0]), float(s.center[1] + origin[1] + moved[1] - host.pos[1]),
+						float(s.center[2] + origin[2] + moved[2] - host.pos[2])};
+					to_camera(host, cd, v.sun_center);
+					to_camera(host, s.right, v.sun_right);
+					to_camera(host, s.up, v.sun_up);
+					to_camera(host, s.dir, v.sun_dir);
+					v.sun_half = s.half;
+					v.sun_near = s.near_dist;
+					v.sun_n = float(g_sunN);
+					v.shadow = shadow;
+				}
+				v.sun = sun_map;
 			}
-			set_bool(runtime, "SunVActive", sun_map);
-			if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "AstraShadow"); v.handle != 0)
-				runtime->set_uniform_value_float(v, sun_map ? shadow : 0.0f);
+			float values[frame_meta::kTexels * 4];
+			frame_meta::pack(v, values);
+			commit(runtime, cmd, next, values);
 		}
 
 		void on_reloaded_effects(effect_runtime *runtime)

@@ -1,6 +1,7 @@
 // Native tests of the add-on's portable core: the pipe's line protocol, the provider's seqlocked state, the
 // camera math and the frame-ring reader (crop included). Run: tests/run.sh (any Linux/macOS clang++ or g++).
 #include "config_rules.h"
+#include "frame_meta.h"
 #include "lines.h"
 #include "outbox.h"
 #include "passfind.h"
@@ -1029,6 +1030,75 @@ static void test_tone_in_effect()
 	CHECK(fx.find("ToneA") == std::string::npos && fx.find("TonePre") == std::string::npos);
 }
 
+// ---- frame_meta: what the effect reads in step with the frame it draws ----------------------------------------------
+
+/// The values land at the texels the effect reads them from, and the effect reads every per-frame value from that
+/// texture - never from a uniform (ReShade's one constant buffer per effect is rewritten by the next frame before the
+/// GPU draws this one: in Scarlet Skips 577 of 600 frames were drawn with the next frame's uniforms).
+static void test_frame_meta()
+{
+	frame_meta::Values v;
+	v.rect[0] = 0.25f;
+	v.rect[3] = 0.5f;
+	v.active = true;
+	v.near_m = 0.1f;
+	v.flags = 136.0f;
+	v.host_near = 0.2f;
+	v.host_far = 1.0e7f;
+	v.hdr = true;
+	v.identity = true;
+	v.warp[1][2] = -0.5f;
+	v.warp_t[2] = 3.0f;
+	v.tan_host = 0.3f;
+	v.aspect = 1.6f;
+	v.sun_center[0] = 7.0f;
+	v.shadow = 0.6f;
+	v.sun_dir[1] = -0.9f;
+	v.sun_n = 256.0f;
+	v.sun = true;
+	v.run = (uint64_t(1) << 40) + 77;
+	float t[frame_meta::kTexels * 4];
+	frame_meta::pack(v, t);
+	auto at = [&](int texel, int c) { return t[texel * 4 + c]; };
+	CHECK(at(frame_meta::kRect, 0) == 0.25f && at(frame_meta::kRect, 2) == 1.0f && at(frame_meta::kRect, 3) == 0.5f);
+	CHECK(at(frame_meta::kPlanes, 0) == 0.1f && at(frame_meta::kPlanes, 2) == 136.0f && at(frame_meta::kPlanes, 3) == 1.0f);
+	CHECK(at(frame_meta::kHost, 0) == 0.2f && at(frame_meta::kHost, 1) == 1.0e7f && at(frame_meta::kHost, 2) == 1.0f && at(frame_meta::kHost, 3) == 1.0f);
+	CHECK(at(frame_meta::kWarp1, 2) == -0.5f && at(frame_meta::kWarp0, 0) == 1.0f && at(frame_meta::kWarpT, 2) == 3.0f);
+	CHECK(at(frame_meta::kWarpTan, 0) == 0.3f && at(frame_meta::kWarpTan, 2) == 1.6f);
+	CHECK(at(frame_meta::kSunCenter, 0) == 7.0f && at(frame_meta::kSunCenter, 3) == 0.6f && at(frame_meta::kSunDir, 1) == -0.9f);
+	CHECK(at(frame_meta::kSunParams, 2) == 256.0f && at(frame_meta::kSunParams, 3) == 1.0f);
+	CHECK(at(frame_meta::kRun, 0) == 77.0f); // 24 bits: exact in a float
+	frame_meta::Values off;
+	frame_meta::pack(off, t);
+	CHECK(at(frame_meta::kPlanes, 3) == 0.0f && at(frame_meta::kHost, 2) == 0.0f && at(frame_meta::kSunParams, 3) == 0.0f);
+
+	std::ifstream f(ASTRA_FX);
+	CHECK(f.good());
+	std::stringstream ss;
+	ss << f.rdbuf();
+	const std::string fx = ss.str();
+	CHECK(std::regex_search(fx, std::regex(R"(texture\s+AstraFrameTex\s*:\s*ASTRAFRAME\s*;)")));
+	const struct
+	{
+		const char *name;
+		int texel;
+	} texels[] = {{"Rect", frame_meta::kRect}, {"Planes", frame_meta::kPlanes}, {"Host", frame_meta::kHost}, {"Warp0", frame_meta::kWarp0},
+		{"Warp1", frame_meta::kWarp1}, {"Warp2", frame_meta::kWarp2}, {"WarpT", frame_meta::kWarpT}, {"WarpTan", frame_meta::kWarpTan},
+		{"SunCenter", frame_meta::kSunCenter}, {"SunRight", frame_meta::kSunRight}, {"SunUp", frame_meta::kSunUp}, {"SunDir", frame_meta::kSunDir},
+		{"SunParams", frame_meta::kSunParams}};
+	for (const auto &x : texels)
+	{
+		std::smatch m;
+		const bool found = std::regex_search(fx, m, std::regex(std::string(R"(static const int AstraFrame)") + x.name + R"(\s*=\s*([0-9]+)\s*;)"));
+		CHECK(found && std::stoi(m[1].str()) == x.texel);
+		if (!found || std::stoi(m[1].str()) != x.texel)
+			std::printf("  AstraFrame%s: not at texel %d in the effect\n", x.name, x.texel);
+	}
+	// a value that changes every frame declared as a uniform again would be read a frame late
+	CHECK(!std::regex_search(fx, std::regex(
+		R"(uniform\s+\w+\s+(AstraActive|AstraHdr|AstraPlanes|HostPlanes|AstraRect|AstraWarp\w*|SunV\w*|AstraShadow)\b)")));
+}
+
 // ---- config_rules: where the add-on is pointed, and ReShade.ini without a shipped one ------------------------------
 
 static void test_config_rules()
@@ -1120,6 +1190,7 @@ int main(int argc, char **argv)
 	test_link_sends_through_the_outbox();
 	test_tone();
 	test_tone_in_effect();
+	test_frame_meta();
 	test_config_rules();
 	if (argc > 1)
 		test_lua_lines(argv[1]);
