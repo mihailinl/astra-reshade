@@ -1,7 +1,7 @@
 #include "config.h"
+#include "config_rules.h"
 #include <windows.h>
 #include <cwchar>
-#include <cwctype>
 
 namespace config
 {
@@ -13,99 +13,96 @@ namespace config
 			return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash + 1);
 		}
 
-		/// A token is sent inside JSON: keep it to what a token is (no quotes, no control characters).
-		std::string clean_token(const std::wstring &w)
+		/// The file is there and this process may read it (a folder is not).
+		bool readable(const std::wstring &path)
 		{
-			std::string out;
-			for (wchar_t c : w)
-				if (c > 0x20 && c < 0x7F && c != L'"' && c != L'\\' && out.size() < 256)
-					out.push_back(char(c));
-			return out;
+			const HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+				OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (h == INVALID_HANDLE_VALUE)
+				return false;
+			CloseHandle(h);
+			return true;
 		}
 
-		/// The value of -AstraConfig=<path> on the game's command line ("" if absent). Parsed by hand: no shell32 in
-		/// the game's process. Quoting: the whole argument ("-AstraConfig=C:\a b\x.ini") or the value
-		/// (-AstraConfig="C:\a b\x.ini"); unquoted, the value ends at the first space.
-		std::wstring command_line_value(const wchar_t *line, const wchar_t *key)
+		std::wstring ini_value(const std::wstring &ini, const wchar_t *section, const wchar_t *key)
 		{
-			const size_t n = std::wcslen(key);
-			for (const wchar_t *p = line; *p != 0; ++p)
-			{
-				if (_wcsnicmp(p, key, n) != 0 || (p != line && p[-1] != L' ' && p[-1] != L'\t' && p[-1] != L'"'))
-					continue;
-				const bool quoted_arg = p != line && p[-1] == L'"';
-				const wchar_t *v = p + n;
-				const bool quoted_value = !quoted_arg && *v == L'"';
-				if (quoted_value)
-					++v;
-				const wchar_t *end = v;
-				while (*end != 0 && ((quoted_arg || quoted_value) ? *end != L'"' : (*end != L' ' && *end != L'\t')))
-					++end;
-				return std::wstring(v, end);
-			}
-			return std::wstring();
+			wchar_t v[300] = L"";
+			GetPrivateProfileStringW(section, key, L"", v, 300, ini.c_str());
+			return v;
+		}
+
+		/// A variable's value ("" unset or too long); `set` becomes true when it is set.
+		std::wstring env_value(const wchar_t *name, bool &set)
+		{
+			wchar_t v[300] = L"";
+			const DWORD n = GetEnvironmentVariableW(name, v, 300);
+			if (n == 0 || n >= 300)
+				return std::wstring();
+			set = true;
+			return v;
+		}
+
+		void read_exposure(const std::wstring &v, float &exposure)
+		{
+			if (v.empty())
+				return;
+			const float e = std::wcstof(v.c_str(), nullptr);
+			if (e > 0.0f && e < 100.0f)
+				exposure = e;
 		}
 	}
 
-	Settings load()
+	Settings load(const ReShadeKeys &reshade_ini)
 	{
 		Settings s;
 		wchar_t exe[MAX_PATH] = L"";
 		GetModuleFileNameW(nullptr, exe, MAX_PATH);
 		s.log_path = dir_of(exe) + L"astra-reshade.log";
-		s.source = L"defaults";
 
-		// 1. -AstraConfig=<ini> on the command line
-		const std::wstring ini = command_line_value(GetCommandLineW(), L"-AstraConfig=");
-		if (!ini.empty() && GetFileAttributesW(ini.c_str()) != INVALID_FILE_ATTRIBUTES)
+		const std::wstring ini = config_rules::option_value(GetCommandLineW(), L"-AstraConfig");
+		const bool ini_ok = !ini.empty() && readable(ini);
+
+		std::vector<config_rules::BridgeSource> sources(3);
+		// 1. the -AstraConfig ini
+		sources[0].name = ini;
+		sources[0].present = ini_ok;
+		if (ini_ok)
 		{
-			s.port = int(GetPrivateProfileIntW(L"bridge", L"Port", 25600, ini.c_str()));
-			wchar_t token[300] = L"";
-			GetPrivateProfileStringW(L"bridge", L"Token", L"", token, 300, ini.c_str());
-			s.token = clean_token(token);
+			sources[0].port = ini_value(ini, L"bridge", L"Port");
+			sources[0].token = ini_value(ini, L"bridge", L"Token");
+		}
+		// 2. the environment (a hand-made launch option)
+		sources[1].name = L"environment";
+		sources[1].port = env_value(L"ASTRA_BRIDGE_PORT", sources[1].present);
+		sources[1].token = env_value(L"ASTRA_BRIDGE_TOKEN", sources[1].present);
+		// 3. ReShade.ini [ASTRA]
+		sources[2].name = L"ReShade.ini [ASTRA]";
+		sources[2].present = !reshade_ini.port.empty() || !reshade_ini.token.empty();
+		sources[2].port = reshade_ini.port;
+		sources[2].token = reshade_ini.token;
+
+		const config_rules::Bridge b = config_rules::pick_bridge(sources);
+		s.port = b.port;
+		s.token = b.token;
+		s.source = b.source;
+		if (!ini.empty() && !ini_ok)
+			s.source += L" (-AstraConfig file missing or unreadable: " + ini + L")";
+
+		// [tone]: the -AstraConfig ini's, else the environment's
+		if (ini_ok)
+		{
 			s.log_path = dir_of(ini) + L"astra-reshade.log";
-			s.source = ini;
-			wchar_t v[64] = L"";
-			if (GetPrivateProfileStringW(L"tone", L"Exposure", L"", v, 64, ini.c_str()) > 0)
-			{
-				const float e = std::wcstof(v, nullptr);
-				if (e > 0.0f && e < 100.0f)
-					s.tone_exposure = e;
-			}
-			GetPrivateProfileStringW(L"tone", L"Path", L"auto", v, 64, ini.c_str());
-			s.tone_present = _wcsicmp(v, L"present") == 0;
-			GetPrivateProfileStringW(L"tone", L"Engine", L"", v, 64, ini.c_str());
-			s.tone_engine = clean_token(v);
+			read_exposure(ini_value(ini, L"tone", L"Exposure"), s.tone_exposure);
+			s.tone_present = _wcsicmp(ini_value(ini, L"tone", L"Path").c_str(), L"present") == 0;
+			s.tone_engine = config_rules::clean_token(ini_value(ini, L"tone", L"Engine"));
 		}
 		else
 		{
-			// 2. the environment (a game Astra started itself, or a hand-made launch option)
-			wchar_t v[300];
-			if (GetEnvironmentVariableW(L"ASTRA_BRIDGE_PORT", v, 300) > 0)
-			{
-				s.port = int(std::wcstol(v, nullptr, 10));
-				s.source = L"environment";
-			}
-			if (GetEnvironmentVariableW(L"ASTRA_BRIDGE_TOKEN", v, 300) > 0)
-			{
-				s.token = clean_token(v);
-				s.source = L"environment";
-			}
-			if (GetEnvironmentVariableW(L"ASTRA_TONE_EXPOSURE", v, 300) > 0)
-			{
-				const float e = std::wcstof(v, nullptr);
-				if (e > 0.0f && e < 100.0f)
-					s.tone_exposure = e;
-			}
-			if (GetEnvironmentVariableW(L"ASTRA_TONE_PATH", v, 300) > 0)
-				s.tone_present = _wcsicmp(v, L"present") == 0;
-			if (GetEnvironmentVariableW(L"ASTRA_TONE_ENGINE", v, 300) > 0)
-				s.tone_engine = clean_token(v);
-			if (!ini.empty())
-				s.source = L"defaults (-AstraConfig file not found: " + ini + L")";
+			bool set = false;
+			read_exposure(env_value(L"ASTRA_TONE_EXPOSURE", set), s.tone_exposure);
+			s.tone_present = _wcsicmp(env_value(L"ASTRA_TONE_PATH", set).c_str(), L"present") == 0;
+			s.tone_engine = config_rules::clean_token(env_value(L"ASTRA_TONE_ENGINE", set));
 		}
-		if (s.port <= 0 || s.port > 65535)
-			s.port = 25600;
 		return s;
 	}
 }

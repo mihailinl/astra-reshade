@@ -1,5 +1,6 @@
 // Native tests of the add-on's portable core: the pipe's line protocol, the provider's seqlocked state, the
 // camera math and the frame-ring reader (crop included). Run: tests/run.sh (any Linux/macOS clang++ or g++).
+#include "config_rules.h"
 #include "lines.h"
 #include "outbox.h"
 #include "passfind.h"
@@ -1028,6 +1029,85 @@ static void test_tone_in_effect()
 	CHECK(fx.find("ToneA") == std::string::npos && fx.find("TonePre") == std::string::npos);
 }
 
+// ---- config_rules: where the add-on is pointed, and ReShade.ini without a shipped one ------------------------------
+
+static void test_config_rules()
+{
+	using config_rules::option_value;
+	const wchar_t *k = L"-AstraConfig";
+	// Astra's launcher: two arguments, the path a Windows one (Z:\ under Proton) - after UE4SS's own option
+	CHECK(option_value(L"\"C:\\G\\Game-Win64-Shipping.exe\" --ue4ss-path Z:\\p\\ue4ss\\UE4SS.dll -AstraConfig Z:\\p\\astra-reshade.ini", k) ==
+		L"Z:\\p\\astra-reshade.ini");
+	CHECK(option_value(L"x.exe -AstraConfig Z:\\p\\a.ini -windowed", k) == L"Z:\\p\\a.ini");
+	CHECK(option_value(L"x.exe -astraconfig\tZ:\\p\\a.ini", k) == L"Z:\\p\\a.ini"); // letter case, a tab
+	// the older single-argument form and both quotings
+	CHECK(option_value(L"x.exe -AstraConfig=C:\\p\\a.ini -windowed", k) == L"C:\\p\\a.ini");
+	CHECK(option_value(L"x.exe \"-AstraConfig=C:\\a b\\x.ini\" -windowed", k) == L"C:\\a b\\x.ini");
+	CHECK(option_value(L"x.exe -AstraConfig=\"C:\\a b\\x.ini\" -windowed", k) == L"C:\\a b\\x.ini");
+	CHECK(option_value(L"x.exe -AstraConfig \"C:\\Users\\A B\\x.ini\" -windowed", k) == L"C:\\Users\\A B\\x.ini");
+	CHECK(option_value(L"x.exe \"-AstraConfig\" \"C:\\a b\\x.ini\"", k) == L"C:\\a b\\x.ini");
+	// a path with blanks whose quotes a launch dropped: up to the .ini that ends a word, never into the next option
+	CHECK(option_value(L"x.exe -AstraConfig C:\\Users\\A B\\astra.ini -windowed", k) == L"C:\\Users\\A B\\astra.ini");
+	CHECK(option_value(L"x.exe -AstraConfig C:\\Users\\A B\\astra.ini", k) == L"C:\\Users\\A B\\astra.ini");
+	CHECK(option_value(L"x.exe -AstraConfig C:\\x.cfg -other C:\\y.ini", k) == L"C:\\x.cfg");
+	CHECK(option_value(L"x.exe -AstraConfig C:\\a.ini.bak\\b.ini", k) == L"C:\\a.ini.bak\\b.ini");
+	// absent, empty, another option that starts the same, the key inside a value, the first one wins
+	CHECK(option_value(L"x.exe -windowed", k).empty());
+	CHECK(option_value(L"x.exe -AstraConfig", k).empty());
+	CHECK(option_value(L"x.exe -AstraConfig ", k).empty());
+	CHECK(option_value(L"x.exe -AstraConfig= -windowed", k).empty());
+	CHECK(option_value(L"x.exe -AstraConfig -windowed", k).empty());
+	CHECK(option_value(L"x.exe -AstraConfigX C:\\a.ini", k).empty());
+	CHECK(option_value(L"x.exe --ue4ss-path C:\\-AstraConfig\\u.dll", k).empty());
+	CHECK(option_value(L"x.exe -AstraConfig C:\\1.ini -AstraConfig C:\\2.ini", k) == L"C:\\1.ini");
+
+	// the port and token: the first source present decides BOTH, never a mix
+	using config_rules::BridgeSource;
+	const auto src = [](const wchar_t *name, bool present, const wchar_t *port, const wchar_t *token) {
+		BridgeSource s;
+		s.name = name, s.present = present, s.port = port, s.token = token;
+		return s;
+	};
+	config_rules::Bridge b = config_rules::pick_bridge({ src(L"Z:\\p\\a.ini", true, L"25601", L"tok-1"), src(L"environment", true, L"9", L"env"),
+		src(L"ReShade.ini [ASTRA]", true, L"7", L"old") });
+	CHECK(b.port == 25601 && b.token == "tok-1" && b.source == L"Z:\\p\\a.ini");
+	b = config_rules::pick_bridge({ src(L"Z:\\p\\a.ini", true, L" 25602 ", L""), src(L"ReShade.ini [ASTRA]", true, L"7", L"old") });
+	CHECK(b.port == 25602 && b.token.empty()); // the launcher's empty token lets no stale one through
+	b = config_rules::pick_bridge({ src(L"Z:\\p\\a.ini", false, L"", L""), src(L"environment", false, L"", L""),
+		src(L"ReShade.ini [ASTRA]", true, L"25603", L"rs") });
+	CHECK(b.port == 25603 && b.token == "rs" && b.source == L"ReShade.ini [ASTRA]");
+	b = config_rules::pick_bridge({ src(L"a", false, L"1", L"x") });
+	CHECK(b.port == config_rules::kDefaultPort && b.token.empty() && b.source == L"defaults");
+	for (const wchar_t *bad : { L"", L"0", L"65536", L"-5", L"80x", L"1234567", L"8 0" })
+		CHECK(config_rules::pick_bridge({ src(L"a", true, bad, L"") }).port == config_rules::kDefaultPort);
+	CHECK(config_rules::pick_bridge({ src(L"a", true, L"65535", L"") }).port == 65535);
+	CHECK(config_rules::clean_token(L" a\"b\\c\x01" L"d\x7f" L"e ") == "abcde");
+	CHECK(config_rules::clean_token(std::wstring(400, L'z')).size() == 256);
+
+	// ReShade.ini's lists through its API: elements each ended by '\0'
+	const char raw[] = ".\\a\\**\0.\\b\0";
+	CHECK((config_rules::split_list(raw, sizeof(raw) - 1) == std::vector<std::string> { ".\\a\\**", ".\\b" }));
+	CHECK(config_rules::split_list("", 0).empty());
+	CHECK((config_rules::split_list(raw, sizeof(raw) - 1) == config_rules::split_list(config_rules::join_list({ ".\\a\\**", ".\\b" }).data(),
+		config_rules::join_list({ ".\\a\\**", ".\\b" }).size())));
+	// her shaders' folder: added once, at the end, a person's own paths kept; compared as Windows compares paths
+	std::vector<std::string> paths;
+	CHECK(config_rules::add_search_path(paths, config_rules::kEffectSearchPath) && paths == std::vector<std::string> { ".\\astra-reshade\\Shaders\\**" });
+	CHECK(!config_rules::add_search_path(paths, config_rules::kEffectSearchPath) && paths.size() == 1);
+	paths = { ".\\reshade-shaders\\Shaders\\**" };
+	CHECK(config_rules::add_search_path(paths, config_rules::kEffectSearchPath) && paths.size() == 2 && paths[0] == ".\\reshade-shaders\\Shaders\\**");
+	paths = { "./Astra-ReShade/shaders/**" };
+	CHECK(!config_rules::add_search_path(paths, config_rules::kEffectSearchPath));
+	// the seeds name what the manual install's ReShade.ini set and ReShade's defaults lack
+	bool preset = false, tutorial = false;
+	for (const config_rules::Seed &s : config_rules::kSeeds)
+	{
+		preset |= std::string(s.section) == "GENERAL" && std::string(s.key) == "PresetPath" && std::string(s.value) == ".\\astra-reshade\\AstraPreset.ini";
+		tutorial |= std::string(s.section) == "OVERLAY" && std::string(s.key) == "TutorialProgress" && std::string(s.value) == "4";
+	}
+	CHECK(preset && tutorial);
+}
+
 int main(int argc, char **argv)
 {
 	test_lines();
@@ -1040,6 +1120,7 @@ int main(int argc, char **argv)
 	test_link_sends_through_the_outbox();
 	test_tone();
 	test_tone_in_effect();
+	test_config_rules();
 	if (argc > 1)
 		test_lua_lines(argv[1]);
 	std::printf("%d checks, %d failed\n", g_checks, g_failed);

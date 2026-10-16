@@ -13,6 +13,7 @@
 #include <imgui.h>
 #include <reshade.hpp>
 #include "config.h"
+#include "config_rules.h"
 #include "guard.h"
 #include "layer.h"
 #include "link.h"
@@ -26,6 +27,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <mutex>
+#include <string>
+#include <vector>
 
 using namespace reshade::api;
 
@@ -49,6 +52,55 @@ namespace
 	// camera is picked counting back from the newest, so a camera arriving in between would make her a frame late
 	uint64_t g_earlyFrames = 0, g_camerasBetween = 0;
 	ULONGLONG g_nextTimingLog = 0;
+
+	/// A value of ReShade.ini through ReShade's API, its list elements each ended by '\0' ("" absent).
+	std::string reshade_ini_value(const char *section, const char *key)
+	{
+		size_t size = 0;
+		if (!reshade::get_config_value(nullptr, section, key, nullptr, &size) || size == 0)
+			return std::string();
+		std::string v(size, '\0');
+		if (!reshade::get_config_value(nullptr, section, key, v.data(), &size))
+			return std::string();
+		v.resize(std::min(size, v.size()));
+		return v;
+	}
+
+	/// An ASCII value of ReShade.ini as text (its list separators dropped).
+	std::wstring widen(const std::string &s)
+	{
+		std::wstring out;
+		for (const char c : s)
+			if (c != 0)
+				out.push_back(wchar_t(static_cast<unsigned char>(c)));
+		return out;
+	}
+
+	/// ReShade.ini as her effect needs it, with no ReShade.ini shipped (config_rules.h): her shaders' folder added to
+	/// EffectSearchPaths, and the keys in config_rules::kSeeds set where missing. Runs while ReShade loads add-ons, at
+	/// the game's first device - before any swap chain, so before the effect runtime reads its config (its constructor,
+	/// from the same in-memory ReShade.ini, which ReShade writes to disk later). Returns the keys it set, for the log.
+	std::string seed_reshade_ini()
+	{
+		std::string set;
+		const std::string raw = reshade_ini_value("GENERAL", "EffectSearchPaths");
+		std::vector<std::string> paths = config_rules::split_list(raw.data(), raw.size());
+		if (config_rules::add_search_path(paths, config_rules::kEffectSearchPath))
+		{
+			const std::string list = config_rules::join_list(paths);
+			reshade::set_config_value(nullptr, "GENERAL", "EffectSearchPaths", list.data(), list.size());
+			set += " EffectSearchPaths";
+		}
+		for (const config_rules::Seed &s : config_rules::kSeeds)
+		{
+			if (!reshade_ini_value(s.section, s.key).empty())
+				continue;
+			reshade::set_config_value(nullptr, s.section, s.key, s.value);
+			set += ' ';
+			set += s.key;
+		}
+		return set;
+	}
 
 	void load_overlay_settings()
 	{
@@ -226,11 +278,17 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 	case DLL_PROCESS_ATTACH:
 		if (!reshade::register_addon(module))
 			return FALSE;
-		g_settings = config::load();
-		_wfopen_s(&g_log, g_settings.log_path.c_str(), L"a");
-		logf("---- Astra (astra-reshade) loaded; settings from %ls; engine port %d%s; tone: exposure %.2f, path %s%s%s", g_settings.source.c_str(),
-			g_settings.port, g_settings.token.empty() ? "" : ", token set", g_settings.tone_exposure, g_settings.tone_present ? "present" : "auto",
-			g_settings.tone_engine.empty() ? "" : ", engine ", g_settings.tone_engine.c_str());
+		{
+			const std::string seeded = seed_reshade_ini();
+			const config::ReShadeKeys astra { widen(reshade_ini_value("ASTRA", "Port")), widen(reshade_ini_value("ASTRA", "Token")) };
+			g_settings = config::load(astra);
+			_wfopen_s(&g_log, g_settings.log_path.c_str(), L"a");
+			logf("---- Astra (astra-reshade) loaded; settings from %ls; engine port %d%s; tone: exposure %.2f, path %s%s%s", g_settings.source.c_str(),
+				g_settings.port, g_settings.token.empty() ? "" : ", token set", g_settings.tone_exposure, g_settings.tone_present ? "present" : "auto",
+				g_settings.tone_engine.empty() ? "" : ", engine ", g_settings.tone_engine.c_str());
+			if (!seeded.empty())
+				logf("ReShade.ini: set what her effect needs and it lacked:%s", seeded.c_str());
+		}
 		guard::install();
 		load_overlay_settings();
 		layer::install();
