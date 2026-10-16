@@ -280,6 +280,60 @@ share of her pixels with a channel at full brightness, on the grass 26 % at 1.3,
 with no light match at all); on the dirt path 15 %, 7 %, 1.6 % (1.6 %); in a tree's shade her legs darkened the
 same at all three (picture brightness 0.69-0.70, 0.77 with no light match).
 
+### Her picture sharp and steady at 2560x1440 (2026-10-16 night, same game, headless gamescope at 2560x1440)
+
+What the owner saw at 2560x1440 - her outline jittering with the camera still, white pixels at her edges, her picture
+soft and stair-stepped - had five causes, all generic:
+- **Jitter**: ReShade has ONE constant buffer per effect, rewritten on the CPU every run; her pass before the
+  tonemapper is recorded into the game's command list and runs on the GPU after the NEXT frame's write, so it drew
+  picture N with crop rectangle N+1 (seen in a test build: the uniforms were one run ahead of the picture in 577 of
+  600 frames). Every per-frame value now goes through a 16x1 texture uploaded with the picture (`src/frame_meta.h`).
+- **White fringe**: before the tonemapper her coverage was blended in the scene's linear light, where her white is
+  ~10x a mid grey past the curve's steep top - a 5 % covered pixel showed 0.81 where her engine draws 0.53. Her edge
+  is now blended in display space through the curve's model.
+- **Stairs**: her colour was filtered up from 1920x1080 but her depth point-sampled, cutting the soft edge along
+  whole texels (1.33-pixel steps). Her depth is now the nearest of the colour's bilinear footprint.
+- **Her shoes flickering**: TSR jitters the game's depth every frame and the grass at her feet covered a texel one
+  frame and not the next. Her visibility is now the share of nine depth texels she is in front of.
+- **Soft**: the add-on capped her picture at 1080p worth of pixels and the engine's ring was a fixed 1920x1080: her
+  picture was scaled up x1.33. The hello now names the size it needs (`"want":[2560,1440]`, `src/hello_rules.h`; up
+  to the engine's 3840x2160) and says hello again when the window grows past the ring (the old ring let go first).
+
+Measured with the effect and add-on of `fix/ue-look` against the 0.2.0 ones the launcher installs, the engine of
+the `want` change (lean release, scratch state, port 25614), the main menu (camera still, she idles):
+- **Her picture's size**: 0.2.0 sends no `want`: reply `maxW 1920, maxH 1080`, her picture 1920x1080 shown x1.33.
+  Now: `hello sent (... want 2560x1440 ...)`, reply `maxW 2560, maxH 1440`, `[bridge] frame ring ... (2560x1440
+  max)`, and all 600 pictures read from the ring 2560x1440 (crop 1216-1280 px wide): her pixels are the game's.
+- **Jumps** (her torso patch frame to frame, 600 frames at 60 Hz, sub-pixel phase correlation; a jump = 0.8 px or
+  more and straight back): 0.2.0 52 of 599; now 0, 0, 1 and 1 in four captures at 2560x1440, 1 and 0 with the
+  ring pinned to 1920x1080 (`WGPU_BRIDGE_MAX`) - a single one is her own animation reversing.
+- **Fringe** (two frozen pictures each: the engine stopped, the screen and the ring's picture read; her edge pixels
+  left of the menu's buttons and above the grass, a = 0.02..0.6; a fringe pixel is brighter by more than 24 levels
+  than her own colour - through the game's mapping fitted on her covered pixels - mixed with the background in
+  display space): 0.2.0 434 and 473 of 1450 and 1727 edge pixels (27-30 %; 183 and 273 by more than 64); now at
+  2560x1440 7 and 4 of 1377 and 1055 (0.4-0.5 %, none by 64); now with the ring pinned to 1920x1080 16 and 34 (none
+  by 64). Contact sheets: `fringe-sheet-1.png`, `fringe-sheet-2.png` (rows 0.2.0, fix at 1080, fix at 1440; each
+  window as shown | fringe in red) and `sharpness-sheet.png`, in `/mnt/data/scratch-ap/ue-look2/`.
+- **Repeated pictures** (her patch exactly still from one frame to the next, the box's load average 27-49 from other
+  builds): 0.2.0 9.7 %; in one game session with only the engine restarted, ring pinned 1920x1080 17.2 % and 12.2 %
+  (52.6-52.7 pictures/s), at 2560x1440 22.5 %, 20.2 % and 28.2 % (49.6, 51.7 and, under the heaviest load, 36.5
+  pictures/s; the engine drew a newer camera instead of 0-30 of 600).
+
+Still open:
+- **The colour LUT**: her pass maps her picture into the scene through a model of Unreal's default tone curve
+  (`tone.h`); this game's own curve has a brighter toe (shown 0.1 -> 0.175, 0.2 -> 0.295, 0.5 -> 0.597; gain 1.77
+  in the dark to 1.2 in the bright), so she is paler and flatter than her engine draws her. The game's curve should be
+  read off the game (its LUT), not modelled.
+- **Repeated pictures**: about 10 % at 1080, more at 2560x1440 and under load. Two causes seen: frames whose
+  provider camera never reached the engine (two provider cameras between presents), and pictures that come after
+  the 6 ms wait (`WaitMs`) - a 2560x1440 picture is 1.8x the engine's drawing and readback. Not measured yet: a
+  quiet box, a longer wait, the game's own frame pacing.
+- **Not seen live**: the hello again after a window grew (gamescope's size is fixed; the rule is tested in
+  `tests/core_tests.cpp`), and native Windows (where the ring is let go before that hello).
+- **A refused add-on retries every frame**: an engine that refuses games (its crash marker, see `BRIDGE.md`) got
+  ~1300 hellos a minute; the add-on should back off after an `error` reply. (Testers: stopping the engine within its
+  grace after the game leaves keeps the marker, and the next engine refuses every game once.)
+
 ### Remove
 
 ```bash
