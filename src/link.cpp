@@ -1,4 +1,5 @@
 #include "link.h"
+#include "hello_rules.h"
 #include "layer.h"
 #include "log.h"
 #include "outbox.h"
@@ -17,7 +18,6 @@ namespace enginelink
 	namespace
 	{
 		constexpr const char *kFoundation = "0.2.0";       // this add-on's version, told to the engine
-		constexpr double kMaxPixels = 1920.0 * 1080.0;     // her picture: the game's aspect, about 1080p worth
 		constexpr double kRebase = 1500.0;                 // move the floating origin when she is this far from it
 		constexpr float kFar = 300.0f;                     // she is never far: a short depth range keeps it precise
 		constexpr int64_t kStaleMs = 300;                  // a provider silent this long: she is hidden
@@ -32,7 +32,7 @@ namespace enginelink
 		bool g_capsLight = false, g_capsCues = false;
 		double g_origin[3] = {};
 		bool g_originSet = false;
-		uint32_t g_viewSent = 0;
+		hello_rules::Asked g_asked; // this connection's hellos: the ring asked for and the ring made
 		int g_viewW = 1920, g_viewH = 1080;
 		unsigned long long g_camId = 0;
 		uint64_t g_sentIndex = ~uint64_t(0); // the provider camera last sent (one picture per game camera)
@@ -87,7 +87,8 @@ namespace enginelink
 			return provider::clean_text(s.c_str());
 		}
 
-		void say_hello()
+		/// `want`: the largest picture this connection will ask for (hello_rules::Asked), unknown before the first present.
+		void say_hello(hello_rules::Size want)
 		{
 			std::string integration, game;
 			provider::state().identity(integration, game);
@@ -95,12 +96,18 @@ namespace enginelink
 				game = exe_name();
 			if (integration.empty())
 				integration = "astra.reshade";
-			std::string token;
-			if (!g_token.empty())
-				token = ",\"token\":\"" + g_token + "\"";
-			sendf("{\"t\":\"hello\",\"v\":1,\"client\":\"astra-reshade/%s\",\"game\":\"%s\",\"foundation\":\"%s\",\"integration\":\"%s\",\"crop\":true%s}",
-				game.c_str(), game.c_str(), kFoundation, integration.c_str(), token.c_str());
-			logf("link: hello sent (game \"%s\", integration %s%s)", game.c_str(), integration.c_str(), g_token.empty() ? "" : ", with token");
+			g_outbox.push(hello_rules::hello(game, kFoundation, integration, g_token, want), g_ws.generation());
+			logf("link: hello sent (game \"%s\", integration %s, want %dx%d%s)", game.c_str(), integration.c_str(), want.w, want.h,
+				g_token.empty() ? "" : ", with token");
+		}
+
+		/// Her picture outgrew the engine's ring: let go of it FIRST (on Windows a ring a reader still holds cannot grow -
+		/// the engine would keep the old one), then ask for the larger one; the reply names it, mapped afresh.
+		void hello_again(hello_rules::Size want)
+		{
+			layer::let_go_of_frames();
+			g_asked.sent(want);
+			say_hello(want);
 		}
 
 		/// The engine's hello reply: where its frames are (map them again at every hello: a restarted engine's ring
@@ -125,6 +132,10 @@ namespace enginelink
 			const std::string list = caps == std::string::npos ? std::string() : m.substr(caps, m.find(']', caps) - caps);
 			g_capsLight = list.find("\"light\"") != std::string::npos;
 			g_capsCues = list.find("\"cues\"") != std::string::npos;
+			const hello_rules::Reply reply = hello_rules::read_reply(m);
+			g_asked.answered(reply);
+			logf("link: the engine's ring is %dx%d (asked %dx%d%s)", reply.ring.w, reply.ring.h, g_asked.want.w, g_asked.want.h,
+				reply.takes_want ? "" : "; this engine sizes no ring for a game");
 		}
 
 		void receive()
@@ -219,24 +230,24 @@ namespace enginelink
 			g_answered = false;
 			return;
 		}
+		// her picture: the game's size (1:1 with its pixels), within the largest ring the engine makes
+		const hello_rules::Size picture = hello_rules::picture_for(bw, bh);
+		if (picture.known())
+		{
+			g_viewW = picture.w;
+			g_viewH = picture.h;
+		}
 		if (g_ws.generation() != g_generation)
 		{
-			// a new connection: say who we are; the picture size and her pose follow with the next frame
+			// a new connection: say who we are and how large her picture is; her pose follows with the next frame
 			g_generation = g_ws.generation();
 			g_answered = false;
 			g_capsLight = g_capsCues = false;
-			g_viewSent = 0;
 			g_sentIndex = ~uint64_t(0);
-			say_hello();
+			say_hello(g_asked.first(picture));
 		}
-		// her picture: the game's aspect, about 1080p worth (the engine caps it at its maximum, same aspect)
-		if (bw > 0 && bh > 0 && uint32_t(bw * 65536 + bh) != g_viewSent)
-		{
-			g_viewSent = uint32_t(bw * 65536 + bh);
-			const double scale = std::min(1.0, std::sqrt(kMaxPixels / (double(bw) * bh)));
-			g_viewW = std::max(16, int(bw * scale + 0.5));
-			g_viewH = std::max(16, int(bh * scale + 0.5));
-		}
+		else if (const hello_rules::Size more = g_asked.again(picture); more.known())
+			hello_again(more); // the game's window grew past the ring
 		if (!live || bw <= 0 || bh <= 0)
 			return;
 

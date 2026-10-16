@@ -667,6 +667,14 @@ namespace layer
 		logf("layer: the engine's frames are at %s", where);
 	}
 
+	void let_go_of_frames()
+	{
+		g_named = false; // nothing is mapped until the reply names the ring again
+		close_mapping();
+		std::snprintf(g_status, sizeof(g_status), "ring: let go, a larger one asked for");
+		logf("layer: let go of the engine's frames (a larger ring asked for)");
+	}
+
 	void set_host(const view::Pose &host, float near_m, float far_m)
 	{
 		std::lock_guard<std::mutex> lock(g_lock);

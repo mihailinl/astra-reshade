@@ -28,6 +28,10 @@ namespace layer
 	/// Where the engine says its frames are ("/dev/shm/astra-frame" or "Local\\AstraFrame"): mapped again at
 	/// every hello (a restarted engine's ring is a new file). Present thread only.
 	void set_frames_at(const char *where);
+	/// Before a hello asking the engine for a larger ring: stop reading this one (on Windows a ring a reader still holds
+	/// cannot grow; on Linux its layout changes) until the reply names it again (set_frames_at). Her picture is gone
+	/// for the frame or two that takes. The same thread as set_frames_at.
+	void let_go_of_frames();
 	/// The camera being presented (absolute world) and the game's near and far clip (its depth buffer, reversed
 	/// Z, is linearised with them; far 0: an infinite projection).
 	void set_host(const view::Pose &host, float near_m, float far_m);

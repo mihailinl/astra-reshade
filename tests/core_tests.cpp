@@ -2,6 +2,7 @@
 // camera math and the frame-ring reader (crop included). Run: tests/run.sh (any Linux/macOS clang++ or g++).
 #include "config_rules.h"
 #include "frame_meta.h"
+#include "hello_rules.h"
 #include "lines.h"
 #include "outbox.h"
 #include "passfind.h"
@@ -860,6 +861,184 @@ static void test_link_sends_through_the_outbox()
 	CHECK(sends == 1 && in_sink == 1);
 }
 
+// ---- hello: her picture's size, and the ring the engine makes for it ----------------------------------------------
+
+/// The engine's side of `want` (astra-avatar-engine src/platform/bridge/shm/lazy.rs): RingBounds::size_for, step_up, a
+/// WGPU_BRIDGE_MAX pin, an engine that predates `want`, and a Windows ring a reader still holds (it cannot grow).
+struct FakeEngine
+{
+	hello_rules::Size ring, cap{ 3840, 2160 }, fallback{ 1920, 1080 };
+	bool takes_want = true, made = false;
+	int hellos = 0;
+	static int side(int have, int size, int cap)
+	{
+		if (size <= have)
+			return have;
+		const int even = (std::max(size, have + have / 4) + 1) & ~1;
+		return std::min(even, std::max(cap, size));
+	}
+	hello_rules::Reply hello(hello_rules::Size want, bool reader_holds_ring)
+	{
+		++hellos;
+		hello_rules::Size size = fallback;
+		if (takes_want && want.known())
+			size = { std::min(std::max(want.w + (want.w & 1), 16), cap.w), std::min(std::max(want.h + (want.h & 1), 16), cap.h) };
+		if (!made)
+			ring = size, made = true;
+		else if (!reader_holds_ring)
+			ring = { side(ring.w, size.w, cap.w), side(ring.h, size.h, cap.h) };
+		hello_rules::Reply r;
+		r.ring = ring;
+		r.takes_want = takes_want;
+		return r;
+	}
+};
+
+/// One connection as link.cpp drives it: a first hello, then a frame per back buffer size; the engine answers each
+/// hello before the next frame. Returns the hellos sent after the first.
+static int drive(FakeEngine &e, const std::vector<hello_rules::Size> &backbuffers, bool let_go_first = true)
+{
+	hello_rules::Asked asked;
+	const hello_rules::Size p0 = hello_rules::picture_for(backbuffers.front().w, backbuffers.front().h);
+	asked.answered(e.hello(asked.first(p0), false));
+	int again = 0;
+	for (const hello_rules::Size &bb : backbuffers)
+	{
+		const hello_rules::Size more = asked.again(hello_rules::picture_for(bb.w, bb.h));
+		if (!more.known())
+			continue;
+		++again;
+		asked.sent(more);
+		CHECK(!asked.again(hello_rules::picture_for(bb.w, bb.h)).known()); // one hello in flight
+		asked.answered(e.hello(more, !let_go_first));
+	}
+	return again;
+}
+
+static void test_hello_rules()
+{
+	using hello_rules::Size;
+	using hello_rules::picture_for;
+	// her picture is the game's own size: 2560x1440 is no longer 1920x1080 scaled up
+	CHECK((picture_for(2560, 1440) == Size{ 2560, 1440 }));
+	CHECK((picture_for(1920, 1080) == Size{ 1920, 1080 }));
+	CHECK((picture_for(3840, 2160) == Size{ 3840, 2160 }));
+	CHECK((picture_for(3440, 1440) == Size{ 3440, 1440 }));
+	// ...bounded by the engine's largest ring, aspect kept
+	CHECK((picture_for(7680, 4320) == Size{ 3840, 2160 }));
+	CHECK((picture_for(5120, 1440) == Size{ 3840, 1080 }));
+	CHECK((picture_for(1440, 5120) == Size{ 608, 2160 }));
+	CHECK((picture_for(4, 4) == Size{ 16, 16 }));
+	CHECK(!picture_for(0, 1440).known() && !picture_for(2560, -1).known());
+	for (int w = 16; w <= 9000; w += 37)
+		for (int h : { 16, 200, 1080, 1440, 2160, 4000, 9000 })
+		{
+			const Size p = picture_for(w, h);
+			CHECK(p.w >= 16 && p.h >= 16 && p.w <= hello_rules::kMaxW && p.h <= hello_rules::kMaxH && p.w <= std::max(w, 16) && p.h <= std::max(h, 16));
+		}
+
+	// the hello's bytes: `want` after `crop`, the token last; no `want` before the back buffer is known
+	CHECK(hello_rules::hello("ScarletSkips", "0.2.0", "astra.unreal", "", Size{ 2560, 1440 }) ==
+		"{\"t\":\"hello\",\"v\":1,\"client\":\"astra-reshade/ScarletSkips\",\"game\":\"ScarletSkips\",\"foundation\":\"0.2.0\",\"integration\":"
+		"\"astra.unreal\",\"crop\":true,\"want\":[2560,1440]}");
+	CHECK(hello_rules::hello("G", "0.2.0", "astra.reshade", "t0k", Size{ 3840, 1080 }) ==
+		"{\"t\":\"hello\",\"v\":1,\"client\":\"astra-reshade/G\",\"game\":\"G\",\"foundation\":\"0.2.0\",\"integration\":\"astra.reshade\","
+		"\"crop\":true,\"want\":[3840,1080],\"token\":\"t0k\"}");
+	CHECK(hello_rules::hello("G", "0.2.0", "astra.reshade", "", Size{}) ==
+		"{\"t\":\"hello\",\"v\":1,\"client\":\"astra-reshade/G\",\"game\":\"G\",\"foundation\":\"0.2.0\",\"integration\":\"astra.reshade\","
+		"\"crop\":true}");
+
+	// the reply (BRIDGE.md's own example), an engine before `want`, and `want` outside caps is not the word
+	hello_rules::Reply r = hello_rules::read_reply("{\"t\":\"hello\",\"v\":1,\"engine\":\"astra-avatar-engine\",\"ver\":\"0.2.0\",\"shm\":\"/dev/shm/astra-frame\","
+												   "\"maxW\":2560,\"maxH\":1440,\"views\":8,\"caps\":[\"views\",\"caster\",\"crop\",\"capture-live\",\"want\"],"
+												   "\"inbox\":\"/home/u/x\"}");
+	CHECK((r.ring == Size{ 2560, 1440 }) && r.takes_want);
+	r = hello_rules::read_reply("{\"t\":\"hello\",\"maxW\":1920,\"maxH\":1080,\"caps\":[\"views\",\"crop\"],\"inbox\":\"/home/u/\\\"want\\\"\"}");
+	CHECK((r.ring == Size{ 1920, 1080 }) && !r.takes_want);
+	r = hello_rules::read_reply("{\"t\":\"hello\",\"shm\":\"/dev/shm/a\"}");
+	CHECK(!r.ring.known() && !r.takes_want);
+	r = hello_rules::read_reply("{\"t\":\"hello\",\"maxW\":-5,\"maxH\":99999999,\"caps\":[\"want\"]}");
+	CHECK(!r.ring.known() && r.takes_want);
+
+	// a 2560x1440 game's first hello gets a 2560x1440 ring: no second hello
+	FakeEngine e;
+	CHECK(drive(e, std::vector<Size>(100, Size{ 2560, 1440 })) == 0 && (e.ring == Size{ 2560, 1440 }));
+	// the window drawn small first, then full screen: one more hello, the ring grown for it
+	e = FakeEngine();
+	std::vector<Size> bbs(10, Size{ 1280, 720 });
+	bbs.insert(bbs.end(), 10, Size{ 2560, 1440 });
+	CHECK(drive(e, bbs) == 1 && e.ring.w >= 2560 && e.ring.h >= 1440);
+	// a window dragged larger a pixel a frame (2560 frames): a few hellos, never one per frame - the engine grows each side
+	// by a quarter, so 3x wider and taller is 5 steps a side, 10 hellos at most
+	e = FakeEngine();
+	bbs.clear();
+	for (int w = 1280; w <= 3840; ++w)
+		bbs.push_back(Size{ w, w * 9 / 16 });
+	const int dragged = drive(e, bbs);
+	std::printf("hello: a window dragged 1280x720 -> 3840x2160 a pixel a frame: %d more hellos, ring %dx%d\n", dragged, e.ring.w, e.ring.h);
+	CHECK(dragged >= 2 && dragged <= 10 && (e.ring == Size{ 3840, 2160 }));
+	// smaller again: nothing
+	CHECK(drive(e, { Size{ 3840, 2160 }, Size{ 1280, 720 }, Size{ 2000, 1000 } }) == 0);
+	// the developer's pin (the engine answers 1920x1080 whatever is asked): asked once, never again every frame
+	e = FakeEngine();
+	e.cap = e.fallback;
+	CHECK(drive(e, std::vector<Size>(100, Size{ 2560, 1440 })) == 0);
+	e = FakeEngine();
+	e.cap = e.fallback;
+	bbs.assign(5, Size{ 1280, 720 });
+	bbs.insert(bbs.end(), 100, Size{ 2560, 1440 });
+	CHECK(drive(e, bbs) == 1 && (e.ring == Size{ 1920, 1080 }));
+	// an engine before `want` is never asked again (it would answer the same ring)
+	e = FakeEngine();
+	e.takes_want = false;
+	CHECK(drive(e, bbs) == 0 && (e.ring == Size{ 1920, 1080 }));
+	// Windows: a reader that kept the ring mapped keeps the old one, asked once - the link lets go first (below)
+	e = FakeEngine();
+	bbs.assign(5, Size{ 1280, 720 });
+	bbs.insert(bbs.end(), 100, Size{ 2560, 1440 });
+	CHECK(drive(e, bbs, false) == 1 && (e.ring == Size{ 1280, 720 }));
+	e = FakeEngine();
+	CHECK(drive(e, bbs, true) == 1 && (e.ring == Size{ 2560, 1440 }));
+	// a first hello before the back buffer is known names no size: the next frame that knows it asks for it
+	hello_rules::Asked a;
+	CHECK(!a.first(picture_for(0, 0)).known() && !a.again(Size{ 2560, 1440 }).known()); // its reply has not come
+	hello_rules::Reply dflt;
+	dflt.ring = { 1920, 1080 }, dflt.takes_want = true;
+	a.answered(dflt);
+	CHECK((a.again(Size{ 2560, 1440 }) == Size{ 2560, 1440 }) && !a.again(Size{ 1920, 1080 }).known());
+	// what was asked never shrinks: a wider then a taller picture asks for both
+	a.sent(Size{ 2560, 1080 });
+	a.answered(dflt);
+	CHECK((a.again(Size{ 1920, 1440 }) == Size{ 2560, 1440 }));
+	// one hello in flight: a picture that grows again before the reply waits for it
+	a.sent(Size{ 2560, 1440 });
+	CHECK(!a.again(Size{ 3840, 2160 }).known());
+	a.answered(dflt);
+	CHECK((a.again(Size{ 3840, 2160 }) == Size{ 3840, 2160 }));
+}
+
+/// link.cpp's re-hello lets go of the ring BEFORE the hello (a Windows ring a reader holds cannot grow), and the link
+/// says hello in exactly two places: a new connection's first, and that one.
+static void test_link_lets_go_before_hello_again()
+{
+	std::ifstream f(std::string(ASTRA_SRC) + "/link.cpp");
+	CHECK(f.good());
+	std::stringstream ss;
+	ss << f.rdbuf();
+	const std::string src = ss.str();
+	const size_t at = src.find("void hello_again(");
+	CHECK(at != std::string::npos);
+	const std::string body = src.substr(at, src.find("\n\t\t}\n", at) - at);
+	const size_t let_go = body.find("layer::let_go_of_frames();"), hello = body.find("say_hello(");
+	CHECK(let_go != std::string::npos && hello != std::string::npos && let_go < hello);
+	size_t calls = 0;
+	for (size_t i = src.find("say_hello("); i != std::string::npos; i = src.find("say_hello(", i + 1))
+		++calls;
+	CHECK(calls == 3); // its definition, the first hello, hello_again's
+	CHECK(src.find("hello_again(more)") != std::string::npos);
+	CHECK(src.find("kMaxPixels") == std::string::npos && src.find("hello_rules::picture_for(bw, bh)") != std::string::npos);
+}
+
 // ---- tone: her picture into the scene's light -----------------------------------------------------------------
 
 /// The largest channel difference.
@@ -1240,6 +1419,8 @@ int main(int argc, char **argv)
 	test_pretone_rules();
 	test_outbox();
 	test_link_sends_through_the_outbox();
+	test_hello_rules();
+	test_link_lets_go_before_hello_again();
 	test_tone();
 	test_tone_in_effect();
 	test_frame_meta();
