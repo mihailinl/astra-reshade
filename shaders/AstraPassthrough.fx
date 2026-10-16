@@ -321,21 +321,28 @@ float game_depth(float2 uv)
 	return host_linear(tex2Dlod(ReShade::DepthBuffer, float4(uv * DepthUvScale, 0, 0)).x);
 }
 
-/// How much of her is in front of the game's surfaces here: the share of the nine depth texels around the pixel she is
-/// nearer than. Unreal's TSR draws its depth with a different sub-pixel jitter every frame, and thin things in it (grass
-/// at her feet, a fence) cover a texel one frame and not the next: one compare against one filtered sample hid and
-/// showed whole pixels of her feet frame by frame (in Scarlet Skips a quarter of her shoes, the ground's lighting
-/// showing through in 16-pixel blocks). The share moves by a ninth where one texel flips, and her edge against a nearer
-/// surface is soft, as TSR leaves the game's own.
+/// How much of her is in front of the game's surfaces here: the depth test of the four depth texels around the sample
+/// point, weighted as a bilinear filter would weigh them. Unreal's TSR draws its depth with a new sub-pixel jitter every
+/// frame (up to half a texel), and thin things in it (grass at her feet, a fence) cover a texel one frame and not the
+/// next: one compare against one sample hid and showed whole pixels of her feet frame by frame (in Scarlet Skips a
+/// quarter of her shoes, the ground's lighting showing through in 16-pixel blocks). Weighted, a texel that flips moves
+/// her by its weight, and her edge against a nearer surface is soft, as TSR leaves the game's own - while a pole, a wire
+/// or a blade of grass one texel wide in front of her still hides her where it is (an equal share of nine texels let
+/// 8/9 of her through it). The taps stay inside the part of the depth buffer the game drew (DepthUvScale).
 float her_visibility(float2 uv, float za, float allow)
 {
 	const int2 size = tex2Dsize(ReShade::DepthBuffer);
-	const int2 c = int2(uv * DepthUvScale * float2(size));
-	float seen = 0.0;
-	[unroll] for (int y = -1; y <= 1; ++y)
-		[unroll] for (int x = -1; x <= 1; ++x)
-			seen += za < host_linear(tex2Dfetch(ReShade::DepthBuffer, clamp(c + int2(x, y), int2(0, 0), size - 1)).x) + allow ? 1.0 : 0.0;
-	return seen / 9.0;
+	const int2 last = max(int2(DepthUvScale * float2(size) + 0.5) - 1, int2(0, 0));
+	const float2 p = uv * DepthUvScale * float2(size) - 0.5; // texel centres at whole numbers
+	const int2 c = int2(floor(p));
+	const float2 f = p - float2(c);
+	float4 seen;
+	[unroll] for (int i = 0; i < 4; ++i)
+	{
+		const int2 t = clamp(c + int2(i & 1, i >> 1), int2(0, 0), last);
+		seen[i] = za < host_linear(tex2Dfetch(ReShade::DepthBuffer, t).x) + allow ? 1.0 : 0.0;
+	}
+	return lerp(lerp(seen.x, seen.y, f.x), lerp(seen.z, seen.w, f.x), f.y);
 }
 
 float luma(float3 c)

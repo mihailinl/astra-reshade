@@ -14,6 +14,8 @@ namespace layer
 	/// The effects about to run draw into the game's HDR scene colour, before its tonemapper (pretone.cpp), on a game
 	/// thread recording command list `frame` presents in: her picture is mapped into the scene's light (tone.h), the
 	/// game's own grade applies to her after, and her picture is uploaded through that command list.
+	/// `frame`: the present it belongs to (pretone's count; set at every present too) - the clock of the staging ring
+	/// her planes are uploaded from.
 	void set_hdr_pass(bool hdr, unsigned long long frame);
 	/// pretone may draw her pass before the tonemapper (an Unreal game): only then is the tone table made - on the
 	/// present thread, the next time the effects run there. Elsewhere nothing of it exists.

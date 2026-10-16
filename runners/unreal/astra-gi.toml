@@ -18,7 +18,7 @@ schema = 1
 [integration]
 id = "astra.unreal"
 name = "Astra for any Unreal Engine game"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["mihailinl"]
 license = "MIT AND BSD-3-Clause AND CC0-1.0" # ours and UE4SS: MIT; ReShade: BSD-3-Clause; ReShade.fxh: CC0-1.0
 repo = "https://github.com/mihailinl/astra-reshade"

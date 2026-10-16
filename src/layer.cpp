@@ -54,6 +54,12 @@ namespace layer
 		Layer g_world, g_depth, g_sunMap;
 		Layer g_frameMeta; // frame_meta.h: what the effect reads in step with the frame it draws (ASTRAFRAME)
 		bool g_frameMetaFailed = false;
+		float g_metaHeld[frame_meta::kTexels * 4] = {}; // what the texture holds (once g_metaKnown)
+		bool g_metaKnown = false;
+		// uploads, for the 30-s line: planes through the staging ring, through ReShade's update_texture_region; the
+		// frame's values uploaded and left as they were
+		unsigned long long g_upStaged = 0, g_upImmediate = 0, g_metaSent = 0, g_metaSame = 0, g_statRuns = 0, g_statPictures = 0;
+		ULONGLONG g_nextStat = 0;
 		uint32_t g_texW = 0, g_texH = 0, g_sunN = 0;
 		std::vector<uint8_t> g_colourCopy, g_depthCopy, g_sunCopy;
 		ring::Frame g_frame;     // the picture shown
@@ -160,6 +166,7 @@ namespace layer
 			destroy(dev, g_toneLut);
 			destroy(dev, g_frameMeta);
 			g_frameMetaFailed = false;
+			g_metaKnown = false;
 			g_retiredLayers.collect(~uint64_t(0) >> 1, [dev](Layer &l) { destroy(dev, l); }); // the GPU was waited for
 			g_toneFailed = false;
 			destroy_staging(dev);
@@ -259,12 +266,13 @@ namespace layer
 		// update_texture_region goes through its immediate command list, which the game's submitting thread flushes
 		// under a lock this thread does not hold - so there her picture is copied by the pass's own command list, from
 		// an upload buffer of a small ring, each reused (or freed to grow) only pretone_rules::kGpuFrames presents after
-		// the frame the GPU was given it.
+		// the frame the GPU was given it. At Present on D3D12 too: there ReShade's update_texture_region makes an upload
+		// buffer and waits for the queue at every call. One run of the effects per present uses one slot.
 		// one buffer per slot of pretone_rules::Staging (which says when a slot may be reused)
 		pretone_rules::Staging g_slots;
 		resource g_stagingBuf[pretone_rules::Staging::kSlots] = {};
 		uint64_t g_stagingSize[pretone_rules::Staging::kSlots] = {};
-		std::atomic<uint64_t> g_passFrame{0}; // the frame her pass before the tonemapper draws (pretone's count)
+		std::atomic<uint64_t> g_passFrame{0}; // the present the effects run in (pretone's count): the staging ring's clock
 
 		struct Plane
 		{
@@ -398,9 +406,11 @@ namespace layer
 			out.ok = true;
 		}
 
-		/// The fetched picture (if any) and the frame's values into their textures, in the command stream the effects are
-		/// drawn in: on the present thread through ReShade's upload, before the game's tonemapper through `cmd`
-		/// (upload_through). False: nothing went (no upload buffer free) - the textures keep the last picture and values,
+		/// The fetched picture (if any) and the frame's values (when they changed) into their textures, in the command
+		/// stream the effects are drawn in: through `cmd` from the staging ring (upload_through) before the game's
+		/// tonemapper and at Present on D3D12 - ReShade's update_texture_region there makes an upload buffer and WAITS for
+		/// the GPU at every call, which once ran every frame for the values even while she was not out - elsewhere through
+		/// ReShade's upload. False: nothing went (no upload buffer free) - the textures keep the last picture and values,
 		/// which belong together, and the fetched picture is read again next time.
 		bool commit(effect_runtime *runtime, command_list *cmd, const Fetched &next, const float *values)
 		{
@@ -414,23 +424,56 @@ namespace layer
 				if (next.sun)
 					planes[n++] = {&g_sunMap, g_sunCopy.data(), f.sun.n, f.sun.n, 4};
 			}
-			planes[n++] = {&g_frameMeta, reinterpret_cast<const uint8_t *>(values), frame_meta::kTexels, 1, 16};
-			if (g_hdrPass)
+			const bool values_changed = !g_metaKnown || !frame_meta::same_drawing(values, g_metaHeld);
+			if (values_changed)
+				planes[n++] = {&g_frameMeta, reinterpret_cast<const uint8_t *>(values), frame_meta::kTexels, 1, 16};
+			device *dev = runtime->get_device();
+			const bool staged = g_hdrPass || dev->get_api() == device_api::d3d12;
+			if (n > 0 && staged)
 			{
-				if (!upload_through(runtime->get_device(), cmd, planes, n))
+				if (!upload_through(dev, cmd, planes, n))
 					return false;
+				g_upStaged += unsigned(n);
 			}
-			else
+			else if (n > 0)
+			{
 				for (int i = 0; i < n; ++i)
 					upload_plane(runtime, *planes[i].layer, planes[i].data, planes[i].w, planes[i].h, planes[i].texel_bytes);
+				g_upImmediate += unsigned(n);
+			}
+			if (values_changed)
+			{
+				std::memcpy(g_metaHeld, values, sizeof(g_metaHeld));
+				g_metaKnown = true;
+				++g_metaSent;
+			}
+			else
+				++g_metaSame;
 			if (next.ok)
 			{
 				g_lastPublish = next.frame.publish;
 				g_frame = next.frame;
 				g_hasFrame = true;
 				++g_frames;
+				++g_statPictures;
 			}
 			return true;
+		}
+
+		/// Every 30 s, what the runs uploaded (a live check: no upload while she is not out and nothing changes).
+		void log_uploads()
+		{
+			++g_statRuns;
+			const ULONGLONG now = GetTickCount64();
+			if (g_nextStat == 0)
+				g_nextStat = now + 30000;
+			if (now < g_nextStat)
+				return;
+			g_nextStat = now + 30000;
+			logf("layer: last 30 s: %llu runs, %llu pictures; planes uploaded %llu from the staging ring, %llu through ReShade's upload; the frame's "
+				 "values uploaded %llu times, unchanged %llu",
+				g_statRuns, g_statPictures, g_upStaged, g_upImmediate, g_metaSent, g_metaSame);
+			g_statRuns = g_statPictures = g_upStaged = g_upImmediate = g_metaSent = g_metaSame = 0;
 		}
 
 		/// ASTRAFRAME, made once per device; false: it cannot be made (she is not drawn: the effect reads zeros).
@@ -447,6 +490,7 @@ namespace layer
 				logf("layer: cannot make the texture of the frame's values: she is not drawn");
 				return false;
 			}
+			g_metaKnown = false; // a new texture holds zeros
 			bind(runtime);
 			return true;
 		}
@@ -578,6 +622,7 @@ namespace layer
 			float values[frame_meta::kTexels * 4];
 			frame_meta::pack(v, values);
 			commit(runtime, cmd, next, values);
+			log_uploads();
 		}
 
 		void on_reloaded_effects(effect_runtime *runtime)

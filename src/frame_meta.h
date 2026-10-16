@@ -56,6 +56,17 @@ namespace frame_meta
 		out[texel * 4 + 3] = w;
 	}
 
+	/// Two packings draw the same: every texel but kRun (written for tests; it changes at every run and would make every
+	/// run an upload). layer.cpp uploads the texture only when the values changed: at Present on D3D12 ReShade's upload
+	/// waits for the GPU, and the values of a frame she is not in stay the same.
+	inline bool same_drawing(const float *a, const float *b)
+	{
+		for (int i = 0; i < kTexels * 4; ++i)
+			if (i / 4 != kRun && !(a[i] == b[i]))
+				return false;
+		return true;
+	}
+
 	/// The values into kTexels * 4 floats, as the texture holds them.
 	inline void pack(const Values &v, float out[kTexels * 4])
 	{

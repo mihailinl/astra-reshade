@@ -1001,6 +1001,7 @@ namespace pretone
 		g_presenting.store(true);
 		while (g_recording.load()) // a pass on a recording thread: let it finish before ReShade's Present work
 			SwitchToThread();
+		layer::set_hdr_pass(false, g_presents.load()); // the staging ring's clock for the effects at Present (layer.cpp commit)
 	}
 
 	void presented(swapchain *swap, uint32_t width, uint32_t height)

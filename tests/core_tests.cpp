@@ -1015,6 +1015,62 @@ static void test_hello_rules()
 	CHECK(!a.again(Size{ 3840, 2160 }).known());
 	a.answered(dflt);
 	CHECK((a.again(Size{ 3840, 2160 }) == Size{ 3840, 2160 }));
+	// a growing side is asked for a quarter more at least (as the engine grows), within the 4K cap; a side that did not
+	// grow keeps what was asked
+	a = hello_rules::Asked();
+	a.first(Size{ 1920, 1080 }, 0);
+	a.answered(dflt);
+	CHECK((a.again(Size{ 1921, 1080 }) == Size{ 2400, 1080 }));
+	CHECK((a.again(Size{ 2600, 1300 }) == Size{ 2600, 1350 }));
+	a.sent(Size{ 3600, 2000 }, 0);
+	a.answered(dflt);
+	CHECK((a.again(Size{ 3601, 2000 }) == Size{ 3840, 2000 }));
+	// a window dragged larger against an engine pinned to 1920x1080 (the developer's WGPU_BRIDGE_MAX): a hello at
+	// every quarter a side (5 steps a side over 3x), not at every round trip once past the pin (~1900 of them)
+	e = FakeEngine();
+	e.cap = e.fallback;
+	bbs.clear();
+	for (int w = 1280; w <= 3840; ++w)
+		bbs.push_back(Size{ w, w * 9 / 16 });
+	const int pinned_drag = drive(e, bbs);
+	std::printf("hello: the same drag against an engine pinned to 1920x1080: %d more hellos\n", pinned_drag);
+	CHECK(pinned_drag >= 1 && pinned_drag <= 10 && (e.ring == Size{ 1920, 1080 }));
+
+	// a reply that never comes (the outbox dropped the hello, the connection stalled) is lost after 2 s
+	a = hello_rules::Asked();
+	a.first(Size{ 1280, 720 }, 1000);
+	a.answered(dflt);
+	a.sent(Size{ 2560, 1440 }, 5000);
+	CHECK(!a.lost(6999) && a.lost(7000) && !a.again(Size{ 2560, 1440 }).known());
+	a.unanswered(); // the link reads the ring it had again; asked already: not asked again for the same size
+	CHECK(!a.lost(9000) && !a.again(Size{ 2560, 1440 }).known() && (a.reply.ring == Size{ 1920, 1080 }));
+	CHECK((a.again(Size{ 3300, 1440 }) == Size{ 3300, 1440 }));
+
+	// an engine that refuses the hello: asked again after 2, 4, 8, 16, 30, 30 s; a reply starts over
+	hello_rules::Backoff b;
+	CHECK(b.due(0));
+	int64_t now = 0;
+	const int64_t waits[] = { 2000, 4000, 8000, 16000, 30000, 30000 };
+	for (int64_t w : waits)
+	{
+		b.refused(now);
+		CHECK(b.step_ms == w && !b.due(now + w - 1) && b.due(now + w));
+		now += w;
+	}
+	b.answered();
+	b.refused(now);
+	CHECK(b.step_ms == 2000);
+	// a refusing engine closes the socket, and the client reconnects in ~45 ms: one minute of it was ~1300 hellos; now
+	int hellos = 0;
+	b = hello_rules::Backoff();
+	for (int64_t t = 0; t < 60000; t += 45)
+		if (b.due(t))
+		{
+			++hellos;
+			b.refused(t);
+		}
+	std::printf("hello: one minute against an engine that refuses every hello: %d hellos\n", hellos);
+	CHECK(hellos >= 4 && hellos <= 6);
 }
 
 /// link.cpp's re-hello lets go of the ring BEFORE the hello (a Windows ring a reader holds cannot grow), and the link
@@ -1035,7 +1091,7 @@ static void test_link_lets_go_before_hello_again()
 	for (size_t i = src.find("say_hello("); i != std::string::npos; i = src.find("say_hello(", i + 1))
 		++calls;
 	CHECK(calls == 3); // its definition, the first hello, hello_again's
-	CHECK(src.find("hello_again(more)") != std::string::npos);
+	CHECK(src.find("hello_again(more, now)") != std::string::npos);
 	CHECK(src.find("kMaxPixels") == std::string::npos && src.find("hello_rules::picture_for(bw, bh)") != std::string::npos);
 }
 
@@ -1259,6 +1315,83 @@ static void test_her_edge()
 	CHECK(std::regex_search(fx, std::regex(R"(zs = her_depth_footprint\(suv\);)")));
 	CHECK(std::regex_search(fx, std::regex(R"(float visible = astra\.a > 0\.0 \? her_visibility\(uv, za, allow\))")));
 	CHECK(fx.find("za < zh + allow ?") == std::string::npos);
+	// the effect's cover_scene is tone::cover_scene: both ends exact, the mix in display space, each end's round trip error
+	// carried by its own weight
+	const auto body = [&fx](const char *head) {
+		const size_t at = fx.find(head);
+		return at == std::string::npos ? std::string() : fx.substr(at, fx.find("\n}\n", at) - at);
+	};
+	const std::string cover = body("float3 cover_scene(float3 game, float3 her, float cover)");
+	CHECK(std::regex_search(cover, std::regex(R"(if \(cover <= 0\.0\)\s*return game;\s*if \(cover >= 1\.0\)\s*return her;)")));
+	CHECK(std::regex_search(cover, std::regex(R"(const float3 gd = host_display\(game\), hd = host_display\(her\);)")));
+	CHECK(std::regex_search(cover, std::regex(R"(return display_to_scene_raw\(lerp\(gd, hd, cover\)\) \+ \(game - display_to_scene_raw\(gd\)\) \* \(1\.0 - cover\) \+ )"
+											  R"(\(her - display_to_scene_raw\(hd\)\) \* cover;)")));
+	// her visibility: the four depth texels around the sample point, bilinear weights, inside the part the game drew
+	const std::string vis = body("float her_visibility(float2 uv, float za, float allow)");
+	CHECK(std::regex_search(vis, std::regex(R"(const int2 last = max\(int2\(DepthUvScale \* float2\(size\) \+ 0\.5\) - 1, int2\(0, 0\)\);)")));
+	CHECK(std::regex_search(vis, std::regex(R"(const float2 p = uv \* DepthUvScale \* float2\(size\) - 0\.5;)")));
+	CHECK(std::regex_search(vis, std::regex(R"(clamp\(c \+ int2\(i & 1, i >> 1\), int2\(0, 0\), last\))")));
+	CHECK(std::regex_search(vis, std::regex(R"(return lerp\(lerp\(seen\.x, seen\.y, f\.x\), lerp\(seen\.z, seen\.w, f\.x\), f\.y\);)")));
+	CHECK(vis.find("/ 9.0") == std::string::npos && vis.find("size - 1") == std::string::npos);
+}
+
+/// layer.cpp commits the frame's values with every run (removing the commit drew her with stale values and stayed
+/// green): on_begin_effects packs and commits them; commit uploads the values only when they draw differently, and at
+/// Present on D3D12 from the staging ring - never through ReShade's update_texture_region, which waits for the GPU.
+static void test_layer_commits_values()
+{
+	std::ifstream f(std::string(ASTRA_SRC) + "/layer.cpp");
+	CHECK(f.good());
+	std::stringstream ss;
+	ss << f.rdbuf();
+	const std::string src = ss.str();
+	const auto body = [&src](const char *head) {
+		const size_t at = src.find(head);
+		return at == std::string::npos ? std::string() : src.substr(at, src.find("\n\t\t}\n", at) - at);
+	};
+	const std::string begin = body("void on_begin_effects(");
+	const size_t pack = begin.find("frame_meta::pack(v, values);"), commit = begin.find("commit(runtime, cmd, next, values);");
+	CHECK(pack != std::string::npos && commit != std::string::npos && pack < commit);
+	const std::string c = body("bool commit(effect_runtime *runtime, command_list *cmd, const Fetched &next, const float *values)");
+	const size_t changed = c.find("const bool values_changed = !g_metaKnown || !frame_meta::same_drawing(values, g_metaHeld);");
+	const size_t meta = c.find("planes[n++] = {&g_frameMeta"), staged = c.find("const bool staged = g_hdrPass || dev->get_api() == device_api::d3d12;");
+	const size_t through = c.find("upload_through(dev, cmd, planes, n)"), held = c.find("std::memcpy(g_metaHeld, values, sizeof(g_metaHeld));");
+	CHECK(changed != std::string::npos && meta != std::string::npos && changed < meta);
+	CHECK(staged != std::string::npos && through != std::string::npos && meta < through && through < held);
+	CHECK(body("bool make_frame_meta(").find("g_metaKnown = false;") != std::string::npos);
+	CHECK(body("void destroy_layers(").find("g_metaKnown = false;") != std::string::npos);
+}
+
+/// One version: what the add-on tells the engine is the runner's (astra-gi.toml), so a release cannot carry two.
+static void test_one_version()
+{
+	const auto read = [](const std::string &path) {
+		std::ifstream f(path);
+		std::stringstream ss;
+		ss << f.rdbuf();
+		return ss.str();
+	};
+	std::smatch a, b;
+	const std::string link = read(std::string(ASTRA_SRC) + "/link.cpp"), toml = read(std::string(ASTRA_SRC) + "/../runners/unreal/astra-gi.toml");
+	CHECK(std::regex_search(link, a, std::regex(R"re(kFoundation = "([0-9.]+)")re")));
+	CHECK(std::regex_search(toml, b, std::regex(R"re(\[integration\][^\[]*?\nversion = "([0-9.]+)")re")));
+	CHECK(a.size() > 1 && b.size() > 1 && a[1].str() == b[1].str());
+}
+
+/// link.cpp: an engine that refuses the hello is not asked again at every reconnect - its socket is stopped (off the
+/// present thread) and started when hello_rules::Backoff says; a refused connection's other messages are dropped; an
+/// error answering the hello that asked for a larger ring gives the old ring back.
+static void test_link_backs_off()
+{
+	std::ifstream f(std::string(ASTRA_SRC) + "/link.cpp");
+	std::stringstream ss;
+	ss << f.rdbuf();
+	const std::string src = ss.str();
+	CHECK(src.find("else if (error && !g_answered)\n\t\t\t\t\trefused(m);") != std::string::npos);
+	CHECK(src.find("else if (error && g_asked.waiting)\n\t\t\t\t\tmap_again(") != std::string::npos);
+	CHECK(src.find("g_backoff.refused(provider::now_ms());") != std::string::npos && src.find("g_stopper = std::thread([] { g_ws.stop(); });") != std::string::npos);
+	CHECK(src.find("if (!g_backoff.due(now))\n\t\t\t\treturn;") != std::string::npos && src.find("g_backoff.answered();") != std::string::npos);
+	CHECK(src.find("else if (g_answered && g_asked.lost(now))\n\t\t\tmap_again(") != std::string::npos);
 }
 
 // ---- frame_meta: what the effect reads in step with the frame it draws ----------------------------------------------
@@ -1325,6 +1458,52 @@ static void test_frame_meta()
 		if (!found || std::stoi(m[1].str()) != x.texel)
 			std::printf("  AstraFrame%s: not at texel %d in the effect\n", x.name, x.texel);
 	}
+	// each value the effect reads: the texel AND the component pack() writes it to (AstraHdr reading .w - the identity
+	// flag - drew a picture of her before the tonemapper as if at Present)
+	const struct
+	{
+		const char *macro, *texel, *component;
+	} reads[] = {{"AstraActive", "Planes", "w"}, {"AstraHdr", "Host", "z"}, {"AstraPlanes", "Planes", "xyz"}, {"HostPlanes", "Host", "xy"},
+		{"AstraRect", "Rect", ""}, {"AstraWarpRow0", "Warp0", "xyz"}, {"AstraWarpRow1", "Warp1", "xyz"}, {"AstraWarpRow2", "Warp2", "xyz"},
+		{"AstraWarpT", "WarpT", "xyz"}, {"AstraWarpIdentity", "Host", "w"}, {"AstraWarpTan", "WarpTan", "xyz"}, {"SunVActive", "SunParams", "w"},
+		{"SunVCenter", "SunCenter", "xyz"}, {"SunVRight", "SunRight", "xyz"}, {"SunVUp", "SunUp", "xyz"}, {"SunVDir", "SunDir", "xyz"},
+		{"SunVParams", "SunParams", "xyz"}, {"AstraShadow", "SunCenter", "w"}};
+	for (const auto &r : reads)
+	{
+		const std::string want = std::string(R"(#define )") + r.macro + R"(\s+\(?ASTRA_FRAME\(AstraFrame)" + r.texel + R"(\))" +
+			(*r.component ? std::string(R"(\.)") + r.component + R"(\b)" : std::string(R"((?![.\w]))"));
+		const bool ok = std::regex_search(fx, std::regex(want));
+		CHECK(ok);
+		if (!ok)
+			std::printf("  %s: not read from AstraFrame%s.%s\n", r.macro, r.texel, r.component);
+	}
+	// ...and pack() writes those components: active .w and her planes .xyz of Planes; game near/far .xy, hdr .z,
+	// identity .w of Host; shadow .w of SunCenter; the sun view's use .w of SunParams
+	frame_meta::Values marks;
+	marks.near_m = 11, marks.far_m = 12, marks.flags = 13, marks.active = true, marks.host_near = 21, marks.host_far = 22, marks.hdr = true;
+	marks.shadow = 0.25f, marks.sun_half = 31, marks.sun_near = 32, marks.sun_n = 33, marks.sun = true;
+	frame_meta::pack(marks, t);
+	CHECK(at(frame_meta::kPlanes, 0) == 11 && at(frame_meta::kPlanes, 1) == 12 && at(frame_meta::kPlanes, 2) == 13 && at(frame_meta::kPlanes, 3) == 1);
+	CHECK(at(frame_meta::kHost, 0) == 21 && at(frame_meta::kHost, 1) == 22 && at(frame_meta::kHost, 2) == 1 && at(frame_meta::kHost, 3) == 0);
+	CHECK(at(frame_meta::kSunCenter, 3) == 0.25f && at(frame_meta::kSunParams, 2) == 33 && at(frame_meta::kSunParams, 3) == 1);
+
+	// the add-on uploads the values only when they draw differently: the run alone is no change; anything else is
+	float a1[frame_meta::kTexels * 4], a2[frame_meta::kTexels * 4];
+	frame_meta::Values w1;
+	frame_meta::pack(w1, a1);
+	w1.run = 99;
+	frame_meta::pack(w1, a2);
+	CHECK(frame_meta::same_drawing(a1, a2));
+	for (int i = 0; i < frame_meta::kTexels * 4; ++i)
+	{
+		frame_meta::pack(frame_meta::Values(), a2);
+		a2[i] = a2[i] + 1.0f + std::fabs(a2[i]); // changed (+0.5 would vanish into 1e7, x2+1 keeps -1)
+		CHECK(frame_meta::same_drawing(a1, a2) == (i / 4 == frame_meta::kRun));
+	}
+	frame_meta::pack(frame_meta::Values(), a2);
+	a2[frame_meta::kRect * 4] = std::nanf("");
+	CHECK(!frame_meta::same_drawing(a2, a2)); // a NaN never passes for "unchanged"
+
 	// a value that changes every frame declared as a uniform again would be read a frame late
 	CHECK(!std::regex_search(fx, std::regex(
 		R"(uniform\s+\w+\s+(AstraActive|AstraHdr|AstraPlanes|HostPlanes|AstraRect|AstraWarp\w*|SunV\w*|AstraShadow)\b)")));
@@ -1421,6 +1600,9 @@ int main(int argc, char **argv)
 	test_link_sends_through_the_outbox();
 	test_hello_rules();
 	test_link_lets_go_before_hello_again();
+	test_link_backs_off();
+	test_layer_commits_values();
+	test_one_version();
 	test_tone();
 	test_tone_in_effect();
 	test_frame_meta();

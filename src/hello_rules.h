@@ -6,7 +6,10 @@
 //   hello()        the hello the link sends (BRIDGE.md), with `want`: the largest picture it will ask for
 //   read_reply()   what the engine's hello reply says of its ring (maxW/maxH), and whether it takes `want`
 //   Asked          the re-hello rule: her picture outgrew the ring the engine made -> one more hello, asking for it
+//   Backoff        an engine that refuses the hello (its games paused after a crash, a wrong token) is asked again after
+//                  2 s, then 4, 8, 16, 30 - not at every reconnect (it closes the socket: ~22 hellos a second)
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -77,22 +80,27 @@ namespace hello_rules
 	}
 
 	/// One connection's hellos. Its first asks for her picture's size; when her picture later outgrows the ring the reply
-	/// named (the game's window grew), one more hello asks for the larger size - only to an engine that takes `want`, only
+	/// named (the game's window grew), one more hello asks for a larger size - only to an engine that takes `want`, only
 	/// once the last hello was answered (one in flight), and only past what was already asked for: an engine pinned
-	/// smaller answers the same size again, and is not asked again every frame. The engine grows a ring by at least a
-	/// quarter a side, so a window dragged larger costs a few hellos, not one per frame. What was asked never shrinks.
+	/// smaller answers the same size again, and is not asked again every frame. A growing side is asked for a quarter
+	/// more at least (as the engine grows its ring), so a window dragged larger costs a few hellos, not one per frame -
+	/// even against a pinned engine. What was asked never shrinks. A reply that does not come within kReplyMs is lost
+	/// (`lost`): the link reads the ring it had again.
 	struct Asked
 	{
+		static constexpr int64_t kReplyMs = 2000;
 		Size want;            // the largest picture asked for on this connection
 		Reply reply;          // the engine's last answer
 		bool waiting = false; // a hello is in flight
+		int64_t sent_ms = 0;  // when it was sent
 
 		/// A new connection: its first hello's `want` (unknown: none, the engine's default size).
-		Size first(Size picture)
+		Size first(Size picture, int64_t now = 0)
 		{
 			*this = Asked();
 			want = picture;
 			waiting = true;
+			sent_ms = now;
 			return want;
 		}
 
@@ -111,13 +119,40 @@ namespace hello_rules
 				return {}; // it fits the ring there is
 			if (picture.w <= want.w && picture.h <= want.h)
 				return {}; // asked for already: the engine made what it could
-			return { std::max(picture.w, want.w), std::max(picture.h, want.h) };
+			const auto side = [](int have, int need, int cap) {
+				return need <= have ? have : std::min(cap, std::max(need, have + have / 4));
+			};
+			return { side(want.w, picture.w, kMaxW), side(want.h, picture.h, kMaxH) };
 		}
 
-		void sent(Size w)
+		void sent(Size w, int64_t now = 0)
 		{
 			want = w;
 			waiting = true;
+			sent_ms = now;
 		}
+
+		/// The hello in flight has had no reply for kReplyMs (the outbox dropped it, the connection stalled).
+		bool lost(int64_t now) const { return waiting && now - sent_ms >= kReplyMs; }
+
+		/// Its reply is not coming (lost, or the engine answered with an error): the ring is still the last reply's.
+		void unanswered() { waiting = false; }
+	};
+
+	/// When to say hello again to an engine that refused one (an `error` before any hello reply on the connection):
+	/// the socket is stopped and started again after 2 s, doubling to 30 s; a hello reply starts over.
+	struct Backoff
+	{
+		static constexpr int64_t kFirstMs = 2000, kMaxMs = 30000;
+		int64_t step_ms = 0; // the wait after the last refusal (0: none)
+		int64_t until = 0;   // no hello before then
+
+		void refused(int64_t now)
+		{
+			step_ms = step_ms == 0 ? kFirstMs : std::min(step_ms * 2, kMaxMs);
+			until = now + step_ms;
+		}
+		void answered() { *this = Backoff(); }
+		bool due(int64_t now) const { return now >= until; }
 	};
 }

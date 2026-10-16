@@ -12,12 +12,13 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <thread>
 
 namespace enginelink
 {
 	namespace
 	{
-		constexpr const char *kFoundation = "0.2.0";       // this add-on's version, told to the engine
+		constexpr const char *kFoundation = "0.2.1";       // this add-on's version, told to the engine
 		constexpr double kRebase = 1500.0;                 // move the floating origin when she is this far from it
 		constexpr float kFar = 300.0f;                     // she is never far: a short depth range keeps it precise
 		constexpr int64_t kStaleMs = 300;                  // a provider silent this long: she is hidden
@@ -25,6 +26,14 @@ namespace enginelink
 		constexpr ULONGLONG kLightEveryMs = 100;
 
 		WsClient g_ws;
+		std::string g_host = "127.0.0.1";
+		int g_port = 0;
+		hello_rules::Backoff g_backoff; // an engine that refused the hello is asked again later, not at every reconnect
+		bool g_parked = false;          // the socket is stopped until g_backoff says
+		std::thread g_stopper;          // stops it off the present thread (WsClient::stop joins its thread: up to ~0.1 s)
+		std::string g_lastShm;          // the ring the last hello reply named
+		ULONGLONG g_helloLogAt = 0;
+		unsigned g_hellosUnlogged = 0;
 		Outbox g_outbox; // every message goes out through it: a frame never waits for the network
 		std::string g_token;
 		int g_generation = -1;
@@ -88,7 +97,8 @@ namespace enginelink
 		}
 
 		/// `want`: the largest picture this connection will ask for (hello_rules::Asked), unknown before the first present.
-		void say_hello(hello_rules::Size want)
+		/// False: it could not be queued (the outbox is full: the connection stopped taking messages).
+		bool say_hello(hello_rules::Size want)
 		{
 			std::string integration, game;
 			provider::state().identity(integration, game);
@@ -96,18 +106,54 @@ namespace enginelink
 				game = exe_name();
 			if (integration.empty())
 				integration = "astra.reshade";
-			g_outbox.push(hello_rules::hello(game, kFoundation, integration, g_token, want), g_ws.generation());
-			logf("link: hello sent (game \"%s\", integration %s, want %dx%d%s)", game.c_str(), integration.c_str(), want.w, want.h,
-				g_token.empty() ? "" : ", with token");
+			const bool queued = g_outbox.push(hello_rules::hello(game, kFoundation, integration, g_token, want), g_ws.generation());
+			// at most one line every 10 s: a peer that closes every connection once made it ~22 a second
+			const ULONGLONG now = GetTickCount64();
+			if (now >= g_helloLogAt)
+			{
+				logf("link: hello %s (game \"%s\", integration %s, want %dx%d%s; %u more since the last line)", queued ? "sent" : "NOT queued",
+					game.c_str(), integration.c_str(), want.w, want.h, g_token.empty() ? "" : ", with token", g_hellosUnlogged);
+				g_helloLogAt = now + 10000;
+				g_hellosUnlogged = 0;
+			}
+			else
+				++g_hellosUnlogged;
+			return queued;
+		}
+
+		/// A hello's reply is not coming (lost, or the engine answered with an error): the ring the last reply named is
+		/// read again - the engine keeps it when it cannot make a larger one.
+		void map_again(const char *why)
+		{
+			g_asked.unanswered();
+			if (!g_lastShm.empty())
+				layer::set_frames_at(g_lastShm.c_str());
+			logf("link: %s: reading the engine's ring at %s again", why, g_lastShm.c_str());
 		}
 
 		/// Her picture outgrew the engine's ring: let go of it FIRST (on Windows a ring a reader still holds cannot grow -
-		/// the engine would keep the old one), then ask for the larger one; the reply names it, mapped afresh.
-		void hello_again(hello_rules::Size want)
+		/// the engine would keep the old one), then ask for the larger one; the reply names it, mapped afresh. A hello
+		/// that cannot be queued gives the old ring back at once.
+		void hello_again(hello_rules::Size want, int64_t now)
 		{
 			layer::let_go_of_frames();
-			g_asked.sent(want);
-			say_hello(want);
+			if (say_hello(want))
+				g_asked.sent(want, now);
+			else
+				map_again("the hello asking for a larger ring could not be queued");
+		}
+
+		/// The engine refused this connection's hello (an `error` before any reply: its games paused after a crash, a
+		/// wrong token). It closes the socket and the client would reconnect at once - so the socket is stopped and
+		/// started again when the back-off ends (2 s, doubling to 30 s).
+		void refused(const std::string &m)
+		{
+			g_backoff.refused(provider::now_ms());
+			logf("link: the engine refused the hello (%.200s): asking again in %lld s", m.c_str(), (long long)(g_backoff.step_ms / 1000));
+			if (g_stopper.joinable())
+				g_stopper.join();
+			g_parked = true;
+			g_stopper = std::thread([] { g_ws.stop(); });
 		}
 
 		/// The engine's hello reply: where its frames are (map them again at every hello: a restarted engine's ring
@@ -125,7 +171,10 @@ namespace enginelink
 					for (size_t i = where.find("\\\\"); i != std::string::npos; i = where.find("\\\\", i + 1))
 						where.erase(i, 1); // JSON's "\\" -> "\"
 					if (!where.empty())
+					{
 						layer::set_frames_at(where.c_str());
+						g_lastShm = where;
+					}
 				}
 			}
 			const size_t caps = m.find("\"caps\":[");
@@ -134,6 +183,7 @@ namespace enginelink
 			g_capsCues = list.find("\"cues\"") != std::string::npos;
 			const hello_rules::Reply reply = hello_rules::read_reply(m);
 			g_asked.answered(reply);
+			g_backoff.answered();
 			logf("link: the engine's ring is %dx%d (asked %dx%d%s)", reply.ring.w, reply.ring.h, g_asked.want.w, g_asked.want.h,
 				reply.takes_want ? "" : "; this engine sizes no ring for a game");
 		}
@@ -155,8 +205,14 @@ namespace enginelink
 					++g_logged;
 					logf("engine: %.300s", m.c_str());
 				}
+				if (g_parked)
+					continue; // the rest of a refused connection's messages
 				if (hello)
 					on_hello(m);
+				else if (error && !g_answered)
+					refused(m);
+				else if (error && g_asked.waiting)
+					map_again("the engine answered the hello asking for a larger ring with an error");
 			}
 		}
 
@@ -173,7 +229,8 @@ namespace enginelink
 	void start(int port, const std::string &token)
 	{
 		g_token = token;
-		g_ws.start("127.0.0.1", port);
+		g_port = port;
+		g_ws.start(g_host.c_str(), port);
 		g_outbox.start([](const std::string &m) { return g_ws.send(m); }, [] { return g_ws.generation(); });
 		logf("link: engine bridge at 127.0.0.1:%d", port);
 	}
@@ -181,6 +238,8 @@ namespace enginelink
 	void stop()
 	{
 		g_outbox.stop(); // after the send in flight (its timeout bounds it)
+		if (g_stopper.joinable())
+			g_stopper.join();
 		g_ws.stop();
 	}
 
@@ -223,6 +282,16 @@ namespace enginelink
 		g_stats.provider_visible = ps.visible;
 		g_stats.camera_age_ms = have_cam ? now - newest.at_ms : -1;
 
+		if (g_parked)
+		{
+			layer::set_active(false);
+			if (!g_backoff.due(now))
+				return;
+			if (g_stopper.joinable())
+				g_stopper.join();
+			g_parked = false;
+			g_ws.start(g_host.c_str(), g_port); // a new connection: hello again
+		}
 		const bool live = g_ws.connected() && fresh && have_av && ps.visible && g_enabled;
 		layer::set_active(live);
 		if (!g_ws.connected())
@@ -244,10 +313,13 @@ namespace enginelink
 			g_answered = false;
 			g_capsLight = g_capsCues = false;
 			g_sentIndex = ~uint64_t(0);
-			say_hello(g_asked.first(picture));
+			if (!say_hello(g_asked.first(picture, now)))
+				g_generation = -1; // not queued: again next frame
 		}
+		else if (g_answered && g_asked.lost(now))
+			map_again("no reply in 2 s to the hello asking for a larger ring");
 		else if (const hello_rules::Size more = g_asked.again(picture); more.known())
-			hello_again(more); // the game's window grew past the ring
+			hello_again(more, now); // the game's window grew past the ring
 		if (!live || bw <= 0 || bh <= 0)
 			return;
 
