@@ -190,6 +190,23 @@ float her_depth(float2 uv)
 	return src_linear(tex2Dlod(sAstraDepth, float4(r, 0, 0)).r, AstraPlanes);
 }
 
+/// Her depth wherever her colour's bilinear footprint holds her: the nearest of its four texels. Her picture is filtered
+/// where it is scaled to the game's size (1920x1080 into 2560x1440), so its partly covered edge reaches pixels whose
+/// NEAREST depth texel is outside her; a point-sampled depth cut those off - a stair of whole texels along her edge.
+float her_depth_footprint(float2 uv)
+{
+	float2 r;
+	if (!rect_uv(uv, r))
+		return 1e9;
+	const int2 size = tex2Dsize(sAstraDepth);
+	const int2 i = int2(floor(r * float2(size) - 0.5));
+	float z = 1e9;
+	[unroll] for (int y = 0; y <= 1; ++y)
+		[unroll] for (int x = 0; x <= 1; ++x)
+			z = min(z, src_linear(tex2Dfetch(sAstraDepth, clamp(i + int2(x, y), int2(0, 0), size - 1)).r, AstraPlanes));
+	return z;
+}
+
 /// Her colour (premultiplied) at a point of the whole picture; nothing outside her rectangle.
 float4 her_colour(float2 uv)
 {
@@ -221,7 +238,7 @@ bool reproject(float2 uv, float zFar, out float2 suv, out float zs)
 	if (AstraWarpIdentity)
 	{
 		suv = src_uv(ray.xy / scale, planes);
-		zs = her_depth(suv);
+		zs = her_depth_footprint(suv);
 		return zs < 1e8 && zs < zFar + 0.05;
 	}
 	float zprev = zNear;
@@ -302,6 +319,23 @@ float host_linear(float d)
 float game_depth(float2 uv)
 {
 	return host_linear(tex2Dlod(ReShade::DepthBuffer, float4(uv * DepthUvScale, 0, 0)).x);
+}
+
+/// How much of her is in front of the game's surfaces here: the share of the nine depth texels around the pixel she is
+/// nearer than. Unreal's TSR draws its depth with a different sub-pixel jitter every frame, and thin things in it (grass
+/// at her feet, a fence) cover a texel one frame and not the next: one compare against one filtered sample hid and
+/// showed whole pixels of her feet frame by frame (in Scarlet Skips a quarter of her shoes, the ground's lighting
+/// showing through in 16-pixel blocks). The share moves by a ninth where one texel flips, and her edge against a nearer
+/// surface is soft, as TSR leaves the game's own.
+float her_visibility(float2 uv, float za, float allow)
+{
+	const int2 size = tex2Dsize(ReShade::DepthBuffer);
+	const int2 c = int2(uv * DepthUvScale * float2(size));
+	float seen = 0.0;
+	[unroll] for (int y = -1; y <= 1; ++y)
+		[unroll] for (int x = -1; x <= 1; ++x)
+			seen += za < host_linear(tex2Dfetch(ReShade::DepthBuffer, clamp(c + int2(x, y), int2(0, 0), size - 1)).x) + allow ? 1.0 : 0.0;
+	return seen / 9.0;
 }
 
 float luma(float3 c)
@@ -391,9 +425,9 @@ float3 srgb_encode(float3 c)
 	return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
 }
 
-/// A shown colour (sRGB, as her picture holds it) -> the game's scene colour (linear, pre-exposed), times her exposure
-/// trim (tone::display_to_scene).
-float3 display_to_scene(float3 d)
+/// A shown colour (sRGB, as her picture holds it) -> the game's scene colour (linear, pre-exposed): the curve's model
+/// inverted, no exposure trim.
+float3 display_to_scene_raw(float3 d)
 {
 	float3 c = clamp(tone_mul(ToneInvIn0, ToneInvIn1, ToneInvIn2, srgb_decode(d)), 0.0, ToneLut.x);
 	c = float3(tone_curve_inverse(c.x), tone_curve_inverse(c.y), tone_curve_inverse(c.z));
@@ -401,7 +435,13 @@ float3 display_to_scene(float3 d)
 	const float3 target = c;
 	[unroll] for (int k = 0; k < ToneUnexpand; ++k)
 		c = target - tone_expand_amount(c) * (tone_mul(ToneExpand0, ToneExpand1, ToneExpand2, c) - c);
-	return max(tone_mul(ToneFromAp1_0, ToneFromAp1_1, ToneFromAp1_2, c), 0.0) * ToneExposure;
+	return max(tone_mul(ToneFromAp1_0, ToneFromAp1_1, ToneFromAp1_2, c), 0.0);
+}
+
+/// ...times her exposure trim (tone::display_to_scene).
+float3 display_to_scene(float3 d)
+{
+	return display_to_scene_raw(d) * ToneExposure;
 }
 
 /// The game's colour where this runs -> about what the game will show there (sRGB): the light, fog and grade around her
@@ -470,6 +510,22 @@ float3 relight(float3 c, float2 uv, float z)
 	float3 fog;
 	const float t = fog_transmittance(z, fog);
 	return lerp(fog, c, t);
+}
+
+/// Her coverage over the game's scene colour, before its tonemapper: blended as her engine drew it - in the shown
+/// space her picture's antialiasing was made for, through the curve's model - not in the scene's linear light. Through
+/// the curve's steep top her white is ~10x a mid grey: blended linearly, a pixel she covers 5 % of came out of the game
+/// at 0.81 where her engine shows 0.53 - a white fringe along her edge, brightest where her coverage is sparsest (an
+/// 8-bit alpha of a few hundredths, its colour quantised). Exact at both ends: no cover is the game's colour, full
+/// cover hers; between, the model's round trip error at each end is carried along.
+float3 cover_scene(float3 game, float3 her, float cover)
+{
+	if (cover <= 0.0)
+		return game;
+	if (cover >= 1.0)
+		return her;
+	const float3 gd = host_display(game), hd = host_display(her);
+	return display_to_scene_raw(lerp(gd, hd, cover)) + (game - display_to_scene_raw(gd)) * (1.0 - cover) + (her - display_to_scene_raw(hd)) * cover;
 }
 
 /// Her shadow: this game surface point in the engine's view of her from the sun; shadowed where it lies further
@@ -606,7 +662,7 @@ float4 PS_Astra(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 		return float4(AstraHdr ? display_to_scene(d) : d, host4.a);
 	}
 	// behind the game's surfaces (and another compositor's, where it drew nearer)
-	float visible = za < zh + allow ? 1.0 : 0.0;
+	float visible = astra.a > 0.0 ? her_visibility(uv, za, allow) : 0.0;
 #ifdef ASTRA_OCCLUDER_TEX
 	if (AstraOccluderActive)
 	{
@@ -627,12 +683,10 @@ float4 PS_Astra(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 	}
 	// (her colour is premultiplied: relight it as straight colour, then by her coverage again; before the tonemapper,
 	// into the scene's light)
-	float3 lit = visible > 0.0 && astra.a > 1e-4 ? relight(astra.rgb / astra.a, uv, za) : 0.0;
+	const float3 lit = visible > 0.0 && astra.a > 1e-4 ? relight(astra.rgb / astra.a, uv, za) : 0.0;
 	if (AstraHdr)
-		lit = display_to_scene(lit);
+		return float4(max(cover_scene(shaded, display_to_scene(lit), cover), 0.0), host4.a); // the game's UI comes after, over her
 	float3 c = lit * astra.a * visible + shaded * (1.0 - cover);
-	if (AstraHdr)
-		return float4(max(c, 0.0), host4.a); // the game's UI comes after, over her
 #ifdef ASTRA_GAME_UI
 	// the game's UI back over her (the game composited it with its scene before she was drawn over that)
 	if (ASTRA_GAME_UI_ACTIVE && cover > 0.001)

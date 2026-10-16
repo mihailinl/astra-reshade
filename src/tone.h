@@ -425,6 +425,32 @@ namespace tone
 			out[i] = float(srgb_encode(c[i]));
 	}
 
+	/// Her coverage `cover` (0..1) of a pixel of the game's scene colour `game`, her own scene colour there `her`: blended
+	/// in the shown space her picture's antialiasing was made for (through the model), not in the scene's linear light,
+	/// where her white (~10x a mid grey past the curve's steep top) makes a 5 % covered pixel of her edge nearly as bright
+	/// as her. Exact at both ends; between, the model's round-trip error at each end is carried along. The effect's
+	/// cover_scene.
+	inline void cover_scene(const float *lut, const Matrices &m, const float game[3], const float her[3], float cover, float out[3],
+		const Film &f = Film())
+	{
+		if (cover <= 0.0f || cover >= 1.0f)
+		{
+			for (int i = 0; i < 3; ++i)
+				out[i] = cover <= 0.0f ? game[i] : her[i];
+			return;
+		}
+		float gd[3], hd[3], mix[3], gi[3], hi[3], mi[3];
+		scene_to_display(lut, m, game, gd, f);
+		scene_to_display(lut, m, her, hd, f);
+		for (int i = 0; i < 3; ++i)
+			mix[i] = gd[i] + (hd[i] - gd[i]) * cover;
+		display_to_scene(lut, m, gd, 1.0f, gi, f);
+		display_to_scene(lut, m, hd, 1.0f, hi, f);
+		display_to_scene(lut, m, mix, 1.0f, mi, f);
+		for (int i = 0; i < 3; ++i)
+			out[i] = mi[i] + (game[i] - gi[i]) * (1.0f - cover) + (her[i] - hi[i]) * cover;
+	}
+
 	/// The uniforms AstraPassthrough.fx takes from this file (a name and three floats: the matrices' rows, AP1's luma
 	/// weights), set before every run of the effects. tests/core_tests.cpp checks the effect declares every one.
 	struct Uniform

@@ -1030,6 +1030,58 @@ static void test_tone_in_effect()
 	CHECK(fx.find("ToneA") == std::string::npos && fx.find("TonePre") == std::string::npos);
 }
 
+// ---- her edge over the game's scene colour, and her feet against its jittered depth -----------------------------
+
+/// Her partly covered edge is blended as her engine drew it (in the shown space), not in the scene's linear light: a
+/// 5 % covered pixel of her white over a mid grey showed 0.81 where her engine shows 0.53 - the white fringe of
+/// Scarlet Skips. And the effect does it that way: through cover_scene, her depth found over the colour's bilinear
+/// footprint, her visibility a share of nine depth texels.
+static void test_her_edge()
+{
+	std::vector<float> lut(2 * tone::kLutN);
+	tone::fill_lut(lut.data());
+	const tone::Matrices m = tone::matrices();
+	const float grey_d[3] = {0.5f, 0.5f, 0.5f}, white_d[3] = {1.0f, 1.0f, 1.0f};
+	float grey[3], white[3], out[3], shown[3];
+	tone::display_to_scene(lut.data(), m, grey_d, 1.0f, grey);
+	tone::display_to_scene(lut.data(), m, white_d, 1.0f, white);
+	// the ends are exact
+	tone::cover_scene(lut.data(), m, grey, white, 0.0f, out);
+	CHECK(out[0] == grey[0] && out[2] == grey[2]);
+	tone::cover_scene(lut.data(), m, grey, white, 1.0f, out);
+	CHECK(out[0] == white[0] && out[1] == white[1]);
+	// 5 % of her white over a mid grey shows as her engine's blend would (0.525), not 0.81
+	tone::cover_scene(lut.data(), m, grey, white, 0.05f, out);
+	tone::scene_to_display(lut.data(), m, out, shown);
+	CHECK(near(shown[0], 0.525, 0.01) && near(shown[1], 0.525, 0.01));
+	float linear[3] = {grey[0] * 0.95f + white[0] * 0.05f, grey[1] * 0.95f + white[1] * 0.05f, grey[2] * 0.95f + white[2] * 0.05f};
+	tone::scene_to_display(lut.data(), m, linear, shown);
+	CHECK(shown[0] > 0.75f); // what the linear blend did
+	// rising with her coverage, and a bright game colour (past the curve's range) kept where she barely covers it
+	float prev = -1.0f;
+	bool rising = true;
+	for (int k = 0; k <= 20; ++k)
+	{
+		tone::cover_scene(lut.data(), m, grey, white, float(k) / 20.0f, out);
+		tone::scene_to_display(lut.data(), m, out, shown);
+		rising = rising && shown[0] >= prev - 1e-4f;
+		prev = shown[0];
+	}
+	CHECK(rising);
+	const float sun[3] = {80.0f, 70.0f, 60.0f};
+	tone::cover_scene(lut.data(), m, sun, grey, 0.001f, out);
+	CHECK(near(out[0], 80.0, 0.5) && near(out[2], 60.0, 0.5));
+
+	std::ifstream f(ASTRA_FX);
+	std::stringstream ss;
+	ss << f.rdbuf();
+	const std::string fx = ss.str();
+	CHECK(std::regex_search(fx, std::regex(R"(if \(AstraHdr\)\s*return float4\(max\(cover_scene\(shaded, display_to_scene\(lit\), cover\))")));
+	CHECK(std::regex_search(fx, std::regex(R"(zs = her_depth_footprint\(suv\);)")));
+	CHECK(std::regex_search(fx, std::regex(R"(float visible = astra\.a > 0\.0 \? her_visibility\(uv, za, allow\))")));
+	CHECK(fx.find("za < zh + allow ?") == std::string::npos);
+}
+
 // ---- frame_meta: what the effect reads in step with the frame it draws ----------------------------------------------
 
 /// The values land at the texels the effect reads them from, and the effect reads every per-frame value from that
@@ -1191,6 +1243,7 @@ int main(int argc, char **argv)
 	test_tone();
 	test_tone_in_effect();
 	test_frame_meta();
+	test_her_edge();
 	test_config_rules();
 	if (argc > 1)
 		test_lua_lines(argv[1]);
