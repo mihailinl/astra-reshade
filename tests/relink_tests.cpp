@@ -246,6 +246,17 @@ static void test_engine_relink()
 	WSAStartup(MAKEWORD(2, 2), &wsa);
 	FakeEngine engine;
 
+	// link.cpp's hello is gated on a provider camera having arrived at least once (never claim her for a game
+	// nothing can show a picture of - core_tests.cpp's test_link_waits_for_a_provider_camera_before_hello): this
+	// test's own in-process push stands in for AstraUE's (or any provider's) first camera line. provider::state()
+	// is a process-wide singleton the device recreate never resets, so one push here covers both device A and B.
+	provider::Camera seen{};
+	seen.fwd[2] = -1.0f;
+	seen.up[1] = 1.0f;
+	seen.fov_deg = 60.0f;
+	seen.near_m = 0.1f;
+	provider::state().cameras.push(seen);
+
 	// enginelink::frame() is what a present calls (main.cpp's begin_frame, once per presented frame) - it is the
 	// only place a hello is sent. Driven from this (the test's single) thread, exactly as one present thread
 	// would drive it for every present of either device - never concurrently with start()/stop() themselves.

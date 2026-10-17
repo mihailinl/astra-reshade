@@ -302,6 +302,13 @@ namespace enginelink
 			g_answered = false;
 			return;
 		}
+		// no provider has EVER sent a camera (pipe or in-process: both push into ps.cameras) - this game's picture
+		// is one the engine cannot show. A hello still claims her (WGPU_GAME_SWITCH takes her off the desktop on it),
+		// so saying one here would flicker her off for nothing while a dead UE4SS or a game with no provider mod
+		// never answers. have_cam, once true, stays true (the ring never empties): a provider that connected once
+		// keeps today's behaviour even if it later falls silent.
+		if (!have_cam)
+			return;
 		// her picture: the game's size (1:1 with its pixels), within the largest ring the engine makes
 		const hello_rules::Size picture = hello_rules::picture_for(bw, bh);
 		if (picture.known())

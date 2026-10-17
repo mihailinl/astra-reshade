@@ -1095,6 +1095,31 @@ static void test_link_lets_go_before_hello_again()
 	CHECK(src.find("kMaxPixels") == std::string::npos && src.find("hello_rules::picture_for(bw, bh)") != std::string::npos);
 }
 
+/// A hello claims her (WGPU_GAME_SWITCH takes her off the desktop on it): a runner whose picture needs a provider
+/// camera (every runner this add-on serves - the pipe or an in-process export call, both push into ps.cameras) must
+/// not say one until a camera has arrived, or she flickers off the desktop for a game whose provider is dead (UE4SS
+/// crashed) or never runs. frame() must check have_cam and return before the first hello, and before the re-hello
+/// path (both share the one return above the whole hello block).
+static void test_link_waits_for_a_provider_camera_before_hello()
+{
+	std::ifstream f(std::string(ASTRA_SRC) + "/link.cpp");
+	CHECK(f.good());
+	std::stringstream ss;
+	ss << f.rdbuf();
+	const std::string src = ss.str();
+	const size_t fn = src.find("void frame(int bw, int bh)");
+	CHECK(fn != std::string::npos);
+	const size_t connected_return = src.find("if (!g_ws.connected())", fn);
+	const size_t have_cam_gate = src.find("if (!have_cam)", fn);
+	const size_t gate_return = have_cam_gate == std::string::npos ? std::string::npos : src.find("return;", have_cam_gate);
+	const size_t first_hello = src.find("g_asked.first(picture, now)", fn);
+	const size_t re_hello = src.find("hello_again(more, now)", fn);
+	CHECK(connected_return != std::string::npos && have_cam_gate != std::string::npos && gate_return != std::string::npos);
+	CHECK(first_hello != std::string::npos && re_hello != std::string::npos);
+	// the gate sits after the connected-check's own return and before BOTH hello sites (one return covers both)
+	CHECK(connected_return < have_cam_gate && have_cam_gate < gate_return && gate_return < first_hello && gate_return < re_hello);
+}
+
 // ---- tone: her picture into the scene's light -----------------------------------------------------------------
 
 /// The largest channel difference.
@@ -1607,6 +1632,7 @@ int main(int argc, char **argv)
 	test_link_sends_through_the_outbox();
 	test_hello_rules();
 	test_link_lets_go_before_hello_again();
+	test_link_waits_for_a_provider_camera_before_hello();
 	test_link_backs_off();
 	test_layer_commits_values();
 	test_one_version();
