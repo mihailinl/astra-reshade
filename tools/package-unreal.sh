@@ -10,8 +10,9 @@ TP="$HERE/extern/minecraft-in-death-stranding/third_party"
 CACHE="$HERE/build/cache"
 OUT="$HERE/build/astra-gi"
 # RE-UE4SS's experimental line (UE 5.6-5.8). experimental-latest is a ROLLING tag: its asset is replaced at every
-# upstream commit, so this URL dies with the next one - mirror the zip (MIT) as an asset of our own release.
-UE4SS_URL=${UE4SS_URL:-https://github.com/UE4SS-RE/RE-UE4SS/releases/download/experimental-latest/UE4SS_v3.0.1-1164-g5e627997.zip}
+# upstream commit, so its URL died with the next one: the pinned zip (MIT, digest below) is mirrored as an asset of our
+# own v0.2.1 release, and fetched from there.
+UE4SS_URL=${UE4SS_URL:-https://github.com/mihailinl/astra-reshade/releases/download/v0.2.1/UE4SS_v3.0.1-1164-g5e627997.zip}
 UE4SS_SHA256=3c72142a383e25e9f9553ac9e4d5677aa572e98cb369cac57200efb2e381e603
 RESHADE_DLL_SHA256=0cee63f9c9f13f3ac909c5b4903f4dbb4b719a7ab3b4f13b0deaf83c814b94f7
 
