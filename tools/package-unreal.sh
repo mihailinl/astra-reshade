@@ -1,9 +1,14 @@
 #!/bin/bash
-# Builds the Unreal runner's release asset: build/astra-gi.zip (astra-gi.toml + every file it names), from
-#   our build (./build.sh -> build/astra.addon64), shaders/, runners/unreal/ (AstraUE, the UE4SS mod list, the manifest);
-#   UE4SS (downloaded, digest-checked), ReShade 6.8.0 Addon + ReShade.fxh (the submodule's fetch_deps.sh).
-# Fills the manifest's @sha256:<path>@ with our files' digests and checks every upstream digest it pins. No ReShade.ini:
-# the add-on sets what her effect needs (src/config_rules.h), and sits beside dxgi.dll where ReShade looks by default.
+# Builds the Unreal runner's release assets from the SAME staged build:
+#   build/astra-gi.zip       astra-gi.toml ("any Unreal game") + every file it names
+#   build/astra-gi-gta3.zip  astra-gi-gta3.toml ("GTA III - The Definitive Edition", exe-pinned) + its own
+#                            extra UE4SS_Signatures override (game-signatures/README.md explains why it is a
+#                            SEPARATE, exe-pinned package and not a file in the shared runner's ue4ss-overlay/)
+# from: our build (./build.sh -> build/astra.addon64), shaders/, runners/unreal/ (AstraUE, the UE4SS mod list, the
+# manifests); UE4SS (downloaded, digest-checked), ReShade 6.8.0 Addon + ReShade.fxh (the submodule's fetch_deps.sh).
+# Fills each manifest's @sha256:<path>@ with our files' digests and checks every upstream digest it pins. No
+# ReShade.ini: the add-on sets what her effect needs (src/config_rules.h), and sits beside dxgi.dll where ReShade
+# looks by default.
 set -e
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 TP="$HERE/extern/minecraft-in-death-stranding/third_party"
@@ -55,3 +60,15 @@ cp "$CACHE/ReShade-LICENSE.md" "$OUT/LICENSES/ReShade-BSD-3-Clause.md"
 rm -f "$HERE/build/astra-gi.zip"
 python3 "$HERE/tools/gi-pack.py" "$HERE/runners/unreal/astra-gi.toml" "$OUT" "$HERE/build/astra-gi.zip"
 echo "build/astra-gi.zip  $(du -h "$HERE/build/astra-gi.zip" | cut -f1)"
+
+# the GTA III DE package: a COPY of the same staged tree, plus its own signature override - never added to
+# $OUT itself, so the generic runner's zip never carries a byte keyed to one game's exe.
+OUT_GTA3="$HERE/build/astra-gi-gta3"
+rm -rf "$OUT_GTA3"
+cp -r "$OUT" "$OUT_GTA3"
+mkdir -p "$OUT_GTA3/game-signatures/GTA3-DefinitiveEdition/UE4SS_Signatures"
+cp "$HERE/runners/unreal/game-signatures/GTA3-DefinitiveEdition/UE4SS_Signatures/"*.lua \
+	"$OUT_GTA3/game-signatures/GTA3-DefinitiveEdition/UE4SS_Signatures/"
+rm -f "$HERE/build/astra-gi-gta3.zip"
+python3 "$HERE/tools/gi-pack.py" "$HERE/runners/unreal/astra-gi-gta3.toml" "$OUT_GTA3" "$HERE/build/astra-gi-gta3.zip"
+echo "build/astra-gi-gta3.zip  $(du -h "$HERE/build/astra-gi-gta3.zip" | cut -f1)"

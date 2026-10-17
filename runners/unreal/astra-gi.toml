@@ -13,12 +13,20 @@
 # against its digest at each Play. ReShade's defaults find the add-on (AddonPath defaults to ReShade's own folder,
 # so astra.addon64 sits beside dxgi.dll), and the add-on sets at load what her effect needs and the defaults lack
 # (src/config_rules.h: her shaders' folder in EffectSearchPaths, PresetPath, TutorialProgress), only where missing.
+#
+# This runner's `exe = "*"` means UE4SS's OWN pattern scan has to work unaided - there is no per-game signature
+# override here, and there must never be one added to ue4ss-overlay/: a Lua UE4SS_Signatures/*.lua override
+# REPLACES UE4SS's built-in scan for that symbol outright (it does not fall back if the override's AOB finds
+# nothing - UE4SS/src/Signatures.cpp, "so that the Lua script can perform the aob scan INSTEAD OF the Unreal
+# API itself"), so a GTA-III-specific byte pattern shipped here would break every OTHER Unreal game this runner
+# serves. A game whose scan fails (GTA III DE: see game-signatures/README.md) gets its OWN exe-pinned manifest
+# instead - astra-gi-gta3.toml is the first one.
 schema = 1
 
 [integration]
 id = "astra.unreal"
 name = "Astra for any Unreal Engine game"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["mihailinl"]
 license = "MIT AND BSD-3-Clause AND CC0-1.0" # ours and UE4SS: MIT; ReShade: BSD-3-Clause; ReShade.fxh: CC0-1.0
 repo = "https://github.com/mihailinl/astra-reshade"
