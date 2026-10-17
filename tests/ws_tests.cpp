@@ -6,12 +6,14 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include "wine_test_util.h"
 #include <atomic>
-#include <chrono>
 #include <cstdio>
 #include <string>
 #include <thread>
 #include <vector>
+
+using namespace wine_test;
 
 static int g_failed = 0, g_checks = 0;
 #define CHECK(x)                                                                                                                                     \
@@ -24,36 +26,6 @@ static int g_failed = 0, g_checks = 0;
 			std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #x);                                                                                 \
 		}                                                                                                                                            \
 	} while (0)
-
-using Clock = std::chrono::steady_clock;
-
-static long long ms_since(Clock::time_point t)
-{
-	return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t).count();
-}
-
-/// Runs `f` with a watchdog: true if it returned within `limit_ms`. A call that never returns fails the run here
-/// (the thread cannot be joined: the process ends).
-template <class F>
-static bool within(int limit_ms, const char *what, F &&f)
-{
-	std::atomic<bool> done{false};
-	std::thread t([&] {
-		f();
-		done = true;
-	});
-	const auto t0 = Clock::now();
-	while (!done && ms_since(t0) < limit_ms)
-		Sleep(5);
-	if (!done)
-	{
-		std::printf("FAIL %s: still waiting after %d ms (a wait without a bound) - giving up\n", what, limit_ms);
-		std::fflush(stdout);
-		ExitProcess(1);
-	}
-	t.join();
-	return true;
-}
 
 /// A peer on 127.0.0.1 (a free port). `answer`: complete the WebSocket handshake (else never say anything) and send
 /// one text message; it never reads after that.
@@ -143,14 +115,6 @@ struct Peer
 	}
 };
 
-static bool wait_for(const std::atomic<int> &v, int at_least, int limit_ms)
-{
-	const auto t0 = Clock::now();
-	while (v < at_least && ms_since(t0) < limit_ms)
-		Sleep(5);
-	return v >= at_least;
-}
-
 int main()
 {
 	WSADATA wsa;
@@ -162,7 +126,7 @@ int main()
 		Peer peer(false);
 		WsClient ws;
 		ws.start("127.0.0.1", peer.port);
-		CHECK(wait_for(peer.accepted, 1, 3000));
+		CHECK(wait_for([&] { return peer.accepted.load() >= 1; }, 3000));
 		Sleep(100); // inside the handshake's wait now
 		const auto t0 = Clock::now();
 		within(4000, "stop() during a handshake nobody answers", [&] { ws.stop(); });
@@ -176,9 +140,9 @@ int main()
 		WsClient ws;
 		ws.start("127.0.0.1", peer.port);
 		const auto t0 = Clock::now();
-		CHECK(wait_for(peer.gone, 1, WsClient::kHandshakeMs + 2000));
+		CHECK(wait_for([&] { return peer.gone.load() >= 1; }, WsClient::kHandshakeMs + 2000));
 		const long long gave_up = ms_since(t0);
-		CHECK(wait_for(peer.accepted, 2, 3000));
+		CHECK(wait_for([&] { return peer.accepted.load() >= 2; }, 3000));
 		std::printf("ws: an unanswered handshake given up after %lld ms, tried again\n", gave_up);
 		CHECK(gave_up >= WsClient::kHandshakeMs - 500 && !ws.connected());
 		within(4000, "stop()", [&] { ws.stop(); });

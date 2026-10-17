@@ -9,7 +9,10 @@
 #      ships none (tools/winecheck.sh; skipped without wine or the xwin SDK);
 #   5. the WebSocket client (the link to her engine) against peers that misbehave, built for Windows and run under Wine
 #      (tools/wstest.sh; skipped the same way);
-#   6. the release packer (tools/gi-pack.py) refuses a game file without a digest: Astra's launcher checks every file
+#   6. the link and the provider pipe survive the device they started for being destroyed and a new one taking its
+#      place (a game's device recreate: DS2's start-up reload, alt-tab/fullscreen toggles, a resolution change) -
+#      tools/relinktest.sh, built and skipped the same way as tools/wstest.sh;
+#   7. the release packer (tools/gi-pack.py) refuses a game file without a digest: Astra's launcher checks every file
 #      it placed beside the game's exe against its digest at each Play.
 set -e
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -34,6 +37,7 @@ cp "$HERE/shaders/AstraPassthrough.fx" "$HERE/tests/hooks/AstraGame.fxh" "$OUT/h
 "$HERE/tools/fxcheck.sh" "$OUT/hooks/AstraPassthrough.fx"
 "$HERE/tools/winecheck.sh" "$HERE"/shaders/*.fx "$OUT/hooks/AstraPassthrough.fx"
 "$HERE/tools/wstest.sh"
+"$HERE/tools/relinktest.sh"
 GP="$OUT/gipack"
 rm -rf "$GP" && mkdir -p "$GP/staged" && printf 'x' > "$GP/staged/a.dll"
 printf 'schema = 1\n[[game_files]]\nfrom = "a.dll"\nto = "${game}/a.dll"\n' > "$GP/undigested.toml"
