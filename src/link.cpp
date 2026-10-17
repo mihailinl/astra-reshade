@@ -32,6 +32,7 @@ namespace enginelink
 		bool g_parked = false;          // the socket is stopped until g_backoff says
 		std::thread g_stopper;          // stops it off the present thread (WsClient::stop joins its thread: up to ~0.1 s)
 		std::string g_lastShm;          // the ring the last hello reply named
+		bool g_helloUnanswered = false; // this connection said hello and no reply came (yet)
 		ULONGLONG g_helloLogAt = 0;
 		unsigned g_hellosUnlogged = 0;
 		Outbox g_outbox; // every message goes out through it: a frame never waits for the network
@@ -148,6 +149,7 @@ namespace enginelink
 		/// started again when the back-off ends (2 s, doubling to 30 s).
 		void refused(const std::string &m)
 		{
+			g_helloUnanswered = false;
 			g_backoff.refused(provider::now_ms());
 			logf("link: the engine refused the hello (%.200s): asking again in %lld s", m.c_str(), (long long)(g_backoff.step_ms / 1000));
 			if (g_stopper.joinable())
@@ -184,6 +186,7 @@ namespace enginelink
 			const hello_rules::Reply reply = hello_rules::read_reply(m);
 			g_asked.answered(reply);
 			g_backoff.answered();
+			g_helloUnanswered = false;
 			logf("link: the engine's ring is %dx%d (asked %dx%d%s)", reply.ring.w, reply.ring.h, g_asked.want.w, g_asked.want.h,
 				reply.takes_want ? "" : "; this engine sizes no ring for a game");
 		}
@@ -306,6 +309,13 @@ namespace enginelink
 			g_viewW = picture.w;
 			g_viewH = picture.h;
 		}
+		if (g_ws.generation() != g_generation && g_helloUnanswered)
+		{
+			// the last connection ended with its hello unanswered: a refusing engine closes the socket at once and its
+			// `error` is usually lost with it (live: 1 of ~70 reached the add-on) - a refusal all the same
+			refused("{\"t\":\"closed\",\"msg\":\"the connection ended before the hello was answered\"}");
+			return;
+		}
 		if (g_ws.generation() != g_generation)
 		{
 			// a new connection: say who we are and how large her picture is; her pose follows with the next frame
@@ -313,7 +323,9 @@ namespace enginelink
 			g_answered = false;
 			g_capsLight = g_capsCues = false;
 			g_sentIndex = ~uint64_t(0);
-			if (!say_hello(g_asked.first(picture, now)))
+			if (say_hello(g_asked.first(picture, now)))
+				g_helloUnanswered = true;
+			else
 				g_generation = -1; // not queued: again next frame
 		}
 		else if (g_answered && g_asked.lost(now))

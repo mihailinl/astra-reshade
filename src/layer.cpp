@@ -59,6 +59,9 @@ namespace layer
 		// uploads, for the 30-s line: planes through the staging ring, through ReShade's update_texture_region; the
 		// frame's values uploaded and left as they were
 		unsigned long long g_upStaged = 0, g_upImmediate = 0, g_metaSent = 0, g_metaSame = 0, g_statRuns = 0, g_statPictures = 0;
+		// why a run she is drawn in has no new picture: its camera's picture was waited for in vain (wait_ms), or no camera
+		// of its own was sent (the game presented without a new provider camera)
+		unsigned long long g_statWaitedOut = 0, g_statNoCamera = 0, g_statDrawn = 0;
 		ULONGLONG g_nextStat = 0;
 		uint32_t g_texW = 0, g_texH = 0, g_sunN = 0;
 		std::vector<uint8_t> g_colourCopy, g_depthCopy, g_sunCopy;
@@ -470,10 +473,11 @@ namespace layer
 			if (now < g_nextStat)
 				return;
 			g_nextStat = now + 30000;
-			logf("layer: last 30 s: %llu runs, %llu pictures; planes uploaded %llu from the staging ring, %llu through ReShade's upload; the frame's "
-				 "values uploaded %llu times, unchanged %llu",
-				g_statRuns, g_statPictures, g_upStaged, g_upImmediate, g_metaSent, g_metaSame);
+			logf("layer: last 30 s: %llu runs, %llu with her (%llu new pictures; %llu waited for in vain, %llu without a camera of their own); "
+				 "planes uploaded %llu from the staging ring, %llu through ReShade's upload; the frame's values uploaded %llu times, unchanged %llu",
+				g_statRuns, g_statDrawn, g_statPictures, g_statWaitedOut, g_statNoCamera, g_upStaged, g_upImmediate, g_metaSent, g_metaSame);
 			g_statRuns = g_statPictures = g_upStaged = g_upImmediate = g_metaSent = g_metaSame = 0;
+			g_statWaitedOut = g_statNoCamera = g_statDrawn = 0;
 		}
 
 		/// ASTRAFRAME, made once per device; false: it cannot be made (she is not drawn: the effect reads zeros).
@@ -501,6 +505,7 @@ namespace layer
 		{
 			const unsigned long long want = g_wantFrame;
 			const float budget = g_waitMs;
+			g_statNoCamera += want == 0;
 			if (want == 0 || budget <= 0.0f || g_view == nullptr)
 				return;
 			LARGE_INTEGER f, t0, t;
@@ -514,6 +519,7 @@ namespace layer
 				if (float(t.QuadPart - t0.QuadPart) * 1000.0f / float(f.QuadPart) > budget)
 				{
 					++g_waitTimeouts;
+					++g_statWaitedOut;
 					break;
 				}
 				YieldProcessor();
@@ -549,6 +555,7 @@ namespace layer
 			Fetched next;
 			if (on)
 			{
+				++g_statDrawn;
 				wait_for_frame();
 				fetch(runtime, next);
 			}

@@ -1392,6 +1392,13 @@ static void test_link_backs_off()
 	CHECK(src.find("g_backoff.refused(provider::now_ms());") != std::string::npos && src.find("g_stopper = std::thread([] { g_ws.stop(); });") != std::string::npos);
 	CHECK(src.find("if (!g_backoff.due(now))\n\t\t\t\treturn;") != std::string::npos && src.find("g_backoff.answered();") != std::string::npos);
 	CHECK(src.find("else if (g_answered && g_asked.lost(now))\n\t\t\tmap_again(") != std::string::npos);
+	// ...and a connection that ENDS with its hello unanswered is a refusal too: the refusing engine closes the socket at
+	// once and its error is usually lost with it (live, 2026-10-16: 351 hellos in 10 s through the first version)
+	const size_t closed = src.find("if (g_ws.generation() != g_generation && g_helloUnanswered)");
+	const size_t hello = src.find("if (g_ws.generation() != g_generation)\n");
+	CHECK(closed != std::string::npos && hello != std::string::npos && closed < hello);
+	CHECK(src.find("refused(\"{\\\"t\\\":\\\"closed\\\"", closed) != std::string::npos);
+	CHECK(src.find("if (say_hello(g_asked.first(picture, now)))\n\t\t\t\tg_helloUnanswered = true;") != std::string::npos);
 }
 
 // ---- frame_meta: what the effect reads in step with the frame it draws ----------------------------------------------
