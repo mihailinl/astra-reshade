@@ -1,4 +1,5 @@
 #include "link.h"
+#include "camera_pace.h"
 #include "hello_rules.h"
 #include "layer.h"
 #include "log.h"
@@ -48,7 +49,10 @@ namespace enginelink
 		unsigned long long g_camId = 0;
 		uint64_t g_sentIndex = ~uint64_t(0); // the provider camera last sent (one picture per game camera)
 		ULONGLONG g_nextLight = 0;
-		int g_delay = 1;
+		int g_delay = camera_pace::kDefaultDelay; // the MANUAL pin (ReShade.ini "CameraDelay"), used when auto is off
+		bool g_delayAuto = true;                 // measure camera_delay instead of asking the user to guess it (ReShade.ini "CameraDelayAuto")
+		camera_pace::PushPace g_pace;
+		uint64_t g_lastPushIdx = ~uint64_t(0); // the provider camera ring index last seen, to detect a new push
 		float g_size = 1.0f;
 		bool g_enabled = true;
 		Stats g_stats{};
@@ -260,6 +264,16 @@ namespace enginelink
 		return g_delay;
 	}
 
+	bool &camera_delay_auto()
+	{
+		return g_delayAuto;
+	}
+
+	int camera_delay_effective()
+	{
+		return g_delayAuto ? g_pace.delay() : std::clamp(g_delay, 0, camera_pace::kMaxDelay);
+	}
+
 	float &size()
 	{
 		return g_size;
@@ -288,6 +302,13 @@ namespace enginelink
 		g_stats.provider_fresh = fresh && have_av;
 		g_stats.provider_visible = ps.visible;
 		g_stats.camera_age_ms = have_cam ? now - newest.at_ms : -1;
+		// how many presents pass between distinct provider cameras (camera_pace.h): ticked every presented
+		// frame there is a provider at all, so a game that falls silent does not skew the average
+		if (have_cam)
+		{
+			g_pace.tick(newest.index != g_lastPushIdx);
+			g_lastPushIdx = newest.index;
+		}
 
 		if (!g_opened)
 		{
@@ -451,8 +472,9 @@ namespace enginelink
 		}
 
 		// the camera being PRESENTED: the one the present callback just wrote, else `camera_delay` provider cameras
-		// back (0 = the newest)
-		if (!ps.cameras.get(presented_now ? 0 : uint64_t(std::max(g_delay, 0)), shown))
+		// back (0 = the newest) - MEASURED (camera_pace.h) unless the user pinned a value on the overlay's slider
+		const int delay = g_delayAuto ? g_pace.delay() : std::clamp(g_delay, 0, camera_pace::kMaxDelay);
+		if (!ps.cameras.get(presented_now ? 0 : uint64_t(delay), shown))
 			shown = newest;
 		const float tan_shown = view::tan_half_vertical(shown.fov_deg, shown.fov_horizontal != 0, shown.aspect > 0.0f ? shown.aspect : bb_aspect);
 		view::Pose host;

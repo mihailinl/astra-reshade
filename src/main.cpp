@@ -12,6 +12,7 @@
 #define ImTextureID ImU64
 #include <imgui.h>
 #include <reshade.hpp>
+#include "camera_pace.h"
 #include "config.h"
 #include "config_rules.h"
 #include "guard.h"
@@ -106,7 +107,10 @@ namespace
 	{
 		int delay = enginelink::camera_delay();
 		reshade::get_config_value(nullptr, "ASTRA", "CameraDelay", delay);
-		enginelink::camera_delay() = std::clamp(delay, 0, 3);
+		enginelink::camera_delay() = std::clamp(delay, 0, camera_pace::kMaxDelay);
+		bool delayAuto = enginelink::camera_delay_auto();
+		reshade::get_config_value(nullptr, "ASTRA", "CameraDelayAuto", delayAuto);
+		enginelink::camera_delay_auto() = delayAuto;
 		float wait = layer::wait_ms();
 		reshade::get_config_value(nullptr, "ASTRA", "WaitMs", wait);
 		layer::wait_ms() = std::clamp(wait, 0.0f, 12.0f);
@@ -126,6 +130,7 @@ namespace
 	void save_overlay_settings()
 	{
 		reshade::set_config_value(nullptr, "ASTRA", "CameraDelay", enginelink::camera_delay());
+		reshade::set_config_value(nullptr, "ASTRA", "CameraDelayAuto", enginelink::camera_delay_auto());
 		reshade::set_config_value(nullptr, "ASTRA", "WaitMs", layer::wait_ms());
 		reshade::set_config_value(nullptr, "ASTRA", "Size", enginelink::size());
 		reshade::set_config_value(nullptr, "ASTRA", "Enabled", enginelink::enabled());
@@ -231,11 +236,26 @@ namespace
 			ImGui::TextDisabled("camera: the presented frame's (the provider reads it at presentation)");
 		else
 		{
-			ImGui::SetNextItemWidth(140);
-			changed |= ImGui::SliderInt("camera delay (frames)", &enginelink::camera_delay(), 0, 3);
+			changed |= ImGui::Checkbox("auto delay", &enginelink::camera_delay_auto());
 			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("How many frames the picture on screen is behind the game's newest camera.\n"
-								  "Turn the camera fast: if she slides AHEAD of the turn, raise it; if she lags behind it, lower it.");
+				ImGui::SetTooltip("Measures how many presented frames pass between the provider's cameras (a game whose engine\n"
+								  "ticks slower than it presents, most Unreal games, needs more than one) instead of a fixed guess.");
+			ImGui::SameLine();
+			ImGui::SetNextItemWidth(140);
+			if (enginelink::camera_delay_auto())
+			{
+				int shown = enginelink::camera_delay_effective();
+				ImGui::BeginDisabled();
+				ImGui::SliderInt("camera delay (frames)", &shown, 0, camera_pace::kMaxDelay);
+				ImGui::EndDisabled();
+			}
+			else
+			{
+				changed |= ImGui::SliderInt("camera delay (frames)", &enginelink::camera_delay(), 0, camera_pace::kMaxDelay);
+				if (ImGui::IsItemHovered())
+					ImGui::SetTooltip("How many frames the picture on screen is behind the game's newest camera.\n"
+									  "Turn the camera fast: if she slides AHEAD of the turn, raise it; if she lags behind it, lower it.");
+			}
 		}
 		ImGui::SameLine();
 		ImGui::SetNextItemWidth(140);

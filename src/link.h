@@ -25,8 +25,15 @@ namespace enginelink
 	/// How far she moved (world) since the camera `cam_id` was sent: an older picture of her moves along.
 	bool moved_since(unsigned long long cam_id, double out[3]);
 
-	/// Frames the presented camera lags the provider's newest (the overlay's slider, saved in ReShade.ini).
+	/// Frames the presented camera lags the provider's newest, when camera_delay_auto() is off (the overlay's
+	/// slider, saved in ReShade.ini); ignored while auto is on.
 	int &camera_delay();
+	/// Measure the delay (camera_pace.h) instead of asking the user to find it by hand (the overlay's checkbox,
+	/// saved in ReShade.ini; default on).
+	bool &camera_delay_auto();
+	/// The delay actually in use this frame - camera_delay() while auto is off, the measured value while it is
+	/// on (for the overlay to show what auto chose).
+	int camera_delay_effective();
 	/// Her size on top of the provider's (the overlay's slider).
 	float &size();
 	/// Show her at all (the overlay's checkbox).

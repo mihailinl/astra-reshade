@@ -1,5 +1,6 @@
 // Native tests of the add-on's portable core: the pipe's line protocol, the provider's seqlocked state, the
 // camera math and the frame-ring reader (crop included). Run: tests/run.sh (any Linux/macOS clang++ or g++).
+#include "camera_pace.h"
 #include "config_rules.h"
 #include "frame_meta.h"
 #include "hello_rules.h"
@@ -415,6 +416,68 @@ static bool tearing_copy(void *d, const void *s, size_t n)
 static bool faulting_copy(void *, const void *, size_t)
 {
 	return false;
+}
+
+/// camera_pace::PushPace: the measured camera_delay (anchor-lane, 2026-10-19 - "she slides with yaw, floats
+/// with pitch" in GTA III DE / Mecha Chameleon). The owner's own live evidence (819 of 2777 presented frames
+/// had no fresh provider camera of their own) and a live Scarlet Skips capture test (idle ~14%, and the SAME
+/// ~100 ms settled reprojection error measured at the old camera_delay 1 AND its old ceiling 3) both point the
+/// same way: a fixed one-frame guess, capped at three, cannot track a provider that ticks slower than the game
+/// presents - which is the common case for Unreal (UE4SS fires once per engine tick). PushPace measures the
+/// real gap instead of asking the user to find it on the overlay's slider.
+static void test_camera_pace()
+{
+	// never ticked: the untouched default is the OLD fixed value, so a provider nobody has measured yet (or
+	// one with no camera at all) behaves exactly as it did before this existed
+	CHECK(camera_pace::PushPace{}.delay() == camera_pace::kDefaultDelay);
+
+	// a push every single presented frame (today's easy case, e.g. the provider's own present callback path,
+	// or a game whose engine tick keeps up with its presents): settles AT the old default, so an already
+	// well-served game sees no change
+	{
+		camera_pace::PushPace p;
+		for (int i = 0; i < 200; ++i)
+			p.tick(true);
+		CHECK(p.delay() == 1);
+	}
+	// a push every 4th presented frame (an engine ticking a quarter as often as the game presents - ordinary
+	// for Unreal): the OLD code could not express this at all (hard-capped at 3); PushPace measures it
+	{
+		camera_pace::PushPace p;
+		for (int i = 0; i < 400; ++i)
+			p.tick(i % 4 == 3);
+		CHECK(p.delay() == 4);
+	}
+	// a push every 20th frame (far worse than the old ceiling of 3): clamps to kMaxDelay, never runs away
+	{
+		camera_pace::PushPace p;
+		for (int i = 0; i < 2000; ++i)
+			p.tick(i % 20 == 19);
+		CHECK(p.delay() == camera_pace::kMaxDelay);
+	}
+	// mutation rule, confirmed RED against the OLD fixed-default/fixed-ceiling behaviour this replaces: a
+	// provider ticking once every 4 presents must settle on a DIFFERENT delay than one ticking every present -
+	// the old code (always camera_delay()==1, hard-clamped 0..3) answers both the same way
+	{
+		camera_pace::PushPace steady, slow;
+		for (int i = 0; i < 400; ++i)
+		{
+			steady.tick(true);
+			slow.tick(i % 4 == 3);
+		}
+		CHECK(steady.delay() != slow.delay());
+	}
+	// recovers when the provider speeds back up (a framerate change, a level load settling): the average is
+	// not stuck at its worst-ever value
+	{
+		camera_pace::PushPace p;
+		for (int i = 0; i < 2000; ++i)
+			p.tick(i % 20 == 19);
+		CHECK(p.delay() == camera_pace::kMaxDelay);
+		for (int i = 0; i < 400; ++i)
+			p.tick(true);
+		CHECK(p.delay() == 1);
+	}
 }
 
 static void test_ring()
@@ -1704,6 +1767,7 @@ int main(int argc, char **argv)
 	test_lines();
 	test_provider();
 	test_view();
+	test_camera_pace();
 	test_ring();
 	test_passfind();
 	test_pretone_rules();
