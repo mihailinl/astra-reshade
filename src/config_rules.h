@@ -2,6 +2,9 @@
 // The add-on's settings rules, portable (no ReShade, no Windows): tests/core_tests.cpp runs them.
 //   option_value()   -AstraConfig <ini> (or -AstraConfig=<ini>) on the game's command line: how Astra's launcher points
 //                    the add-on at the ini it writes into its own profile for this game ([bridge] Port= / Token=)
+//   steam_app_id()   SteamAppId / SteamGameId, as Steam gives them to the game's own process (inherited by every
+//                    child, even one started by a launcher that drops OUR argv) - picks the appid out of either
+//   steam_profile_ini()   the SAME ini, found without ANY argv: <astra games root>/<appid>/astra-reshade.ini
 //   pick_bridge()    where the engine's port and token come from: the first source that is there decides both
 //   clean_token()    a token as the engine's JSON can carry it
 //   add_search_path() / kSeeds   the keys of ReShade's own ReShade.ini her effect needs and ReShade's defaults lack,
@@ -100,6 +103,58 @@ namespace config_rules
 			return line.substr(v, end - v);
 		}
 		return std::wstring();
+	}
+
+	/// Steam gives the game's own process its appid as `SteamAppId` (plain digits) or `SteamGameId` (digits,
+	/// optionally `_<modid>`-suffixed for workshop content) - inherited by every child of that process, even one a
+	/// launcher starts without forwarding OUR OWN argv (Poppy Playtime's PlaytimeLauncher does exactly that, which
+	/// is why this exists: UE4SS's proxy then finds no `-AstraConfig`, but SteamAppId still reaches it). The first
+	/// one present and parseable wins; "" when neither is.
+	inline std::wstring steam_app_id(const std::wstring &steam_app_id_env, const std::wstring &steam_game_id_env)
+	{
+		const auto digits_prefix = [](const std::wstring &s) -> std::wstring
+		{
+			size_t n = 0;
+			while (n < s.size() && s[n] >= L'0' && s[n] <= L'9')
+				++n;
+			return n > 0 && (n == s.size() || s[n] == L'_') ? s.substr(0, n) : std::wstring();
+		};
+		const std::wstring a = digits_prefix(steam_app_id_env);
+		return !a.empty() ? a : digits_prefix(steam_game_id_env);
+	}
+
+	inline std::wstring no_trailing_slash(std::wstring s, wchar_t slash)
+	{
+		while (!s.empty() && s.back() == slash)
+			s.pop_back();
+		return s;
+	}
+
+	/// Astra's launcher profile ini for this game, found with NO argv at all:
+	/// `<astra games root>/<app_id>/astra-reshade.ini`. `app_id` is `steam_app_id()`'s result; "" (no SteamAppId)
+	/// means no path. `is_wine` says this process is Proton/Wine (config.cpp: ntdll's `wine_get_version` export, or
+	/// `STEAM_COMPAT_DATA_PATH` set) - then the root is the LINUX one Astra's own daemon writes to (Wine imports
+	/// the Unix env into `GetEnvironmentVariableW`): `$XDG_DATA_HOME/astra/games`, or else
+	/// `$HOME/.local/share/astra/games`, opened through `Z:`. Native Windows: `%APPDATA%\astra\astra\data\games`
+	/// (ROAMING AppData - `directories`' `ProjectDirs::from("com","astra","astra")`; NEVER %LOCALAPPDATA%). ""
+	/// when `app_id` is empty, or the one env piece the matching branch needs (home/xdg under Wine, appdata
+	/// natively) is missing too.
+	inline std::wstring steam_profile_ini(bool is_wine, const std::wstring &app_id, const std::wstring &home,
+		const std::wstring &xdg_data_home, const std::wstring &appdata)
+	{
+		if (app_id.empty())
+			return std::wstring();
+		if (is_wine)
+		{
+			const std::wstring base = !xdg_data_home.empty() ? xdg_data_home
+				: (!home.empty() ? no_trailing_slash(home, L'/') + L"/.local/share" : std::wstring());
+			if (base.empty())
+				return std::wstring();
+			return L"Z:" + no_trailing_slash(base, L'/') + L"/astra/games/" + app_id + L"/astra-reshade.ini";
+		}
+		if (appdata.empty())
+			return std::wstring();
+		return no_trailing_slash(appdata, L'\\') + L"\\astra\\astra\\data\\games\\" + app_id + L"\\astra-reshade.ini";
 	}
 
 	/// A token is sent inside JSON: keep it to what a token is (printable ASCII, no quotes or backslashes, <= 256).

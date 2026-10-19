@@ -1611,6 +1611,38 @@ static void test_config_rules()
 	CHECK(option_value(L"x.exe --ue4ss-path C:\\-AstraConfig\\u.dll", k).empty());
 	CHECK(option_value(L"x.exe -AstraConfig C:\\1.ini -AstraConfig C:\\2.ini", k) == L"C:\\1.ini");
 
+	// steam_app_id(): SteamAppId wins over SteamGameId; a `_<modid>` suffix is stripped; non-digits mean absent
+	using config_rules::steam_app_id;
+	CHECK(steam_app_id(L"1721470", L"") == L"1721470");
+	CHECK(steam_app_id(L"1721470", L"1546970") == L"1721470"); // SteamAppId wins when both are set
+	CHECK(steam_app_id(L"", L"1546970") == L"1546970");
+	CHECK(steam_app_id(L"", L"1546970_4000") == L"1546970"); // workshop content: strip the `_<modid>` suffix
+	CHECK(steam_app_id(L"", L"").empty());                   // neither set: no SteamAppId at all
+	CHECK(steam_app_id(L"abc", L"1546970") == L"1546970");    // SteamAppId present but not digits: skip it
+	CHECK(steam_app_id(L"172x", L"").empty());
+	CHECK(steam_app_id(L"17214700", L"").size() == 8);        // no digit limit (unlike parse_port)
+
+	// steam_profile_ini(): <astra games root>/<appid>/astra-reshade.ini, with no argv at all
+	using config_rules::steam_profile_ini;
+	const wchar_t *id = L"1721470";
+	// native Windows: %APPDATA%\astra\astra\data\games\<appid>\astra-reshade.ini (ROAMING, never %LOCALAPPDATA%)
+	CHECK(steam_profile_ini(false, id, L"", L"", L"C:\\Users\\A\\AppData\\Roaming") ==
+		L"C:\\Users\\A\\AppData\\Roaming\\astra\\astra\\data\\games\\1721470\\astra-reshade.ini");
+	CHECK(steam_profile_ini(false, id, L"", L"", L"C:\\Users\\A\\AppData\\Roaming\\") == // a trailing backslash: no double one
+		L"C:\\Users\\A\\AppData\\Roaming\\astra\\astra\\data\\games\\1721470\\astra-reshade.ini");
+	CHECK(steam_profile_ini(false, id, L"/home/a", L"/home/a/.local/share", L"").empty()); // native but no %APPDATA%: no path
+	// Proton/Wine: Z: + $XDG_DATA_HOME/astra/games/<appid>, when set
+	CHECK(steam_profile_ini(true, id, L"/home/a", L"/home/a/.local/share", L"") == L"Z:/home/a/.local/share/astra/games/1721470/astra-reshade.ini");
+	CHECK(steam_profile_ini(true, id, L"/home/a", L"/home/a/.local/share/", L"") == // a trailing slash: no double one
+		L"Z:/home/a/.local/share/astra/games/1721470/astra-reshade.ini");
+	// Proton/Wine, no XDG_DATA_HOME: built from $HOME + /.local/share
+	CHECK(steam_profile_ini(true, id, L"/home/a", L"", L"") == L"Z:/home/a/.local/share/astra/games/1721470/astra-reshade.ini");
+	CHECK(steam_profile_ini(true, id, L"/home/a/", L"", L"") == L"Z:/home/a/.local/share/astra/games/1721470/astra-reshade.ini");
+	CHECK(steam_profile_ini(true, id, L"", L"", L"C:\\Users\\A\\AppData\\Roaming").empty()); // Wine: %APPDATA% is never asked
+	CHECK(steam_profile_ini(true, id, L"", L"", L"").empty());                               // Wine, neither HOME nor XDG_DATA_HOME
+	CHECK(steam_profile_ini(false, L"", L"/home/a", L"", L"C:\\Users\\A\\AppData\\Roaming").empty()); // a missing SteamAppId: no path, on either OS
+	CHECK(steam_profile_ini(true, L"", L"/home/a", L"", L"").empty());
+
 	// the port and token: the first source present decides BOTH, never a mix
 	using config_rules::BridgeSource;
 	const auto src = [](const wchar_t *name, bool present, const wchar_t *port, const wchar_t *token) {
@@ -1621,6 +1653,14 @@ static void test_config_rules()
 	config_rules::Bridge b = config_rules::pick_bridge({ src(L"Z:\\p\\a.ini", true, L"25601", L"tok-1"), src(L"environment", true, L"9", L"env"),
 		src(L"ReShade.ini [ASTRA]", true, L"7", L"old") });
 	CHECK(b.port == 25601 && b.token == "tok-1" && b.source == L"Z:\\p\\a.ini");
+	// every rung of config.cpp's real 4-source chain: -AstraConfig, the SteamAppId-found profile ini, the
+	// environment, ReShade.ini [ASTRA] - each rung wins when the ones above it are absent, never a mix
+	b = config_rules::pick_bridge({ src(L"Z:\\p\\a.ini", false, L"", L""), src(L"Z:\\games\\1721470\\astra-reshade.ini", true, L"25610", L"tok-profile"),
+		src(L"environment", true, L"25611", L"tok-env"), src(L"ReShade.ini [ASTRA]", true, L"25612", L"tok-rs") });
+	CHECK(b.port == 25610 && b.token == "tok-profile" && b.source == L"Z:\\games\\1721470\\astra-reshade.ini");
+	b = config_rules::pick_bridge({ src(L"Z:\\p\\a.ini", false, L"", L""), src(L"profile (no SteamAppId)", false, L"", L""),
+		src(L"environment", true, L"25611", L"tok-env"), src(L"ReShade.ini [ASTRA]", true, L"25612", L"tok-rs") });
+	CHECK(b.port == 25611 && b.token == "tok-env" && b.source == L"environment");
 	b = config_rules::pick_bridge({ src(L"Z:\\p\\a.ini", true, L" 25602 ", L""), src(L"ReShade.ini [ASTRA]", true, L"7", L"old") });
 	CHECK(b.port == 25602 && b.token.empty()); // the launcher's empty token lets no stale one through
 	b = config_rules::pick_bridge({ src(L"Z:\\p\\a.ini", false, L"", L""), src(L"environment", false, L"", L""),
