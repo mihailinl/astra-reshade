@@ -81,10 +81,16 @@ namespace config
 		set = false;
 		const std::wstring steam_game_id_env = env_value(L"SteamGameId", set);
 		const std::wstring app_id = config_rules::steam_app_id(steam_app_id_env, steam_game_id_env);
+		// Wine does NOT import HOME/XDG_DATA_HOME into the Windows env it gives this process (confirmed empirically,
+		// `wine cmd /c set` under proton-cachyos-slr: neither appears, even set explicitly right before exec'ing
+		// wine) - it deliberately clears a list of Unix-looking names so Windows programs never see a Unix-style
+		// value under a familiar name. What it DOES do (built into ntdll, so present on any Wine carrying this
+		// ntdll - confirmed the same way) is re-expose the ones it had under WINE_HOST_<NAME>: WINE_HOST_HOME,
+		// WINE_HOST_XDG_DATA_HOME (present only when XDG_DATA_HOME was set upstream, same as the Unix side).
 		set = false;
-		const std::wstring home = env_value(L"HOME", set);
+		const std::wstring home = env_value(L"WINE_HOST_HOME", set);
 		set = false;
-		const std::wstring xdg_data_home = env_value(L"XDG_DATA_HOME", set);
+		const std::wstring xdg_data_home = env_value(L"WINE_HOST_XDG_DATA_HOME", set);
 		set = false;
 		const std::wstring appdata = env_value(L"APPDATA", set);
 		const std::wstring profile_ini = config_rules::steam_profile_ini(running_under_wine(), app_id, home, xdg_data_home, appdata);

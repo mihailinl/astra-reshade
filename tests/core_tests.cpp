@@ -1631,15 +1631,16 @@ static void test_config_rules()
 	CHECK(steam_profile_ini(false, id, L"", L"", L"C:\\Users\\A\\AppData\\Roaming\\") == // a trailing backslash: no double one
 		L"C:\\Users\\A\\AppData\\Roaming\\astra\\astra\\data\\games\\1721470\\astra-reshade.ini");
 	CHECK(steam_profile_ini(false, id, L"/home/a", L"/home/a/.local/share", L"").empty()); // native but no %APPDATA%: no path
-	// Proton/Wine: Z: + $XDG_DATA_HOME/astra/games/<appid>, when set
+	// Proton/Wine: Z: + WINE_HOST_XDG_DATA_HOME/astra/games/<appid>, when set (NOT $XDG_DATA_HOME itself - Wine
+	// clears that from the Windows env; config.cpp reads the WINE_HOST_ name instead, confirmed live)
 	CHECK(steam_profile_ini(true, id, L"/home/a", L"/home/a/.local/share", L"") == L"Z:/home/a/.local/share/astra/games/1721470/astra-reshade.ini");
 	CHECK(steam_profile_ini(true, id, L"/home/a", L"/home/a/.local/share/", L"") == // a trailing slash: no double one
 		L"Z:/home/a/.local/share/astra/games/1721470/astra-reshade.ini");
-	// Proton/Wine, no XDG_DATA_HOME: built from $HOME + /.local/share
+	// Proton/Wine, no WINE_HOST_XDG_DATA_HOME: built from WINE_HOST_HOME + /.local/share
 	CHECK(steam_profile_ini(true, id, L"/home/a", L"", L"") == L"Z:/home/a/.local/share/astra/games/1721470/astra-reshade.ini");
 	CHECK(steam_profile_ini(true, id, L"/home/a/", L"", L"") == L"Z:/home/a/.local/share/astra/games/1721470/astra-reshade.ini");
 	CHECK(steam_profile_ini(true, id, L"", L"", L"C:\\Users\\A\\AppData\\Roaming").empty()); // Wine: %APPDATA% is never asked
-	CHECK(steam_profile_ini(true, id, L"", L"", L"").empty());                               // Wine, neither HOME nor XDG_DATA_HOME
+	CHECK(steam_profile_ini(true, id, L"", L"", L"").empty());                               // Wine, neither WINE_HOST_HOME nor _XDG_DATA_HOME
 	CHECK(steam_profile_ini(false, L"", L"/home/a", L"", L"C:\\Users\\A\\AppData\\Roaming").empty()); // a missing SteamAppId: no path, on either OS
 	CHECK(steam_profile_ini(true, L"", L"/home/a", L"", L"").empty());
 

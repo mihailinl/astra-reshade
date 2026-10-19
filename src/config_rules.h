@@ -133,12 +133,15 @@ namespace config_rules
 	/// Astra's launcher profile ini for this game, found with NO argv at all:
 	/// `<astra games root>/<app_id>/astra-reshade.ini`. `app_id` is `steam_app_id()`'s result; "" (no SteamAppId)
 	/// means no path. `is_wine` says this process is Proton/Wine (config.cpp: ntdll's `wine_get_version` export, or
-	/// `STEAM_COMPAT_DATA_PATH` set) - then the root is the LINUX one Astra's own daemon writes to (Wine imports
-	/// the Unix env into `GetEnvironmentVariableW`): `$XDG_DATA_HOME/astra/games`, or else
-	/// `$HOME/.local/share/astra/games`, opened through `Z:`. Native Windows: `%APPDATA%\astra\astra\data\games`
-	/// (ROAMING AppData - `directories`' `ProjectDirs::from("com","astra","astra")`; NEVER %LOCALAPPDATA%). ""
-	/// when `app_id` is empty, or the one env piece the matching branch needs (home/xdg under Wine, appdata
-	/// natively) is missing too.
+	/// `STEAM_COMPAT_DATA_PATH` set) - then the root is the LINUX one Astra's own daemon writes to: `home` and
+	/// `xdg_data_home` are NOT `$HOME`/`$XDG_DATA_HOME` (Wine clears those from the Windows env this process gets -
+	/// confirmed live, `wine cmd /c set` shows neither even when both are exported right before exec'ing wine) but
+	/// `WINE_HOST_HOME` / `WINE_HOST_XDG_DATA_HOME`, which ntdll re-exposes instead (present the same way its Unix
+	/// twin would be: `WINE_HOST_XDG_DATA_HOME` only when `$XDG_DATA_HOME` was set upstream). The root is
+	/// `xdg_data_home/astra/games`, or else `home/.local/share/astra/games`, opened through `Z:`. Native Windows:
+	/// `%APPDATA%\astra\astra\data\games` (ROAMING AppData - `directories`' `ProjectDirs::from("com","astra",
+	/// "astra")`; NEVER %LOCALAPPDATA%). "" when `app_id` is empty, or the one env piece the matching branch needs
+	/// (home/xdg under Wine, appdata natively) is missing too.
 	inline std::wstring steam_profile_ini(bool is_wine, const std::wstring &app_id, const std::wstring &home,
 		const std::wstring &xdg_data_home, const std::wstring &appdata)
 	{

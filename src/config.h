@@ -10,8 +10,9 @@
 //      failure this rung exists for: Poppy Playtime's PlaytimeLauncher does exactly that). The games root: native
 //      Windows %APPDATA%\astra\astra\data\games (ROAMING, never %LOCALAPPDATA%); under Proton/Wine (detected in
 //      config.cpp: ntdll's wine_get_version export, or STEAM_COMPAT_DATA_PATH set) the LINUX root Astra's daemon
-//      writes to, $XDG_DATA_HOME/astra/games or $HOME/.local/share/astra/games (Wine imports the Unix env),
-//      opened through Z:;
+//      writes to, from WINE_HOST_XDG_DATA_HOME/astra/games or WINE_HOST_HOME/.local/share/astra/games - NOT
+//      XDG_DATA_HOME/HOME themselves: Wine clears those from the Windows env it gives this process (confirmed
+//      live under proton-cachyos-slr) and re-exposes them under the WINE_HOST_ names instead - opened through Z:;
 //   3. the environment: ASTRA_BRIDGE_PORT, ASTRA_BRIDGE_TOKEN (a hand-made launch option);
 //   4. ReShade.ini's [ASTRA] Port= / Token=;
 //   5. port 25600, no token.
