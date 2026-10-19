@@ -259,6 +259,7 @@ local kismet = nil
 local NO_COLOR = { R = 0, G = 0, B = 0, A = 0 }
 local trace_broken = false
 local sun = { comp = nil, find_at = -1e9, sent_at = -1e9, said = nil, visible = 1 }
+local last_cam_pos = nil -- her camera-only fallback's velocity (no actor at all: GTA DE's Gameface, see player_actor)
 
 local function log(fmtstr, ...)
     print(string.format("[AstraUE] " .. fmtstr .. "\n", ...))
@@ -297,6 +298,51 @@ end
 
 local function valid(o)
     return o ~= nil and o:IsValid()
+end
+
+--- An object's class + path (UE4SS's GetFullName), defensively - for the diagnostics below. "none" for
+--- nil/invalid, "?" when the read itself fails (an engine too old/new for GetFullName on this class).
+local function class_name(o)
+    if not valid(o) then return "none" end
+    local ok, name = pcall(function() return o:GetFullName() end)
+    return ok and name or "?"
+end
+
+--- Logs WHY no camera is being sent, at most once per 10 s: what the owner's next run needs to show us.
+local no_cam = { logged_at = -1e9 }
+local function log_no_camera(now, reason, pawn, vt)
+    if now - no_cam.logged_at < 10 then return end
+    no_cam.logged_at = now
+    log("no camera sent (%s): pc.Pawn %s  view target %s", reason, class_name(pawn), class_name(vt))
+end
+
+--- The actor to read her follow-target from: the Pawn if valid; else the controller's view target (GTA DE's
+--- Gameface, and any game whose player logic never possesses a UE Pawn, still points the camera somewhere -
+--- its target is the closest thing to "where the player is"), when that is a valid actor other than the
+--- camera manager itself. nil: no actor at all - she is then placed relative to the camera alone (below).
+--- The second return is the view target found (or nil), for the diagnostics above - read only when there is
+--- no Pawn, so a game that does possess one never pays for the extra calls.
+local function player_actor(pc, pcm, pawn)
+    if valid(pawn) then return pawn, nil end
+    local ok, vt = pcall(function() return pc:GetViewTarget() end)
+    if not (ok and valid(vt)) then ok, vt = pcall(function() return pcm.ViewTarget.Target end) end
+    vt = (ok and valid(vt)) and vt or nil
+    if vt ~= nil and vt ~= pcm then return vt, vt end
+    return nil, vt
+end
+
+--- An actor's location, rotation, velocity: K2_GetActorLocation/K2_GetActorRotation/GetVelocity are
+--- blueprint-callable on every AActor, but defensively - a view target standing in for a missing Pawn may be
+--- a class that does not answer one of them the way a Character does. nil: the actor stopped answering even
+--- its location (gone mid-frame); the caller falls through to the camera-only placement.
+local function actor_state(actor)
+    local ok, at = pcall(function() return actor:K2_GetActorLocation() end)
+    if not (ok and at) then return nil end
+    local rok, prot = pcall(function() return actor:K2_GetActorRotation() end)
+    local vok, vel = pcall(function() return actor:GetVelocity() end)
+    local falling = false
+    pcall(function() falling = actor.CharacterMovement:IsFalling() end)
+    return at, (rok and prot) or { Pitch = 0, Yaw = 0, Roll = 0 }, (vok and vel) or { X = 0, Y = 0, Z = 0 }, falling
 end
 
 --- Values that change rarely, read once a second: the camera's near plane and fov axis, the pawn's capsule.
@@ -458,22 +504,59 @@ local function tick()
         pc = UEHelpers.GetPlayerController()
         if valid(pc) then log("player controller: %s", pc:GetFullName()) end
     end
-    if not valid(pc) then send("V 0\n") return end
-    local pcm, pawn = pc.PlayerCameraManager, pc.Pawn
-    if not valid(pcm) or not valid(pawn) then send("V 0\n") return end
+    if not valid(pc) then
+        log_no_camera(now, "no pc", nil, nil)
+        send("V 0\n")
+        return
+    end
+    local pcm = pc.PlayerCameraManager
+    if not valid(pcm) then
+        log_no_camera(now, "no pcm", pc.Pawn, nil)
+        send("V 0\n")
+        return
+    end
+    if not cache.said_pcm then
+        cache.said_pcm = true
+        log("camera manager: %s", class_name(pcm))
+    end
+    local pawn = pc.Pawn
+    -- her follow-target: the Pawn, else the view target (GTA DE's Gameface never possesses one) - never a
+    -- reason to withhold the camera: a camera manager alone is enough to keep her on screen
+    local actor, vt = player_actor(pc, pcm, pawn)
     refresh_cache(now, pcm, pawn)
-    if paused(now) then send("V 0\n") return end
+    if paused(now) then
+        log_no_camera(now, "paused", pawn, vt)
+        send("V 0\n")
+        return
+    end
 
     local loc, rot, fov = pcm:GetCameraLocation(), pcm:GetCameraRotation(), pcm:GetFOVAngle()
-    local at, prot, vel = pawn:K2_GetActorLocation(), pawn:K2_GetActorRotation(), pawn:GetVelocity()
-    local falling = false
-    pcall(function() falling = pawn.CharacterMovement:IsFalling() end)
     local dt = last_clock and math.min(math.max(now - last_clock, 0), 0.1) or 0
     last_clock = now
-    M.follow(her, { x = at.X, y = at.Y, z = at.Z - (cache.half_height or 0), yaw = prot.Yaw, vx = vel.X, vy = vel.Y, falling = falling }, dt, now,
-        trace_down(pawn))
+
+    local source, p, tracer_actor
+    if actor ~= nil then
+        local at, prot, vel, falling = actor_state(actor)
+        if at ~= nil then
+            p = { x = at.X, y = at.Y, z = at.Z - (cache.half_height or 0), yaw = prot.Yaw, vx = vel.X, vy = vel.Y, falling = falling }
+            source, tracer_actor = (actor == pawn and "pawn" or "view target"), actor
+        else
+            actor = nil -- stopped answering mid-frame (gone): fall through to the camera-only placement
+        end
+    end
+    if actor == nil then
+        -- no actor for the player at all: place her relative to the camera - her spot (M.follow's BACK/SIDE,
+        -- the same fixed distance a Pawn gets) is now behind-and-beside the camera, ground traced from it.
+        -- Her velocity: the camera's own frame-to-frame movement (there is no actor to read one from).
+        local vx, vy = 0, 0
+        if last_cam_pos and dt > 0 then vx, vy = (loc.X - last_cam_pos.X) / dt, (loc.Y - last_cam_pos.Y) / dt end
+        last_cam_pos = { X = loc.X, Y = loc.Y }
+        p = { x = loc.X, y = loc.Y, z = loc.Z, yaw = rot.Yaw, vx = vx, vy = vy, falling = false }
+        source, tracer_actor = "camera", pcm
+    end
+    M.follow(her, p, dt, now, trace_down(tracer_actor))
     -- her placement first, the camera last (the engine draws when the camera comes)
-    if send("V 1\n" .. sun_line(now, pawn) .. M.avatar_line(her) .. M.camera_line(frame, loc, rot, fov, cache.horizontal, cache.aspect, cache.near)) then
+    if send("V 1\n" .. sun_line(now, tracer_actor) .. M.avatar_line(her) .. M.camera_line(frame, loc, rot, fov, cache.horizontal, cache.aspect, cache.near)) then
         stats.sent = stats.sent + 1
     end
     stats.frames = stats.frames + 1
@@ -481,9 +564,9 @@ local function tick()
     if now - stats.logged_at >= 10 then
         stats.logged_at = now
         local t = her.trace or {}
-        log("frame %d  camera %.0f %.0f %.0f  pitch %.1f yaw %.1f roll %.1f  fov %.1f%s  player %.0f %.0f %.0f%s  her %.0f %.0f %.0f  ground %s (%d traces, %d missed)  %.3f ms/frame",
-            frame, loc.X, loc.Y, loc.Z, rot.Pitch, rot.Yaw, rot.Roll, fov, cache.horizontal and "h" or "v", at.X, at.Y, at.Z,
-            falling and " (falling)" or "", her.x, her.y, her.z, t.z ~= nil and string.format("%.0f", t.z) or "the player's", t.traces or 0,
+        log("frame %d  camera %.0f %.0f %.0f  pitch %.1f yaw %.1f roll %.1f  fov %.1f%s  %s %.0f %.0f %.0f%s  her %.0f %.0f %.0f  ground %s (%d traces, %d missed)  %.3f ms/frame",
+            frame, loc.X, loc.Y, loc.Z, rot.Pitch, rot.Yaw, rot.Roll, fov, cache.horizontal and "h" or "v", source, p.x, p.y, p.z,
+            p.falling and " (falling)" or "", her.x, her.y, her.z, t.z ~= nil and string.format("%.0f", t.z) or "the player's", t.traces or 0,
             t.misses or 0, stats.frames > 0 and stats.cost * 1000 / stats.frames or 0)
         stats.frames, stats.cost = 0, 0
     end

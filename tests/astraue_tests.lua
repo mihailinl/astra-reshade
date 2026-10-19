@@ -254,13 +254,18 @@ end
 
 -------------------------------------------------------------------------------- a stub of UE4SS and a game
 --- A fake game: a PlayerController with its camera manager and pawn, UE4SS's helpers and kismet library.
-function make_world()
-    local w = { frame = 1000 }
+--- opts.no_pawn: pc.Pawn is nil (GTA DE's Gameface - no Pawn/Possess at all); w.view_target (settable after
+--- the call, read live by pc:GetViewTarget()) stands in for the controller's view target, nil meaning none.
+--- opts.no_pcm: pc.PlayerCameraManager is nil too (no camera at all).
+function make_world(opts)
+    opts = opts or {}
+    local w = { frame = 1000, view_target = opts.view_target }
     local function object(t)
         t.IsValid = function() return true end
         t.GetFullName = function() return "BP_PlayerController_C /Game/Test" end
         return t
     end
+    w.object = object -- exposed so a test can build its own actors (a view target) the same way
     w.traces = 0
     local kismet = object({
         GetFrameCount = function() return w.frame end,
@@ -296,8 +301,11 @@ function make_world()
     local pc
     local function make_pc()
         local level = w.level
-        pc = object({ PlayerCameraManager = pcm, Pawn = pawn, Player = { AspectRatioAxisConstraint = 1 } })
+        pc = object({ Player = { AspectRatioAxisConstraint = 1 } })
+        if not opts.no_pcm then pc.PlayerCameraManager = pcm end
+        if not opts.no_pawn then pc.Pawn = pawn end
         pc.IsValid = function() return w.level == level end
+        pc.GetViewTarget = function() return w.view_target end
         return pc
     end
     make_pc()
@@ -599,6 +607,136 @@ do
     for _, s in ipairs(logs) do if s:find("[AstraUE] frame", 1, true) and s:find("camera 700 1800 260", 1, true) then logged = true end end
     check(logged, "without the add-on it still logs the camera it reads")
     for _, s in ipairs(logs) do if s:find("error", 1, true) then check(false, "no errors without the add-on: " .. s) end end
+end
+
+-------------------------------------------------------------------------------- no Pawn (GTA DE's Gameface): the view target
+do
+    local written, logs = {}, {}
+    local fake_pipe = { write = function(self, s) written[#written + 1] = s return self end, setvbuf = function() end, close = function() end }
+    local real_open, real_clock, real_print = io.open, os.clock, print
+    io.open = function(name, mode)
+        if name == M.PIPE then return fake_pipe end
+        return real_open(name, mode)
+    end
+    local clock = 300.0
+    os.clock = function() return clock end
+    print = function(s) logs[#logs + 1] = s end
+    local world = make_world({ no_pawn = true })
+    local loop
+    LoopInGameThreadAfterFrames = function(_, fn) loop = fn end
+    dofile(path)
+    world.view_target = world.object({
+        K2_GetActorLocation = function() return { X = 500, Y = -200, Z = 90 } end,
+        K2_GetActorRotation = function() return { Pitch = 0, Yaw = 180, Roll = 0 } end,
+        GetVelocity = function() return { X = 0, Y = 0, Z = 0 } end,
+    })
+    world.view_target.GetFullName = function() return "BP_GTAViewTarget_C /Game/GTA3" end -- object() sets a default; override after
+    for i = 1, 30 do
+        world.frame = 6000 + i
+        clock = clock + 1 / 60
+        loop()
+    end
+    local cams, avatars = 0, 0
+    for l in table.concat(written):gmatch("[^\n]+") do
+        if l:sub(1, 2) == "C " then cams = cams + 1 end
+        if l:sub(1, 2) == "A " then avatars = avatars + 1 end
+    end
+    check(cams == 30 and avatars == 30, "no Pawn, a view target: a camera and her placement every frame regardless (" .. cams .. ", " .. avatars .. ")")
+    local c = table.concat(written):match(".*(C [^\n]+)")
+    local cf = {}
+    for w2 in c:gmatch("%S+") do cf[#cf + 1] = w2 end
+    check(near(tonumber(cf[3]), 7.0) and near(tonumber(cf[4]), 2.6) and near(tonumber(cf[5]), 18.0),
+        "no Pawn: the camera itself (pcm) is unaffected, still sent (" .. c .. ")")
+    local a = table.concat(written):match(".*(A [^\n]+)")
+    local f = {}
+    for w2 in a:gmatch("%S+") do f[#f + 1] = w2 end
+    check(near(tonumber(f[2]), 6.40, 0.02) and near(tonumber(f[3]), 0.90, 0.02) and near(tonumber(f[4]), -2.90, 0.02),
+        "no Pawn, a view target: she follows IT (behind-and-beside, her usual spot), not the camera (" .. a .. ")")
+    local said_pcm = 0
+    for _, s in ipairs(logs) do if s:find("camera manager:", 1, true) then said_pcm = said_pcm + 1 end end
+    check(said_pcm == 1, "the camera manager's class is said once at start (" .. said_pcm .. ")")
+
+    -- the game pauses: no camera (V 0) once paused() notices (its own 0.1 s cache), and the WHY diagnostic
+    -- names the view target's class
+    world.paused = true
+    for i = 1, 30 do
+        world.frame = 6100 + i
+        clock = clock + 1 / 60
+        loop()
+    end
+    check(written[#written] == "V 0\n", "paused: no camera, even with a view target (" .. tostring(written[#written]) .. ")")
+    local said_why = false
+    for _, s in ipairs(logs) do
+        if s:find("no camera sent (paused)", 1, true) and s:find("pc.Pawn none", 1, true) and s:find("BP_GTAViewTarget_C", 1, true) then said_why = true end
+    end
+    check(said_why, "paused: WHY, with pc.Pawn's and the view target's class")
+    io.open, os.clock, print = real_open, real_clock, real_print
+end
+
+-------------------------------------------------------------------------------- no Pawn and no view target: the camera alone
+do
+    local written, logs = {}, {}
+    local fake_pipe = { write = function(self, s) written[#written + 1] = s return self end, setvbuf = function() end, close = function() end }
+    local real_open, real_clock, real_print = io.open, os.clock, print
+    io.open = function(name, mode)
+        if name == M.PIPE then return fake_pipe end
+        return real_open(name, mode)
+    end
+    local clock = 400.0
+    os.clock = function() return clock end
+    print = function(s) logs[#logs + 1] = s end
+    local world = make_world({ no_pawn = true }) -- view_target left nil: no actor for the player at all
+    local loop
+    LoopInGameThreadAfterFrames = function(_, fn) loop = fn end
+    dofile(path)
+    for i = 1, 30 do
+        world.frame = 7000 + i
+        clock = clock + 1 / 60
+        loop()
+    end
+    io.open, os.clock, print = real_open, real_clock, real_print
+    local cams, avatars = 0, 0
+    for l in table.concat(written):gmatch("[^\n]+") do
+        if l:sub(1, 2) == "C " then cams = cams + 1 end
+        if l:sub(1, 2) == "A " then avatars = avatars + 1 end
+    end
+    check(cams == 30 and avatars == 30, "no Pawn, no view target: a camera and her placement every frame all the same (" .. cams .. ", " .. avatars .. ")")
+    -- her spot: behind-and-beside the CAMERA (pos 700,1800,260 yaw 80), the same BACK/SIDE a Pawn would get
+    local a = table.concat(written):match(".*(A [^\n]+)")
+    local f = {}
+    for w2 in a:gmatch("%S+") do f[#f + 1] = w2 end
+    check(near(tonumber(f[2]), 5.8706, 0.01) and near(tonumber(f[3]), 2.60, 0.01) and near(tonumber(f[4]), 16.7776, 0.01),
+        "no Pawn, no view target: she is placed relative to the camera alone (" .. a .. ")")
+end
+
+-------------------------------------------------------------------------------- no camera manager at all: WHY, rate-limited
+do
+    local written, logs = {}, {}
+    local fake_pipe = { write = function(self, s) written[#written + 1] = s return self end, setvbuf = function() end, close = function() end }
+    local real_open, real_clock, real_print = io.open, os.clock, print
+    io.open = function(name, mode)
+        if name == M.PIPE then return fake_pipe end
+        return real_open(name, mode)
+    end
+    local clock = 600.0
+    os.clock = function() return clock end
+    print = function(s) logs[#logs + 1] = s end
+    local world = make_world({ no_pcm = true })
+    local loop
+    LoopInGameThreadAfterFrames = function(_, fn) loop = fn end
+    dofile(path)
+    for i = 1, 25 * 60 do
+        world.frame = 9000 + i
+        clock = clock + 1 / 60
+        loop()
+    end
+    io.open, os.clock, print = real_open, real_clock, real_print
+    local cams = 0
+    for l in table.concat(written):gmatch("[^\n]+") do if l:sub(1, 2) == "C " then cams = cams + 1 end end
+    check(cams == 0, "no camera manager: never a camera (" .. cams .. ")")
+    local said = 0
+    for _, s in ipairs(logs) do if s:find("no camera sent (no pcm)", 1, true) and s:find("pc.Pawn BP_PlayerController_C", 1, true) then said = said + 1 end end
+    check(said >= 2 and said <= 3, "no camera manager: the WHY diagnostic, at most once every 10 s over 25 s (" .. said .. ")")
 end
 
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
