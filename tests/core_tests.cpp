@@ -1110,7 +1110,9 @@ static void test_link_waits_for_a_provider_camera_before_hello()
 	const size_t fn = src.find("void frame(int bw, int bh)");
 	CHECK(fn != std::string::npos);
 	const size_t connected_return = src.find("if (!g_ws.connected())", fn);
-	const size_t have_cam_gate = src.find("if (!have_cam)", fn);
+	// the SOCKET's own earlier camera gate (test_link_waits_for_a_provider_camera_before_opening_the_socket)
+	// sits before this one - skip past the connected-check to find the hello gate that follows it
+	const size_t have_cam_gate = connected_return == std::string::npos ? std::string::npos : src.find("if (!have_cam)", connected_return);
 	const size_t gate_return = have_cam_gate == std::string::npos ? std::string::npos : src.find("return;", have_cam_gate);
 	const size_t first_hello = src.find("g_asked.first(picture, now)", fn);
 	const size_t re_hello = src.find("hello_again(more, now)", fn);
@@ -1118,6 +1120,42 @@ static void test_link_waits_for_a_provider_camera_before_hello()
 	CHECK(first_hello != std::string::npos && re_hello != std::string::npos);
 	// the gate sits after the connected-check's own return and before BOTH hello sites (one return covers both)
 	CHECK(connected_return < have_cam_gate && have_cam_gate < gate_return && gate_return < first_hello && gate_return < re_hello);
+}
+
+/// The gate above only withholds the HELLO; the SOCKET itself must not open before a camera either (0.2.3,
+/// BRIDGE.md and the owner's 2026-10-19 GTA III DE live evidence) - an engine that accepts a TCP connection and
+/// gets no authorised hello in time closes it as refused, growing enginelink's own back-off for OUR silence
+/// while a provider (AstraUE, any other) has not sent a camera yet. start() must not open the WsClient itself
+/// (only the outbox: sends before the camera gate opens are harmless, outbox.push just queues); frame() must
+/// gate `g_ws.start(` on have_cam, before the g_parked block and the connected-check above.
+static void test_link_waits_for_a_provider_camera_before_opening_the_socket()
+{
+	std::ifstream f(std::string(ASTRA_SRC) + "/link.cpp");
+	CHECK(f.good());
+	std::stringstream ss;
+	ss << f.rdbuf();
+	const std::string src = ss.str();
+	const size_t start_fn = src.find("void start(int port, const std::string &token)");
+	CHECK(start_fn != std::string::npos);
+	const size_t start_end = src.find("\n\t}\n", start_fn);
+	CHECK(start_end != std::string::npos);
+	CHECK(src.find("g_ws.start(", start_fn) == std::string::npos || src.find("g_ws.start(", start_fn) > start_end);
+	const size_t fn = src.find("void frame(int bw, int bh)");
+	CHECK(fn != std::string::npos);
+	const size_t opened_gate = src.find("if (!g_opened)", fn);
+	const size_t opened_return = opened_gate == std::string::npos ? std::string::npos : src.find("return;", opened_gate);
+	const size_t opened_start = opened_gate == std::string::npos ? std::string::npos : src.find("g_ws.start(", opened_gate);
+	const size_t parked = src.find("if (g_parked)", fn);
+	const size_t connected_return = src.find("if (!g_ws.connected())", fn);
+	CHECK(opened_gate != std::string::npos && opened_return != std::string::npos && opened_start != std::string::npos);
+	CHECK(parked != std::string::npos && connected_return != std::string::npos);
+	// the gate (its return, then its own g_ws.start()) sits before g_parked and before the connected-check
+	CHECK(opened_gate < opened_return && opened_return < opened_start && opened_start < parked && opened_start < connected_return);
+	// stop() re-arms it, so a device recreate (device A's socket opened, stop(), device B's start()) does not
+	// wait out the gate again for nothing - a camera already seen keeps have_cam true forever (the ring is
+	// never emptied), so the very next frame reopens it
+	const size_t stop_fn = src.find("void stop()");
+	CHECK(stop_fn != std::string::npos && src.find("g_opened = false;", stop_fn) != std::string::npos);
 }
 
 // ---- tone: her picture into the scene's light -----------------------------------------------------------------
@@ -1633,6 +1671,7 @@ int main(int argc, char **argv)
 	test_hello_rules();
 	test_link_lets_go_before_hello_again();
 	test_link_waits_for_a_provider_camera_before_hello();
+	test_link_waits_for_a_provider_camera_before_opening_the_socket();
 	test_link_backs_off();
 	test_layer_commits_values();
 	test_one_version();

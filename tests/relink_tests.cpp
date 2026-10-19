@@ -236,6 +236,56 @@ namespace layer
 	std::string test_last_where();
 }
 
+/// 0.2.3: the hello was already gated on a provider camera (test_engine_relink's comment below); the SOCKET
+/// itself must be too - the engine closes an unauthorised connection it got no hello from in time, and that
+/// refusal would grow enginelink's own back-off for OUR silence while nothing has sent a camera yet (the
+/// owner's GTA III DE live evidence, 2026-10-19: UE4SS's AstraUE found no Pawn and sent nothing; the add-on's
+/// log showed the socket already refused, backing off 2 -> 4 -> 8 -> 16 -> 30 s, before her first camera ever
+/// could have arrived). Driven FIRST in main(), before test_engine_relink() puts a camera into
+/// provider::state() - a process-wide singleton nothing in this binary ever resets.
+static void test_link_waits_for_camera_before_opening_the_socket()
+{
+	WSADATA wsa;
+	WSAStartup(MAKEWORD(2, 2), &wsa);
+	FakeEngine engine;
+
+	enginelink::start(engine.port, "");
+	// half a second of frames with no camera yet: the socket must stay untouched (no TCP accept at the fake
+	// engine, no back-off growth - there is nothing for the engine to have refused)
+	within(2000, "camera gate: waits with no camera", [&] {
+		wait_for([&] { enginelink::frame(1920, 1080); return false; }, 500);
+	});
+	CHECK(engine.accepted.load() == 0);
+	CHECK(!enginelink::connected());
+	CHECK(engine.hellos.load() == 0);
+	std::printf("camera gate: half a second of waiting opened no socket (%d TCP accept(s), %d hello(s))\n", engine.accepted.load(),
+		engine.hellos.load());
+
+	// her first camera line (any provider's, pipe or in-process - this test's own push stands in)
+	provider::Camera seen{};
+	seen.fwd[2] = -1.0f;
+	seen.up[1] = 1.0f;
+	seen.fov_deg = 60.0f;
+	seen.near_m = 0.1f;
+	provider::state().cameras.push(seen);
+
+	// the very next frame opens the socket and says hello - no back-off wait, since nothing was ever refused
+	within(2000, "camera gate: connects within one frame of the first camera", [&] {
+		CHECK(wait_for(
+			[&] {
+				enginelink::frame(1920, 1080);
+				return enginelink::stats().answered;
+			},
+			1800));
+	});
+	CHECK(engine.accepted.load() == 1);
+	CHECK(engine.hellos.load() == 1);
+	std::printf("camera gate: connected and said hello right after the first camera (%d connection(s), %d hello(s))\n", engine.accepted.load(),
+		engine.hellos.load());
+
+	within(4000, "enginelink::stop() after the camera-gate test", [] { enginelink::stop(); });
+}
+
 /// Device A's present loop starts the link; device A is destroyed (enginelink::stop(), as on_destroy_device
 /// does); device B's first present starts it again (enginelink::start(), as on_present's `!g_started` does). If
 /// the gap named in the brief is real, the second half never reconnects: no new TCP connection, no second hello,
@@ -256,6 +306,9 @@ static void test_engine_relink()
 	seen.fov_deg = 60.0f;
 	seen.near_m = 0.1f;
 	provider::state().cameras.push(seen);
+	// layer::test_map_count() is process-wide too (layer_stub.cpp) - a baseline, not the test's own first map,
+	// since test_link_waits_for_camera_before_opening_the_socket (run first in main()) already mapped one ring.
+	const unsigned long long map_before = layer::test_map_count();
 
 	// enginelink::frame() is what a present calls (main.cpp's begin_frame, once per presented frame) - it is the
 	// only place a hello is sent. Driven from this (the test's single) thread, exactly as one present thread
@@ -274,7 +327,7 @@ static void test_engine_relink()
 	within(4000, "device A links", [&] { CHECK(pump_until_answered(3500)); });
 	CHECK(engine.accepted.load() == 1);
 	CHECK(engine.hellos.load() == 1);
-	CHECK(layer::test_map_count() == 1);
+	CHECK(layer::test_map_count() == map_before + 1);
 	CHECK(layer::test_last_where() == "ring-1");
 	std::printf("relink: device A linked (%d connection(s), %d hello(s), ring mapped at %s)\n", engine.accepted.load(), engine.hellos.load(),
 		layer::test_last_where().c_str());
@@ -288,7 +341,7 @@ static void test_engine_relink()
 	within(6000, "device B relinks", [&] { CHECK(pump_until_answered(5500)); });
 	CHECK(engine.accepted.load() == 2); // a REAL new TCP connection, not the old one believed still good
 	CHECK(engine.hellos.load() == 2);   // device B's own hello, not device A's reused
-	CHECK(layer::test_map_count() == 2);
+	CHECK(layer::test_map_count() == map_before + 2);
 	CHECK(layer::test_last_where() == "ring-2"); // the ring was re-mapped for the new connection's reply
 	std::printf("relink: device B relinked (%d connection(s), %d hello(s), ring remapped at %s)\n", engine.accepted.load(), engine.hellos.load(),
 		layer::test_last_where().c_str());
@@ -361,6 +414,7 @@ static void test_pipe_relink()
 
 int main()
 {
+	test_link_waits_for_camera_before_opening_the_socket();
 	test_engine_relink();
 	test_pipe_relink();
 	std::printf("relink: %d checks, %d failed\n", g_checks, g_failed);

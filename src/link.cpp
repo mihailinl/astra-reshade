@@ -30,6 +30,7 @@ namespace enginelink
 		int g_port = 0;
 		hello_rules::Backoff g_backoff; // an engine that refused the hello is asked again later, not at every reconnect
 		bool g_parked = false;          // the socket is stopped until g_backoff says
+		bool g_opened = false;          // the socket has been asked to open at least once (never before a camera)
 		std::thread g_stopper;          // stops it off the present thread (WsClient::stop joins its thread: up to ~0.1 s)
 		std::string g_lastShm;          // the ring the last hello reply named
 		bool g_helloUnanswered = false; // this connection said hello and no reply came (yet)
@@ -233,9 +234,11 @@ namespace enginelink
 	{
 		g_token = token;
 		g_port = port;
-		g_ws.start(g_host.c_str(), port);
+		// the socket itself opens only once a provider camera has arrived (frame()'s g_opened gate): the engine
+		// closes an unauthorised connection with "no authorised hello in time" if the hello (gated on have_cam
+		// below) is not there in time, and that refusal would grow our OWN back-off for our own silence.
 		g_outbox.start([](const std::string &m) { return g_ws.send(m); }, [] { return g_ws.generation(); });
-		logf("link: engine bridge at 127.0.0.1:%d", port);
+		logf("link: engine bridge at 127.0.0.1:%d (the socket opens once a provider camera arrives)", port);
 	}
 
 	void stop()
@@ -244,6 +247,7 @@ namespace enginelink
 		if (g_stopper.joinable())
 			g_stopper.join();
 		g_ws.stop();
+		g_opened = false; // the next start() re-arms the camera gate (passes at once if a camera already came)
 	}
 
 	bool connected()
@@ -285,6 +289,19 @@ namespace enginelink
 		g_stats.provider_visible = ps.visible;
 		g_stats.camera_age_ms = have_cam ? now - newest.at_ms : -1;
 
+		if (!g_opened)
+		{
+			// never claim her (a hello's reply does: WGPU_GAME_SWITCH) for a game nothing can show a picture of,
+			// and never open the socket before there is one to say hello over - an engine that accepted a
+			// connection and got no hello in time closes it as unauthorised, and that refusal would grow
+			// g_backoff for OUR OWN silence, not a real one. Once a camera has arrived, have_cam never goes
+			// false again (the ring is never emptied), so this runs at most once.
+			layer::set_active(false);
+			if (!have_cam)
+				return;
+			g_opened = true;
+			g_ws.start(g_host.c_str(), g_port);
+		}
 		if (g_parked)
 		{
 			layer::set_active(false);
