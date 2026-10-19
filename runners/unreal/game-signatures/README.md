@@ -9,8 +9,9 @@ file can override the scan for just that symbol
 
 ## Why this directory exists, and why it is not in `../ue4ss-overlay/`
 
-`../ue4ss-overlay/` is the runner's shared tree: `tools/package-unreal.sh` copies it into
-`${profile}/ue4ss/` for **every** game `astra-gi.toml` installs onto (`exe = "*"`). Anything placed there
+`../ue4ss-overlay/` is the runner's shared tree: `tools/package-unreal.sh` copies it into `${game}/ue4ss/`
+(beside the game's exe, UE4SS 3.x's own layout - astra-gi.toml's own top comment explains why it lives there
+and not the profile) for **every** game `astra-gi.toml` installs onto (`exe = "*"`). Anything placed there
 reaches every Unreal game this add-on supports.
 
 A `UE4SS_Signatures/<Symbol>.lua` file does not *add* a candidate alongside UE4SS's own scan - it
@@ -44,7 +45,7 @@ is exactly that failure mode).
 **Consequence:** a GTA-III-specific byte pattern dropped into the shared `ue4ss-overlay/` would turn every
 *other* Unreal game this runner serves from "scans fine on its own" into "UE4SS fails outright" - its exact
 bytes are extremely unlikely to occur at the right call site in an unrelated game's binary. The override
-must only ever reach GTA III DE's own profile.
+must only ever reach GTA III DE's own `ue4ss/UE4SS_Signatures/`, never the shared runner's.
 
 ## The shape that ships it safely - no launcher change needed
 
@@ -57,9 +58,11 @@ already has it.
 
 So GTA III DE gets its **own** manifest, `../astra-gi-gta3.toml`: `exe =
 "Gameface/Binaries/Win64/LibertyCity.exe"`, `steam_appid = 1546970`, otherwise the same build as
-`astra-gi.toml`, plus one extra `[[files]]` rule that installs `UE4SS_Signatures/{StaticConstructObject,ConsoleManager}.lua`
-from this directory into `${profile}/ue4ss/UE4SS_Signatures/`. A player picks it from the launcher's list
-the same way they'd pick the generic runner - it just will not install (or run) anywhere but GTA III DE.
+`astra-gi.toml`, plus two extra `[[game_files]]` entries that place
+`UE4SS_Signatures/{StaticConstructObject,ConsoleManager}.lua` from this directory into
+`${game}/ue4ss/UE4SS_Signatures/` - beside the `UE4SS.dll` this package also ships there. A player picks it
+from the launcher's list the same way they'd pick the generic runner - it just will not install (or run)
+anywhere but GTA III DE.
 
 This is why the two Lua files sit under `GTA3-DefinitiveEdition/` here rather than directly under
 `UE4SS_Signatures/`: this directory can hold a sibling folder per game that needs an override, each wired
