@@ -1101,44 +1101,31 @@ end
 
 -------------------------------------------------------------------------------- the camera alone: its view turning is not him going
 do
-    -- the pure pivot: a 300 cm boom orbiting a still player at 20 deg/s (looking 20 degrees down, then tilting) - the
-    -- point the view turns about stays put; a first-person turn in place, too; a camera carried forward moves it
-    local worst, off = 0, 0
-    for _, case in ipairs({ { boom = 300, pitch0 = -20, tilt = 0 }, { boom = 300, pitch0 = -20, tilt = 15 }, { boom = 0, pitch0 = 0, tilt = 0 } }) do
-        local st = {}
-        for i = 0, 180 do
-            local yaw, pitch = 20 * i / 60, case.pitch0 - case.tilt * i / 180
-            local yr, pr = math.rad(yaw), math.rad(pitch)
-            local cx, cy, cz = 500 - math.cos(yr) * math.cos(pr) * case.boom, 800 - math.sin(yr) * math.cos(pr) * case.boom,
-                150 - math.sin(pr) * case.boom
-            local px, py, pz, vx, vy = M.view_pivot(st, cx, cy, cz, pitch, yaw, 1 / 60)
-            worst = math.max(worst, math.sqrt(vx * vx + vy * vy))
-            if i > 3 then off = math.max(off, math.sqrt((px - 500) ^ 2 + (py - 800) ^ 2 + (pz - 150) ^ 2)) end
-        end
-    end
-    check(worst < M.GO_STOP, string.format("camera alone: a view that only turns (a boom, a tilt, first person) is no movement (worst %.1f cm/s)", worst))
-    check(off < 1, string.format("camera alone: him = the point the view turns about (off by %.2f cm)", off))
-    local st, last = {}, 0
-    for i = 0, 60 do
-        local _, _, _, vx = M.view_pivot(st, 300 * i / 60, 0, 150, -15, 0, 1 / 60)
-        last = vx
-    end
-    check(near(last, 300, 1), string.format("camera alone: a camera carried forward is him going (%.1f cm/s)", last))
-    -- the whole frame, no Pawn and no view target: a 300 cm boom looks at a still player; a small turn shows where he
-    -- is, she settles beside him; then the view orbits him for 3 s - she stays where she is
+    -- no Pawn and no view target: his speed is the camera's own motion, which a third-person boom has whenever the view
+    -- turns. An ordinary look round (300 cm boom, 10 deg/s: the camera moves ~52 cm/s) is not him going; she stays.
+    -- (A long orbit still carries the CAMERA - which is him here - away from her: then she walks back, calmly.)
     local hers = {}
-    run_frames({ no_pawn = true }, 580, function(w)
+    run_frames({ no_pawn = true }, 480, function(w)
         w.on_frame = function(i)
-            local yaw = i <= 60 and 0 or i <= 80 and (i - 60) * 0.5 or i <= 400 and 10 or 10 + 20 * (i - 400) / 60
-            local yr, pr = math.rad(yaw), math.rad(-15)
-            w.cam_loc = { X = 1000 - math.cos(yr) * math.cos(pr) * 300, Y = 2000 - math.sin(yr) * math.cos(pr) * 300, Z = 100 + math.sin(math.rad(15)) * 300 }
+            local yaw = i <= 120 and 0 or i <= 240 and 10 * (i - 120) / 60 or 20 -- a 20 degree look round, then still
+            local yr = math.rad(yaw)
+            w.cam_loc = { X = 1000 - math.cos(yr) * 300, Y = 2000 - math.sin(yr) * 300, Z = 260 }
             w.cam_rot = { Pitch = -15, Yaw = yaw, Roll = 0 }
         end
     end, hers)
-    local moved, beside = 0, 100 * math.sqrt((hers[400][1] - 10) ^ 2 + (hers[400][2] - 20) ^ 2)
-    for i = 400, #hers do moved = math.max(moved, 100 * math.sqrt((hers[i][1] - hers[400][1]) ^ 2 + (hers[i][2] - hers[400][2]) ^ 2)) end
-    check(#hers >= 580 and beside < M.STAY_RADIUS, string.format("camera alone: she settles near the player the camera looks at (%.0f cm from him)", beside))
-    check(#hers >= 580 and moved < 1, string.format("camera alone: the view orbits a still player - she stays where she is (moved %.1f cm)", moved))
+    local moved = 0
+    for i = 120, #hers do moved = math.max(moved, 100 * math.sqrt((hers[i][1] - hers[120][1]) ^ 2 + (hers[i][2] - hers[120][2]) ^ 2)) end
+    check(#hers >= 480 and moved < 1, string.format("camera alone: an ordinary view turn is not him going - she stays (moved %.1f cm)", moved))
+    -- the camera carried forward (him walking, 150 cm/s): she follows
+    local hers2 = {}
+    run_frames({ no_pawn = true }, 300, function(w)
+        w.on_frame = function(i)
+            w.cam_loc = { X = 700 + 150 * i / 60, Y = 1800, Z = 260 }
+            w.cam_rot = { Pitch = -15, Yaw = 0, Roll = 0 }
+        end
+    end, hers2)
+    local went = 100 * (hers2[#hers2][1] - hers2[60][1])
+    check(went > 300, string.format("camera alone: a camera carried forward is him going - she follows (%.0f cm)", went))
 end
 
 -------------------------------------------------------------------------------- standing: she only walks
@@ -1157,6 +1144,24 @@ do
         end
         check(fastest <= M.WALK_PACE * 0.01 + 1e-6, string.format("standing or creeping %d cm/s: she only walks, never rushes (fastest %.2f m/s)", pspeed, fastest))
     end
+    -- he stops dead while she is still catching up at CALM_PACE: her pace comes down to her walk gently, not in a jolt
+    local her, p = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }, { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+    M.follow(her, p, 1 / 60)
+    her.x = -1200
+    p.vx = 20
+    for _ = 1, 300 do
+        p.x = p.x + 20 / 60
+        M.follow(her, p, 1 / 60)
+    end
+    local before, worst_drop = her.v, 0
+    p.vx = 0
+    for _ = 1, 60 do
+        local v0 = her.v
+        M.follow(her, p, 1 / 60)
+        worst_drop = math.max(worst_drop, (v0 - her.v) * 60)
+    end
+    check(before > M.WALK_PACE + 20 and worst_drop <= M.SETTLE + 1 and near(her.v, M.WALK_PACE, 1),
+        string.format("he stops while she catches up at %.0f cm/s: she eases to her walk (worst %.0f cm/s^2, now %.0f)", before, worst_drop, her.v))
 end
 
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))

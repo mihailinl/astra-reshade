@@ -54,6 +54,11 @@ M.GO_STOP = 8.0                 -- ...and only goes back to "staying put" once h
                                  -- hysteresis gap, not one bare threshold (M.STILL used to be both edges at
                                  -- once: a jitter near it could flip the stand/catch-up branch every frame);
                                  -- the pack's walk exit is `speed < 0.08`.
+M.CAMERA_GO_START, M.CAMERA_GO_STOP = 60.0, 30.0 -- the same edges for a speed read off the CAMERA's motion (no
+                                 -- Pawn): a 300 cm boom turning at 11 deg/s moves the camera 60 cm/s with the
+                                 -- player standing still (0.2.4's single edge was 30)
+M.SETTLE = 300.0                -- cm/s^2: how gently her pace comes down to WALK_PACE when he stops going while
+                                 -- she is still catching up (review r3: the step from CALM_PACE was a 50 ms jolt)
 M.CALM_PACE = 120.0             -- her catch-up never runs ahead of a slow player: at most this, or 1.5x his
                                  -- pace once he is faster (a slow first step after looking around - her spot
                                  -- swung to his other side - must not send her running there)
@@ -121,47 +126,6 @@ function M.projected_tan_v(project, x, y, z, fx, fy, fz, ux, uy, uz)
     local t = (M.PROBE_H / M.PROBE_D) * cy / dy
     if not (t >= 0.0087 and t <= 11.43) then return nil end -- 1..170 degrees
     return t
-end
-
---- The camera-only fallback's player (no Pawn, no view target - GTA DE's Gameface): the point the view turns about.
---- A third-person camera orbits the player on a boom, a first-person one turns about itself; either way the camera's
---- own motion while the view only TURNS is not the player moving (review r2 of 0.2.5: a 300 cm boom turning at 20
---- deg/s moved the camera 105 cm/s, and she chased her spot as it swung). When the view turns, two frames' horizontal
---- view rays meet at the pivot: its distance along the ray is the boom (averaged, 3D, so looking up or down keeps the
---- pivot where it is; 0 until the view first turns - the camera itself, as before). st: this function's own state;
---- x, y, z (UE cm), pitch and yaw (degrees) of the camera; dt seconds. Returns the pivot x, y, z and its velocity
---- vx, vy (cm/s) - both under this frame's boom, so a boom first measured is not a jump of the player.
-M.BOOM_MAX = 1500.0
-function M.view_pivot(st, x, y, z, pitch, yaw, dt)
-    local function ray(yaw_deg, pitch_deg)
-        local yr, pr = math.rad(yaw_deg), math.rad(pitch_deg)
-        local cp = math.cos(pr)
-        return math.cos(yr) * cp, math.sin(yr) * cp, math.sin(pr)
-    end
-    local fx, fy, fz = ray(yaw, pitch)
-    if st.x ~= nil then
-        local yr0 = math.rad(st.yaw)
-        local d0x, d0y = math.cos(yr0), math.sin(yr0)
-        local hx, hy = math.cos(math.rad(yaw)), math.sin(math.rad(yaw))
-        local turn = d0x * hy - d0y * hx -- sin of the turn since the last frame
-        if math.abs(turn) > 0.005 then -- more than ~0.3 degrees: the two rays meet at the pivot
-            local wx, wy = x - st.x, y - st.y
-            local s = (wx * d0y - wy * d0x) / turn -- the pivot's distance ahead along the NEW horizontal ray
-            if s >= 0 and s <= M.BOOM_MAX then
-                local boom = s / math.max(math.cos(math.rad(pitch)), 0.2)
-                st.boom = st.boom == nil and boom or st.boom + (boom - st.boom) * 0.2
-            end
-        end
-    end
-    local b = st.boom or 0
-    local px, py, pz = x + fx * b, y + fy * b, z + fz * b
-    local vx, vy = 0, 0
-    if st.x ~= nil and dt > 0 then
-        local qx, qy = ray(st.yaw, st.pitch)
-        vx, vy = (px - (st.x + qx * b)) / dt, (py - (st.y + qy * b)) / dt
-    end
-    st.x, st.y, st.yaw, st.pitch = x, y, yaw, pitch
-    return px, py, pz, vx, vy
 end
 
 --- The camera line: C <frame> <pos gl m> <fwd gl> <up gl> <fov> <h|v> <aspect> <near m>
@@ -339,9 +303,11 @@ function M.follow(s, p, dt, now, ground)
     -- stand/go (E): she tracks the player once he is really GOING; a hysteresis gap (GO_START to start,
     -- GO_STOP to stop), not one bare threshold, so a tiny speed jitter near it can't flip the stand/catch-up
     -- branch every frame.
-    if pspeed >= M.GO_START then
+    local go_start, go_stop = M.GO_START, M.GO_STOP
+    if p.from_camera then go_start, go_stop = M.CAMERA_GO_START, M.CAMERA_GO_STOP end
+    if pspeed >= go_start then
         s.going = true
-    elseif pspeed < M.GO_STOP then
+    elseif pspeed < go_stop then
         s.going = false
     end
     local to_player = math.sqrt((p.x - s.x) ^ 2 + (p.y - s.y) ^ 2)
@@ -373,7 +339,8 @@ function M.follow(s, p, dt, now, ground)
     else
         -- he stands (or creeps slower than GO_START): she only ever walks, at her calm walk - never a rush at
         -- CALM_PACE to an aim while he barely moves (review r2: a 9-14 cm/s creep stood, then burst at 1.2 m/s)
-        want = math.min(M.catchup_want(pspeed, d, near_enough), M.WALK_PACE)
+        -- (from a faster catch-up he just stopped, her pace comes down to it at SETTLE, not with a jolt)
+        want = math.min(M.catchup_want(pspeed, d, near_enough), math.max(M.WALK_PACE, (s.v or 0) - M.SETTLE * dt))
     end
     s.v = M.accel_brake(s.v or 0, want, dt)
     local step = math.min(s.v * dt, d)
@@ -425,7 +392,7 @@ local kismet = nil
 local NO_COLOR = { R = 0, G = 0, B = 0, A = 0 }
 local trace_broken = false
 local sun = { comp = nil, find_at = -1e9, sent_at = -1e9, said = nil, visible = 1 }
-local cam_pivot = {} -- her camera-only fallback's player velocity (no actor at all: GTA DE's Gameface; M.view_pivot)
+local last_cam_pos = nil -- her camera-only fallback's velocity (no actor at all: GTA DE's Gameface, see player_actor)
 
 local function log(fmtstr, ...)
     print(string.format("[AstraUE] " .. fmtstr .. "\n", ...))
@@ -762,12 +729,17 @@ local function tick()
         end
     end
     if actor == nil then
-        -- no actor for the player at all: place her relative to what the camera shows - her spot (M.follow's
-        -- BACK/SIDE, the same fixed distance a Pawn gets) is behind-and-beside him, ground traced from it.
-        -- Him: the point the camera's view turns about (M.view_pivot - the player a third-person camera orbits, the
-        -- camera itself in first person), never the camera's own motion, which a boom has whenever the view turns.
-        local px, py, pz, vx, vy = M.view_pivot(cam_pivot, loc.X, loc.Y, loc.Z, rot.Pitch, rot.Yaw, dt)
-        p = { x = px, y = py, z = pz, yaw = rot.Yaw, vx = vx, vy = vy, falling = false }
+        -- no actor for the player at all: place her relative to the camera - her spot (M.follow's BACK/SIDE,
+        -- the same fixed distance a Pawn gets) is behind-and-beside the camera, ground traced from it.
+        -- His velocity: the camera's own frame-to-frame movement (there is no actor to read one from). A
+        -- third-person camera moves whenever the view only turns, and camera motion alone cannot tell an orbit
+        -- round a still player from a player stepping sideways while the view turns (review r3 of 0.2.5: a
+        -- two-ray pivot estimate failed both slow pans and strafing) - so this speed only counts as going past
+        -- the higher CAMERA_GO_START (from_camera). A pawnless game wants a provider of its own (astra-gta-trilogy).
+        local vx, vy = 0, 0
+        if last_cam_pos and dt > 0 then vx, vy = (loc.X - last_cam_pos.X) / dt, (loc.Y - last_cam_pos.Y) / dt end
+        last_cam_pos = { X = loc.X, Y = loc.Y }
+        p = { x = loc.X, y = loc.Y, z = loc.Z, yaw = rot.Yaw, vx = vx, vy = vy, falling = false, from_camera = true }
         source, tracer_actor = "camera", pcm
     end
     M.follow(her, p, dt, now, trace_down(tracer_actor))
