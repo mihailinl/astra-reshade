@@ -22,15 +22,36 @@ local M = {}
 M.PIPE = [[\\.\pipe\astra-provider]]
 M.INTEGRATION = "astra.unreal"
 
--- the follow brain's numbers (UE centimetres, seconds)
+-- the follow brain's numbers (UE centimetres, seconds). BACK/SIDE/NEAR_ENOUGH/STAY_RADIUS are tuned for
+-- M.REF_HALF_HEIGHT's capsule; M.follow scales them by the real player's own half_height when given one
+-- (a smaller/shorter pawn, e.g. Poppy Playtime's ~138 cm eye height vs a standard ~160-165 cm Mannequin,
+-- gets a proportionally closer spot - today's numbers are unchanged for a reference-sized capsule).
 M.BACK, M.SIDE = 140.0, 90.0    -- her spot: behind and to the right of the player
 M.NEAR_ENOUGH = 35.0            -- she stops this close to her spot
 M.STAY_RADIUS = 300.0           -- while the player stands, she stays put if she is this near him
 M.TELEPORT = 2500.0             -- further than this from her spot (or a floor apart): she is put there
 M.FLOOR_APART = 300.0
-M.WALK_MIN = 150.0              -- her slowest catch-up pace (cm/s)
+M.REF_HALF_HEIGHT = 88.0        -- a standard UE ThirdPersonCharacter capsule half-height (cm): BACK/SIDE/
+                                 -- NEAR_ENOUGH/STAY_RADIUS above are tuned for this
+M.WALK_PACE = 70.0              -- her slowest catch-up pace once she is actually moving (cm/s) - matched to
+                                 -- the built-in pack's measured no-slide walk speed (nayu-anims.toml's walk
+                                 -- blend anchor 0.7 m/s): keep the two in step if either changes. Only
+                                 -- applied once a catch-up is already wanted (d > NEAR_ENOUGH), never as an
+                                 -- unconditional floor - that read as "runs at the slightest movement" (the
+                                 -- old M.WALK_MIN=150 fired on ANY >35 cm gap, 2-3x the owner's own measured
+                                 -- 51-70 cm/s slow walk in Poppy Playtime, UE4SS.log 2026-10-20).
 M.RUN_MAX = 950.0
-M.STILL = 30.0                  -- the player "stands" below this speed (cm/s)
+M.GO_START = 40.0               -- she starts tracking (stops "staying put") once the player is going at
+                                 -- least this fast (cm/s)
+M.GO_STOP = 20.0                -- ...and only goes back to "staying put" once he is slower than this - a
+                                 -- hysteresis gap, not one bare threshold (M.STILL used to be both edges at
+                                 -- once: a tiny jitter near it could flip the stand/catch-up branch every
+                                 -- frame). Both sit below the owner's own measured slow walk (51-70 cm/s,
+                                 -- see above) - raising GO_START to a round "100" would FREEZE her behind a
+                                 -- player walking that slow (confirmed: she'd never start tracking him).
+M.ACCEL, M.BRAKE = 700.0, 1000.0 -- her catch-up ramp (cm/s^2, linear - not an exponential filter): the
+                                 -- Death Stranding follower's own already-live values
+                                 -- (astra-in-death-stranding/src/astra.cpp:20, kAccel/kBrake)
 
 -- the ground under her (UE centimetres, seconds)
 M.TRACE_MIN, M.TRACE_MAX = 0.05, 0.25 -- never more often than this; at least this often
@@ -197,13 +218,38 @@ end
 
 ---------------------------------------------------------------------------------------------------- follow brain
 
---- One step of her walking. s: her state (UE cm); p: the player {x, y, z (feet), yaw, vx, vy, falling}; dt seconds;
---- now: a clock (seconds) and ground: a line trace down (both optional: without them she stands on the player's ground).
+--- Her desired catch-up pace (D) for this frame, cm/s: track the player's speed and close the distance to
+--- her spot, floored at her real walk pace (C, D) only once a catch-up is actually wanted (d > near_enough)
+--- - never unconditionally (the old M.WALK_MIN fired on ANY >35 cm gap). The max() shape (not a SUM of the
+--- two terms) keeps today's RUN_MAX saturation point unchanged at speed: a sum saturates sooner (skeptic 2,
+--- confirmed: pspeed 400-600 cm/s with d 200-500 cm saturates RUN_MAX with TRACK=0.9/CLOSE=1.4; this form
+--- does not).
+function M.catchup_want(pspeed, d, near_enough)
+    if d <= near_enough then return 0 end
+    local want = math.min(math.max(pspeed * 1.1, d * 1.5), M.RUN_MAX)
+    return math.max(want, M.WALK_PACE)
+end
+
+--- A linear accel/brake ramp (B) from `v` toward `want` (cm/s) - not an exponential filter: its settle time
+--- scales with how far `want` actually changed, unlike a fixed-time-constant filter's roughly constant
+--- ~3*tau settle time regardless of the target (the owner's measured ~500 ms camera-turn-adjacent lag).
+function M.accel_brake(v, want, dt)
+    if v < want then return math.min(want, v + M.ACCEL * dt) end
+    return math.max(want, v - M.BRAKE * dt)
+end
+
+--- One step of her walking. s: her state (UE cm); p: the player {x, y, z (feet), yaw, vx, vy, falling,
+--- half_height (optional: the pawn's capsule half-height, for scale - F)}; dt seconds; now: a clock
+--- (seconds) and ground: a line trace down (both optional: without them she stands on the player's ground).
 function M.follow(s, p, dt, now, ground)
+    -- scale-aware distances (F): a smaller/taller capsule than the reference moves her spot and comfort
+    -- radii proportionally; no half_height given (or 0): today's fixed numbers, unchanged
+    local dscale = (p.half_height and p.half_height > 0) and (p.half_height / M.REF_HALF_HEIGHT) or 1.0
+    local back, side, near_enough, stay_radius = M.BACK * dscale, M.SIDE * dscale, M.NEAR_ENOUGH * dscale, M.STAY_RADIUS * dscale
     local yr = math.rad(p.yaw)
     local fx, fy = math.cos(yr), math.sin(yr)
     local rx, ry = -fy, fx -- UE: +Y is to the right of +X
-    local tx, ty = p.x - fx * M.BACK + rx * M.SIDE, p.y - fy * M.BACK + ry * M.SIDE
+    local tx, ty = p.x - fx * back + rx * side, p.y - fy * back + ry * side
     if s.placed then M.update_ground(s, p, now, ground) end
     local pspeed = math.sqrt(p.vx * p.vx + p.vy * p.vy)
     local to_spot = math.sqrt((tx - s.x) ^ 2 + (ty - s.y) ^ 2)
@@ -213,32 +259,40 @@ function M.follow(s, p, dt, now, ground)
         if s.trace then s.trace.z = nil end
         M.update_ground(s, p, now, ground, true)
         s.z = s.ground or p.z
-        s.v, s.vx, s.vy, s.speed, s.placed, s.teleports = 0, 0, 0, 0, true, (s.teleports or 0) + 1
+        s.v, s.vx, s.vy, s.speed, s.placed, s.teleports, s.going = 0, 0, 0, 0, true, (s.teleports or 0) + 1, false
         return s
     end
-    -- while the player stands (or turns on the spot), she stays where she is near him
+    -- stand/go (E): she tracks the player once he is really GOING; a hysteresis gap (GO_START to start,
+    -- GO_STOP to stop), not one bare threshold, so a tiny speed jitter near it can't flip the stand/catch-up
+    -- branch every frame. While not going (standing, or turning on the spot), she stays where she is near him.
+    if pspeed >= M.GO_START then
+        s.going = true
+    elseif pspeed < M.GO_STOP then
+        s.going = false
+    end
     local to_player = math.sqrt((p.x - s.x) ^ 2 + (p.y - s.y) ^ 2)
     local goal_x, goal_y = tx, ty
-    if pspeed < M.STILL and to_player < M.STAY_RADIUS and to_player > 60 then goal_x, goal_y = s.x, s.y end
+    if not s.going and to_player < stay_radius and to_player > 60 then goal_x, goal_y = s.x, s.y end
     local dx, dy = goal_x - s.x, goal_y - s.y
     local d = math.sqrt(dx * dx + dy * dy)
-    local want = 0
-    if d > M.NEAR_ENOUGH then want = math.min(math.max(pspeed * 1.1, d * 1.5, M.WALK_MIN), M.RUN_MAX) end
-    s.v = (s.v or 0) + (want - (s.v or 0)) * math.min(1, dt * 6)
+    local want = M.catchup_want(pspeed, d, near_enough)
+    s.v = M.accel_brake(s.v or 0, want, dt)
     local step = math.min(s.v * dt, d)
     if d > 1e-3 and step > 0 then
         s.x, s.y = s.x + dx / d * step, s.y + dy / d * step
         if step > 0.3 then s.yaw = M.turn(s.yaw, math.deg(math.atan(dy, dx)), 540 * dt) end
-    elseif pspeed < M.STILL then
+    elseif not s.going then
         s.yaw = M.turn(s.yaw, p.yaw, 90 * dt) -- standing: turn slowly the way he looks
     end
     s.z = s.z + ((s.ground or p.z) - s.z) * math.min(1, dt * 8)
     local inv = dt > 0 and 1 / dt or 0
     s.vx, s.vy = (d > 1e-3 and dx / d * step or 0) * inv, (d > 1e-3 and dy / d * step or 0) * inv
-    -- her pace in m/s, steady (the engine's animation set reads it)
-    local pace = math.sqrt(s.vx * s.vx + s.vy * s.vy) * 0.01
-    s.speed = (s.speed or 0) + (pace - (s.speed or 0)) * math.min(1, dt * 10)
-    if s.speed < 0.05 then s.speed = 0 end
+    -- her pace in m/s (C): the SAME quantity that just moved her (the realized step/dt, already clamped by
+    -- d) - never a second, independently-filtered copy. The old code low-passed a separate `pace` signal at
+    -- its own tau and snapped it to 0 below 0.05, which (decaying faster than s.v/her position) could leave
+    -- her still translating a frame after the engine had already read her as idle ("slides with no walk
+    -- animation").
+    s.speed = math.sqrt(s.vx * s.vx + s.vy * s.vy) * 0.01
     s.airborne = false
     return s
 end
@@ -538,7 +592,8 @@ local function tick()
     if actor ~= nil then
         local at, prot, vel, falling = actor_state(actor)
         if at ~= nil then
-            p = { x = at.X, y = at.Y, z = at.Z - (cache.half_height or 0), yaw = prot.Yaw, vx = vel.X, vy = vel.Y, falling = falling }
+            p = { x = at.X, y = at.Y, z = at.Z - (cache.half_height or 0), yaw = prot.Yaw, vx = vel.X, vy = vel.Y, falling = falling,
+                half_height = cache.half_height }
             source, tracer_actor = (actor == pawn and "pawn" or "view target"), actor
         else
             actor = nil -- stopped answering mid-frame (gone): fall through to the camera-only placement

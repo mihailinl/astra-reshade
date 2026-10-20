@@ -99,6 +99,145 @@ do
     check(near(her.x, p.x - M.BACK * math.cos(math.rad(p.yaw)) - M.SIDE * math.sin(math.rad(p.yaw)), 1), "fast travel: she is put at her spot")
 end
 
+-------------------------------------------------------------------------------- 0.2.5: a linear ramp, not a fixed-tau filter (B)
+do
+    -- the old exponential filter's settle time was ~3*tau (~500 ms) REGARDLESS of the target; a linear
+    -- accel/brake ramp's settle time scales with how far `want` actually changed.
+    local v, frames_to_95 = 0, nil
+    for i = 1, 60 do
+        v = M.accel_brake(v, M.WALK_PACE, 1 / 60)
+        if frames_to_95 == nil and v >= M.WALK_PACE * 0.95 then frames_to_95 = i end
+    end
+    check(frames_to_95 ~= nil and frames_to_95 <= 9,
+        string.format("accel ramp: reaches 95%% of her walk pace within 150 ms (took %s frames)", tostring(frames_to_95)))
+    -- a bigger target settles in proportionally MORE time, not the same ~500 ms either way
+    local v2, frames_big = 0, nil
+    for i = 1, 60 do
+        v2 = M.accel_brake(v2, 300, 1 / 60)
+        if frames_big == nil and v2 >= 300 * 0.95 then frames_big = i end
+    end
+    check(frames_big ~= nil and frames_big > frames_to_95,
+        "accel ramp: a bigger target takes longer to settle (scales with distance, not a fixed time)")
+end
+
+-------------------------------------------------------------------------------- 0.2.5: one speed, no second filter (C)
+do
+    -- the speed reported to the engine must be the SAME quantity that moves her: recompute her real
+    -- per-frame displacement independently (from her.x/y before and after) and compare against her.speed,
+    -- through an accel-then-abrupt-stop run - the scenario behind symptom 1 ("slides with no walk
+    -- animation": the old code's separately filtered + 0.05-snapped `s.speed` could disagree with a
+    -- position that was still moving, because it decayed at a different rate than `s.v`).
+    local her = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }
+    local p = { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+    M.follow(her, p, 1 / 60)
+    local worst = 0
+    for i = 1, 120 do
+        p.vx = i <= 60 and 90 or 0 -- 1 s walking at 90 cm/s, then the player stops dead
+        p.x = p.x + p.vx / 60
+        local px, py = her.x, her.y
+        M.follow(her, p, 1 / 60)
+        local real_pace = math.sqrt((her.x - px) ^ 2 + (her.y - py) ^ 2) * 60 * 0.01 -- m/s, from the actual displacement
+        worst = math.max(worst, math.abs(her.speed - real_pace))
+    end
+    check(worst < 1e-4, string.format("one speed: her reported speed always equals her real displacement (worst diff %.4f m/s)", worst))
+end
+
+-------------------------------------------------------------------------------- 0.2.5: slow walk, no glide (B, C)
+do
+    -- the owner's own measured slow walk in Poppy Playtime, UE4SS.log 2026-10-20: 51.2 and 69.75 cm/s
+    for _, pspeed in ipairs({ 50, 70 }) do
+        local her = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }
+        local p = { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+        M.follow(her, p, 1 / 60) -- placed at her spot
+        p.vx = pspeed
+        local walked, low_run, max_low_run = false, 0, 0
+        for _ = 1, 300 do -- 5 s: long enough to settle into steady pursuit
+            p.x = p.x + pspeed / 60
+            M.follow(her, p, 1 / 60)
+            if her.speed > 0.15 then walked = true end
+            if her.speed > 0 and her.speed < 0.15 then
+                low_run = low_run + 1
+                max_low_run = math.max(max_low_run, low_run)
+            else
+                low_run = 0
+            end
+        end
+        check(walked, string.format("slow walk %d cm/s: she walks (speed > 0.15 m/s at some point)", pspeed))
+        check(max_low_run <= 2,
+            string.format("slow walk %d cm/s: never glides below walk pace for more than 2 frames (worst run %d)", pspeed, max_low_run))
+    end
+end
+
+-------------------------------------------------------------------------------- 0.2.5: stop, then a slow walk (E)
+do
+    -- skeptic 1: a GO_START/STOP picked without checking it against the owner's own measured slow walk
+    -- (51-70 cm/s) can FREEZE her behind a player who starts walking that slowly, since the stand/go gate
+    -- never flips to "going" below GO_START - she would then only resume once to_player forces it past
+    -- M.STAY_RADIUS. This must not happen: she tracks a 60 cm/s walk-off closely, never drifting far.
+    local her = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }
+    local p = { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+    M.follow(her, p, 1 / 60)
+    -- he runs a bit, then stands for 3 s: she catches up and settles, latching "not going"
+    for _ = 1, 180 do
+        p.x, p.vx = p.x + 200 / 60, 200
+        M.follow(her, p, 1 / 60)
+    end
+    p.vx = 0
+    for _ = 1, 180 do M.follow(her, p, 1 / 60) end
+    check(her.going == false, "stop-then-slow-walk: standing settles her 'going' latch to false")
+    -- now he walks off at 60 cm/s (within the owner's measured 51-70 cm/s range)
+    p.vx = 60
+    local max_to_player, went_going = 0, false
+    for _ = 1, 180 do -- 3 s
+        p.x = p.x + 60 / 60
+        M.follow(her, p, 1 / 60)
+        if her.going then went_going = true end
+        local to_player = math.sqrt((p.x - her.x) ^ 2 + (p.y - her.y) ^ 2)
+        max_to_player = math.max(max_to_player, to_player)
+    end
+    check(went_going, "stop-then-slow-walk: a 60 cm/s walk-off is recognized as 'going' (GO_START sits below it)")
+    check(max_to_player < 250,
+        "stop-then-slow-walk: she tracks a 60 cm/s walk-off, never drifting near STAY_RADIUS (" .. string.format("%.0f", max_to_player) .. " cm)")
+end
+
+-------------------------------------------------------------------------------- 0.2.5: high speed, no RUN_MAX saturation (D)
+do
+    -- skeptic 2: a SUM of the two pace-law terms (the design plan's rejected TRACK=0.9/CLOSE=1.4 form)
+    -- saturates M.RUN_MAX at ordinary sprint+lag combinations; M.catchup_want's max() form must not.
+    local pspeed, d = 600, 500
+    local want = M.catchup_want(pspeed, d, M.NEAR_ENOUGH)
+    local sum_rejected = math.min(pspeed * 0.9 + (d - M.NEAR_ENOUGH) * 1.4, M.RUN_MAX)
+    check(want < M.RUN_MAX, string.format("pace law: pspeed %d d %d does not saturate RUN_MAX (want %.0f)", pspeed, d, want))
+    check(sum_rejected >= M.RUN_MAX, "pace law: confirms the rejected SUM form would have saturated here (skeptic 2)")
+    for _, ps in ipairs({ 400, 450, 500, 550, 600 }) do
+        for _, dd in ipairs({ 200, 275, 350, 425, 500 }) do
+            check(M.catchup_want(ps, dd, M.NEAR_ENOUGH) < M.RUN_MAX,
+                string.format("pace law: pspeed %d d %d stays under RUN_MAX", ps, dd))
+        end
+    end
+end
+
+-------------------------------------------------------------------------------- 0.2.5: scale-aware distances (F)
+do
+    local ref_dist = math.sqrt(M.BACK ^ 2 + M.SIDE ^ 2)
+    -- a capsule half the reference height: her spot is half the distance away
+    local her = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }
+    local p = { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false, half_height = M.REF_HALF_HEIGHT * 0.5 }
+    M.follow(her, p, 1 / 60)
+    check(near(math.sqrt(her.x ^ 2 + her.y ^ 2), ref_dist * 0.5, 1),
+        string.format("scale: a half-height capsule gets a half-distance spot (%.1f vs %.1f)", math.sqrt(her.x ^ 2 + her.y ^ 2), ref_dist * 0.5))
+    -- a reference-sized capsule (88 cm, the stub pawn's own): today's exact distances, unchanged
+    local her2 = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }
+    local p2 = { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false, half_height = M.REF_HALF_HEIGHT }
+    M.follow(her2, p2, 1 / 60)
+    check(near(her2.x, -M.BACK, 1) and near(her2.y, M.SIDE, 1), "scale: a reference 88 cm capsule keeps today's exact distances")
+    -- no half_height at all (a game whose capsule read fails): also unchanged
+    local her3 = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }
+    local p3 = { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+    M.follow(her3, p3, 1 / 60)
+    check(near(her3.x, -M.BACK, 1) and near(her3.y, M.SIDE, 1), "scale: no half_height read: today's exact distances (a degrading game)")
+end
+
 -------------------------------------------------------------------------------- the ground under her
 do
     -- the rate limit: at once, then not before TRACE_MIN, at TRACE_MAX at the latest, in between when she moved
