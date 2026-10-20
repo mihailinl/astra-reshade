@@ -539,6 +539,21 @@ local function refresh_cache(now, pcm, pawn)
         if pov.PerspectiveNearClipPlane and pov.PerspectiveNearClipPlane > 0 then cache.near = pov.PerspectiveNearClipPlane end
         cache.ortho = pov.ProjectionMode == 1 -- ECameraProjectionMode::Orthographic
     end)
+    -- no per-camera near plane (the POV's is <= 0: "use the engine's"): the engine's own, UEngine::NearClipPlane - a
+    -- project setting (Unreal's default 10 cm, which the add-on assumes when told nothing). The add-on turns the game's
+    -- depth buffer into metres with it, so a game drawing with a 1 cm near plane read every wall ~10x further than it
+    -- is and she showed through all of them (the owner, Mecha Chameleon, 2026-10-20: depth bands every few cm).
+    if cache.near <= 0 then
+        pcall(function()
+            if not (cache.engine and cache.engine:IsValid()) then cache.engine = FindFirstOf("Engine") end
+            local n = cache.engine.NearClipPlane
+            if type(n) == "number" and n > 0 then cache.near = n end
+        end)
+    end
+    if cache.near ~= cache.said_near then
+        cache.said_near = cache.near
+        log("the game's near plane: %s", cache.near > 0 and string.format("%.2f cm", cache.near) or "unknown (the add-on assumes 10 cm)")
+    end
     cache.half_height = 0
     pcall(function() cache.half_height = pawn.CapsuleComponent:GetScaledCapsuleHalfHeight() end)
 end

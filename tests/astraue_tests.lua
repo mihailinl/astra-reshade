@@ -495,6 +495,8 @@ end
 --- PlayerController answers ProjectWorldLocationToScreen with that projection (no answer at all without it).
 --- opts.ortho: the camera's POV is orthographic. w.cam_loc / w.cam_rot (settable): the camera, else a fixed one.
 --- w.pawn_loc / w.pawn_vel (settable): the pawn's location and what GetVelocity says, else fixed / zero.
+--- opts.pov_near: the camera POV's PerspectiveNearClipPlane (default 10; <= 0: "the engine's"); opts.engine_near: the
+--- Engine object's NearClipPlane (none without it).
 function make_world(opts)
     opts = opts or {}
     local w = { frame = 1000, view_target = opts.view_target }
@@ -531,7 +533,7 @@ function make_world(opts)
         GetCameraLocation = function() return w.cam_loc or { X = 700, Y = 1800, Z = 260 } end,
         GetCameraRotation = function() return w.cam_rot or { Pitch = -15, Yaw = 80, Roll = 0 } end,
         GetFOVAngle = function() return 90 end,
-        CameraCachePrivate = { POV = { bConstrainAspectRatio = false, AspectRatio = 1.7778, PerspectiveNearClipPlane = 10,
+        CameraCachePrivate = { POV = { bConstrainAspectRatio = false, AspectRatio = 1.7778, PerspectiveNearClipPlane = opts.pov_near or 10,
             ProjectionMode = opts.ortho and 1 or 0 } },
     })
     -- what a real UE 5.6 offers: no IsPaused on the PlayerController (plain C++), GameplayStatics' IsGamePaused
@@ -592,6 +594,10 @@ function make_world(opts)
             end })
         end
         return l
+    end
+    FindFirstOf = function(class)
+        if class == "Engine" and opts.engine_near then return object({ NearClipPlane = opts.engine_near }) end
+        return nil
     end
     FindAllOf = function(class)
         w.finds = w.finds + 1
@@ -1250,6 +1256,19 @@ do
     local fp, tp = placed_at({ X = 1000, Y = 2000, Z = 238 }), placed_at({ X = 1000, Y = 1700, Z = 300 })
     check(near(fp, spot * M.FIRST_PERSON_SCALE, 2), string.format("first person: her spot is further (%.0f cm, want %.0f)", fp, spot * M.FIRST_PERSON_SCALE))
     check(near(tp, spot, 2), string.format("third person: her spot is unchanged (%.0f cm, want %.0f)", tp, spot))
+end
+
+-------------------------------------------------------------------------------- the near plane: the camera's, else the engine's
+do
+    -- Mecha Chameleon's case: no per-camera near plane (POV -1), the engine's is 1 cm - the camera line carries 0.01 m
+    local f = run_frames({ pov_near = -1, engine_near = 1 }, 5)
+    check(f[15] ~= nil and near(tonumber(f[15]), 0.01, 1e-6), "near plane: no camera's own - the engine's NearClipPlane (" .. tostring(f[15]) .. " m)")
+    -- a camera with its own near plane keeps it
+    local f2 = run_frames({ pov_near = 25, engine_near = 1 }, 5)
+    check(near(tonumber(f2[15]), 0.25, 1e-6), "near plane: a camera's own wins (" .. tostring(f2[15]) .. " m)")
+    -- neither: 0 (the add-on's 10 cm)
+    local f3 = run_frames({ pov_near = -1 }, 5)
+    check(near(tonumber(f3[15]), 0, 1e-9), "near plane: none known - 0, the add-on assumes 10 cm (" .. tostring(f3[15]) .. ")")
 end
 
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
