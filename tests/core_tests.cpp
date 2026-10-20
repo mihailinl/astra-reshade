@@ -559,6 +559,15 @@ static void test_camera_pace()
 			p.tick(true, t += 17);
 		CHECK(p.target_age_ms() <= 20);
 	}
+	// a provider that really pushes every 330 ms (a 3 fps game) is measured - to the ceiling - not left on the
+	// unmeasured 17 ms default because every gap is over kPauseMs (review of 0.2.8)
+	{
+		camera_pace::PushPace p;
+		int64_t t = 0;
+		for (int i = 0; i < 100; ++i)
+			p.tick(true, t += 330);
+		CHECK(p.target_age_ms() == camera_pace::kAgeCeilingMs);
+	}
 }
 
 static void test_ring()

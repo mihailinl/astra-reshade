@@ -74,8 +74,13 @@ namespace camera_pace
 				// averaged in, one 17 s pause pulled the measure to the 100 ms ceiling and she was drawn with a
 				// camera 100 ms old for the next second or two (Poppy Playtime log, 2026-10-20: "camera delay 100 ms,
 				// the picture's camera is 17709 ms old", then "100 ms" again 15 s later)
-				if (gap <= float(kPauseMs))
-					gap_ms_ema = gap_ms_ema < 0.0f ? gap : gap_ms_ema + (gap - gap_ms_ema) * kEmaAlpha;
+				// (the first gap seeds the measure whatever it is, bounded by the ceiling, and a gap is a pause only
+				// against the provider's OWN cadence too - a game that pushes every 330 ms for real is measured, not
+				// left on the unmeasured default forever: review of 0.2.8)
+				if (gap_ms_ema < 0.0f)
+					gap_ms_ema = std::min(gap, float(kAgeCeilingMs));
+				else if (gap <= std::max(float(kPauseMs), gap_ms_ema * 4.0f))
+					gap_ms_ema += (gap - gap_ms_ema) * kEmaAlpha;
 			}
 			last_push_ms = now_ms;
 		}

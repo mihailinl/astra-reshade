@@ -557,6 +557,8 @@ local function refresh_cache(now, pcm, pawn)
     end
     if cache.near ~= cache.said_near then
         cache.said_near = cache.near
+        -- (the engine's is its project setting: a game changing it at run time with r.SetNearClipPlane moves only the
+        -- renderer's global, which nothing here can read - the add-on's DebugView 2 shows it: bands 1 m apart are right)
         log("the game's near plane: %s", cache.near > 0 and string.format("%.2f cm", cache.near) or "unknown (the add-on assumes 10 cm)")
     end
     cache.half_height = 0
