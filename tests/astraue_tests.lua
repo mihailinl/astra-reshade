@@ -1271,5 +1271,29 @@ do
     check(near(tonumber(f3[15]), 0, 1e-9), "near plane: none known - 0, the add-on assumes 10 cm (" .. tostring(f3[15]) .. ")")
 end
 
+-------------------------------------------------------------------------------- standing: in first person she faces him, not his view
+do
+    -- first person (camera at his head): he stands and looks round 180 degrees - she does not spin with his view; she
+    -- faces him. Third person: she still turns the way he looks (his body does not turn with a third-person camera).
+    local function stand_and_look(camera_dist)
+        local her, p = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }, { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false, camera_dist = camera_dist }
+        M.follow(her, p, 1 / 60)
+        for _ = 1, 180 do M.follow(her, p, 1 / 60) end
+        local before = her.yaw
+        for i = 1, 120 do
+            p.yaw = 1.5 * i
+            M.follow(her, p, 1 / 60)
+        end
+        for _ = 1, 120 do M.follow(her, p, 1 / 60) end
+        local to_him = math.deg(math.atan(p.y - her.y, p.x - her.x))
+        return before, her.yaw, to_him
+    end
+    local before, after, to_him = stand_and_look(30)
+    local function diff(a, b) return math.abs((a - b + 540) % 360 - 180) end
+    check(diff(after, to_him) < 2 and diff(after, before) < 2, string.format("first person: looking round, she faces him and does not spin (yaw %.0f -> %.0f, him at %.0f)", before, after, to_him))
+    local _, after3 = stand_and_look(300)
+    check(diff(after3, 180) < 2, string.format("third person: standing, she still turns the way he looks (yaw %.0f)", after3))
+end
+
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
 os.exit(failed == 0 and 0 or 1)

@@ -545,6 +545,20 @@ static void test_camera_pace()
 		}
 		CHECK(p.target_age_ms() < 30);
 	}
+
+	// a pause (a menu, a load) is not the provider's cadence: 200 pushes at 17 ms, a 17 s pause, then pushing again -
+	// the measure stays ~17 ms, never the 100 ms ceiling (Poppy Playtime, 2026-10-20: "camera delay 100 ms" after a pause)
+	{
+		camera_pace::PushPace p;
+		int64_t t = 0;
+		for (int i = 0; i < 200; ++i)
+			p.tick(true, t += 17);
+		p.tick(true, t += 17000);
+		CHECK(p.target_age_ms() <= 20);
+		for (int i = 0; i < 5; ++i)
+			p.tick(true, t += 17);
+		CHECK(p.target_age_ms() <= 20);
+	}
 }
 
 static void test_ring()

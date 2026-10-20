@@ -406,7 +406,12 @@ function M.follow(s, p, dt, now, ground)
         s.x, s.y = s.x + mx, s.y + my
         if step > 0.3 then s.yaw = M.turn(s.yaw, math.deg(math.atan(uy, ux)), 540 * dt) end
     elseif not s.going then
-        s.yaw = M.turn(s.yaw, p.yaw, 90 * dt) -- standing: turn slowly the way he looks
+        -- standing: turn slowly the way he looks - in first person, where his body turns with his view, toward HIM
+        -- instead (the owner, Poppy Playtime, 2026-10-20: "when I turn my head she rotates in place, like I'm moving
+        -- the camera around her"; the Death Stranding follower faces Sam too)
+        local face = p.yaw
+        if s.first_person then face = math.deg(math.atan(p.y - s.y, p.x - s.x)) end
+        s.yaw = M.turn(s.yaw, face, 90 * dt)
     end
     s.z = s.z + ((s.ground or p.z) - s.z) * math.min(1, dt * 8)
     local inv = dt > 0 and 1 / dt or 0

@@ -49,6 +49,8 @@ namespace camera_pace
 	/// How quickly the average reacts to a change (smaller = steadier, bigger = catches a framerate
 	/// change sooner); 20-ish pushes' worth of memory, a couple of seconds for a 60 Hz Unreal tick.
 	constexpr float kEmaAlpha = 0.05f;
+	/// A push gap longer than this (ms) is a pause, not a cadence: left out of the average.
+	constexpr int kPauseMs = 250;
 
 	/// Tracks, as an exponential moving average, the wall-clock milliseconds between distinct provider
 	/// camera pushes - the age (ms) the shown camera should be picked at, absent a fresher signal (the
@@ -68,7 +70,12 @@ namespace camera_pace
 			if (last_push_ms >= 0)
 			{
 				const float gap = float(now_ms - last_push_ms);
-				gap_ms_ema = gap_ms_ema < 0.0f ? gap : gap_ms_ema + (gap - gap_ms_ema) * kEmaAlpha;
+				// a gap longer than kPauseMs is a pause (a menu, a load, the game paused), not the provider's cadence:
+				// averaged in, one 17 s pause pulled the measure to the 100 ms ceiling and she was drawn with a
+				// camera 100 ms old for the next second or two (Poppy Playtime log, 2026-10-20: "camera delay 100 ms,
+				// the picture's camera is 17709 ms old", then "100 ms" again 15 s later)
+				if (gap <= float(kPauseMs))
+					gap_ms_ema = gap_ms_ema < 0.0f ? gap : gap_ms_ema + (gap - gap_ms_ema) * kEmaAlpha;
 			}
 			last_push_ms = now_ms;
 		}
