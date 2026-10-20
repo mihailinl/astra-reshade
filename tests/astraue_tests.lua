@@ -494,6 +494,7 @@ end
 --- opts.axis: the local player's AspectRatioAxisConstraint (default 1, MaintainXFOV). opts.draws = { tan_v, w, h }: the
 --- PlayerController answers ProjectWorldLocationToScreen with that projection (no answer at all without it).
 --- opts.ortho: the camera's POV is orthographic. w.cam_loc / w.cam_rot (settable): the camera, else a fixed one.
+--- w.pawn_loc / w.pawn_vel (settable): the pawn's location and what GetVelocity says, else fixed / zero.
 function make_world(opts)
     opts = opts or {}
     local w = { frame = 1000, view_target = opts.view_target }
@@ -520,9 +521,9 @@ function make_world(opts)
         end,
     })
     local pawn = object({
-        K2_GetActorLocation = function() return { X = 1000, Y = 2000, Z = 188 } end,
+        K2_GetActorLocation = function() return w.pawn_loc or { X = 1000, Y = 2000, Z = 188 } end,
         K2_GetActorRotation = function() return { Pitch = 0, Yaw = 90, Roll = 0 } end,
-        GetVelocity = function() return { X = 0, Y = 0, Z = 0 } end,
+        GetVelocity = function() return w.pawn_vel or { X = 0, Y = 0, Z = 0 } end,
         CapsuleComponent = object({ GetScaledCapsuleHalfHeight = function() return 88 end }),
         CharacterMovement = object({ IsFalling = function() return false end }),
     })
@@ -1162,6 +1163,59 @@ do
     end
     check(before > M.WALK_PACE + 20 and worst_drop <= M.SETTLE + 1 and near(her.v, M.WALK_PACE, 1),
         string.format("he stops while she catches up at %.0f cm/s: she eases to her walk (worst %.0f cm/s^2, now %.0f)", before, worst_drop, her.v))
+end
+
+-------------------------------------------------------------------------------- 0.2.6: his speed is what he really does; first person keeps her further
+do
+    -- the pure measure: a report that agrees is taken; a report of ~0 while he moves is not; no report: the displacement;
+    -- a teleport is no speed
+    local st = {}
+    local vx, vy
+    for i = 0, 30 do vx, vy = M.real_velocity(st, 300 * i / 60, 0, 300, 0, 1 / 60) end
+    check(near(vx, 300, 0.01) and near(vy, 0, 0.01), "his speed: a report that agrees is his speed")
+    st = {}
+    for i = 0, 30 do vx, vy = M.real_velocity(st, 300 * i / 60, 0, 0, 0, 1 / 60) end
+    check(near(vx, 300, 3), string.format("his speed: a report of 0 while he walks 300 cm/s is not taken (%.1f)", vx))
+    st = {}
+    for i = 0, 30 do vx, vy = M.real_velocity(st, 0, 120 * i / 60, nil, nil, 1 / 60) end
+    check(near(vy, 120, 2), string.format("his speed: no report - his displacement (%.1f)", vy))
+    vx, vy = M.real_velocity(st, 100000, 0, 0, 0, 1 / 60)
+    check(math.abs(vx) < 1 and math.abs(vy) < 200, string.format("his speed: a teleport is no speed (%.0f, %.0f)", vx, vy))
+    -- standing still with a jittery position (a few mm a frame): no speed to speak of
+    st = {}
+    for i = 0, 120 do vx, vy = M.real_velocity(st, (i % 2) * 0.3, 0, 0, 0, 1 / 60) end
+    check(math.sqrt(vx * vx + vy * vy) < M.GO_STOP, string.format("his speed: millimetre jitter is standing (%.1f cm/s)", math.sqrt(vx * vx + vy * vy)))
+end
+do
+    -- the whole frame, Mecha Chameleon's pawn: GetVelocity says 0 while he walks 300 cm/s for 6 s - she keeps up, at
+    -- his pace, never teleported
+    local hers, speeds = {}, {}
+    local _, world = run_frames({}, 420, function(w)
+        w.on_frame = function(i)
+            local x = 1000 + (i > 60 and 300 * (i - 60) / 60 or 0)
+            w.pawn_loc = { X = x, Y = 2000, Z = 188 }
+            w.pawn_vel = { X = 0, Y = 0, Z = 0 }
+            w.cam_loc = { X = x - 300, Y = 1800, Z = 260 }
+        end
+    end, hers)
+    local last = hers[#hers]
+    local gap = math.sqrt((last[1] - 28) ^ 2 + (last[2] - 20) ^ 2) * 100 -- him: 1000 + 300 * 6 = 2800 cm, 2000 cm
+    check(#hers >= 420 and gap < 400, string.format("a pawn whose GetVelocity says 0: she keeps up with him (%.0f cm away)", gap))
+end
+do
+    -- first person (the camera at his head) - her spot is FIRST_PERSON_SCALE further than in third person
+    local spot = math.sqrt(M.BACK ^ 2 + M.SIDE ^ 2)
+    local function placed_at(cam)
+        local hers = {}
+        run_frames({}, 3, function(w)
+            w.cam_loc = cam
+            w.cam_rot = { Pitch = 0, Yaw = 90, Roll = 0 }
+        end, hers)
+        return math.sqrt((hers[#hers][1] - 10) ^ 2 + (hers[#hers][2] - 20) ^ 2) * 100
+    end
+    local fp, tp = placed_at({ X = 1000, Y = 2000, Z = 238 }), placed_at({ X = 1000, Y = 1700, Z = 300 })
+    check(near(fp, spot * M.FIRST_PERSON_SCALE, 2), string.format("first person: her spot is further (%.0f cm, want %.0f)", fp, spot * M.FIRST_PERSON_SCALE))
+    check(near(tp, spot, 2), string.format("third person: her spot is unchanged (%.0f cm, want %.0f)", tp, spot))
 end
 
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))

@@ -57,6 +57,12 @@ M.GO_STOP = 8.0                 -- ...and only goes back to "staying put" once h
 M.CAMERA_GO_START, M.CAMERA_GO_STOP = 60.0, 30.0 -- the same edges for a speed read off the CAMERA's motion (no
                                  -- Pawn): a 300 cm boom turning at 11 deg/s moves the camera 60 cm/s with the
                                  -- player standing still (0.2.4's single edge was 30)
+M.FIRST_PERSON_DIST = 100.0     -- the camera this near the player's centre (cm, times his size) is his eyes: first
+                                 -- person (Poppy Playtime's eye sits ~50 cm above its capsule's centre; a third-
+                                 -- person boom is 2-4 m away)...
+M.FIRST_PERSON_SCALE = 1.6      -- ...and in first person her distances are this much larger: the camera IS him, so
+                                 -- her whole gap is her distance from the viewer, with no boom to add to it (the
+                                 -- owner, 2026-10-20: "she runs too close behind me" - 166 cm read as at his heels)
 M.SETTLE = 300.0                -- cm/s^2: how gently her pace comes down to WALK_PACE when he stops going while
                                  -- she is still catching up (review r3: the step from CALM_PACE was a 50 ms jolt)
 M.CALM_PACE = 120.0             -- her catch-up never runs ahead of a slow player: at most this, or 1.5x his
@@ -275,6 +281,28 @@ function M.accel_brake(v, want, dt)
     return math.max(want, v - M.BRAKE * dt)
 end
 
+--- His velocity (UE cm/s) as a raw fact: what the game reports (vx, vy - nil: no report), unless his own displacement
+--- since the last frame says he moves much faster - a pawn the game moves without a movement component reports ~0 while
+--- it walks (Mecha Chameleon, 2026-10-20: she followed "at a slow walk however far, then teleported"), and the camera-
+--- only fallback has no report at all (the camera's displacement). The displacement is averaged over ~50 ms (frame
+--- timing jitter); a jump past TELEPORT is a teleport, not a speed. st: this function's own state.
+function M.real_velocity(st, x, y, vx, vy, dt)
+    local jumped = st.x ~= nil and (x - st.x) ^ 2 + (y - st.y) ^ 2 > M.TELEPORT ^ 2
+    if st.x ~= nil and dt > 0 and not jumped then
+        local k = math.min(1, dt * 20)
+        st.vx = (st.vx or 0) + ((x - st.x) / dt - (st.vx or 0)) * k
+        st.vy = (st.vy or 0) + ((y - st.y) / dt - (st.vy or 0)) * k
+    elseif jumped then
+        st.vx, st.vy = 0, 0
+    end
+    st.x, st.y = x, y
+    local dvx, dvy = st.vx or 0, st.vy or 0
+    if vx == nil then return dvx, dvy end
+    local said, moved = math.sqrt(vx * vx + vy * vy), math.sqrt(dvx * dvx + dvy * dvy)
+    if moved > said * 1.5 + M.GO_START then return dvx, dvy end
+    return vx, vy
+end
+
 --- One step of her walking. s: her state (UE cm); p: the player {x, y, z (feet), yaw, vx, vy, falling,
 --- half_height (optional: the pawn's capsule half-height, for scale - F)}; dt seconds; now: a clock
 --- (seconds) and ground: a line trace down (both optional: without them she stands on the player's ground).
@@ -282,6 +310,8 @@ function M.follow(s, p, dt, now, ground)
     -- scale-aware distances (F): a smaller/taller capsule than the reference moves her spot and comfort
     -- radii proportionally; no half_height given (or 0): today's fixed numbers, unchanged
     local dscale = (p.half_height and p.half_height > 0) and (p.half_height / M.REF_HALF_HEIGHT) or 1.0
+    -- first person (the camera at his head, p.camera_dist): every comfort distance larger (FIRST_PERSON_SCALE)
+    if p.camera_dist ~= nil and p.camera_dist < M.FIRST_PERSON_DIST * dscale then dscale = dscale * M.FIRST_PERSON_SCALE end
     local back, side, near_enough, stay_radius = M.BACK * dscale, M.SIDE * dscale, M.NEAR_ENOUGH * dscale, M.STAY_RADIUS * dscale
     local yr = math.rad(p.yaw)
     local fx, fy = math.cos(yr), math.sin(yr)
@@ -392,7 +422,8 @@ local kismet = nil
 local NO_COLOR = { R = 0, G = 0, B = 0, A = 0 }
 local trace_broken = false
 local sun = { comp = nil, find_at = -1e9, sent_at = -1e9, said = nil, visible = 1 }
-local last_cam_pos = nil -- her camera-only fallback's velocity (no actor at all: GTA DE's Gameface, see player_actor)
+local his_motion = {} -- M.real_velocity's state for the followed actor (a Pawn or a view target)
+local cam_motion = {} -- ... and for the camera-only fallback (no actor at all: GTA DE's Gameface, see player_actor)
 
 local function log(fmtstr, ...)
     print(string.format("[AstraUE] " .. fmtstr .. "\n", ...))
@@ -721,8 +752,11 @@ local function tick()
     if actor ~= nil then
         local at, prot, vel, falling = actor_state(actor)
         if at ~= nil then
-            p = { x = at.X, y = at.Y, z = at.Z - (cache.half_height or 0), yaw = prot.Yaw, vx = vel.X, vy = vel.Y, falling = falling,
-                half_height = cache.half_height }
+            if his_motion.actor ~= actor then his_motion = { actor = actor } end -- another actor: no speed from the switch
+            local vx, vy = M.real_velocity(his_motion, at.X, at.Y, vel.X, vel.Y, dt)
+            p = { x = at.X, y = at.Y, z = at.Z - (cache.half_height or 0), yaw = prot.Yaw, vx = vx, vy = vy, falling = falling,
+                half_height = cache.half_height,
+                camera_dist = math.sqrt((loc.X - at.X) ^ 2 + (loc.Y - at.Y) ^ 2 + (loc.Z - at.Z) ^ 2) }
             source, tracer_actor = (actor == pawn and "pawn" or "view target"), actor
         else
             actor = nil -- stopped answering mid-frame (gone): fall through to the camera-only placement
@@ -736,9 +770,7 @@ local function tick()
         -- round a still player from a player stepping sideways while the view turns (review r3 of 0.2.5: a
         -- two-ray pivot estimate failed both slow pans and strafing) - so this speed only counts as going past
         -- the higher CAMERA_GO_START (from_camera). A pawnless game wants a provider of its own (astra-gta-trilogy).
-        local vx, vy = 0, 0
-        if last_cam_pos and dt > 0 then vx, vy = (loc.X - last_cam_pos.X) / dt, (loc.Y - last_cam_pos.Y) / dt end
-        last_cam_pos = { X = loc.X, Y = loc.Y }
+        local vx, vy = M.real_velocity(cam_motion, loc.X, loc.Y, nil, nil, dt)
         p = { x = loc.X, y = loc.Y, z = loc.Z, yaw = rot.Yaw, vx = vx, vy = vy, falling = false, from_camera = true }
         source, tracer_actor = "camera", pcm
     end
