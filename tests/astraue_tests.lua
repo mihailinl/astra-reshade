@@ -206,15 +206,88 @@ do
     -- saturates M.RUN_MAX at ordinary sprint+lag combinations; M.catchup_want's max() form must not.
     local pspeed, d = 600, 500
     local want = M.catchup_want(pspeed, d, M.NEAR_ENOUGH)
-    local sum_rejected = math.min(pspeed * 0.9 + (d - M.NEAR_ENOUGH) * 1.4, M.RUN_MAX)
     check(want < M.RUN_MAX, string.format("pace law: pspeed %d d %d does not saturate RUN_MAX (want %.0f)", pspeed, d, want))
-    check(sum_rejected >= M.RUN_MAX, "pace law: confirms the rejected SUM form would have saturated here (skeptic 2)")
     for _, ps in ipairs({ 400, 450, 500, 550, 600 }) do
         for _, dd in ipairs({ 200, 275, 350, 425, 500 }) do
             check(M.catchup_want(ps, dd, M.NEAR_ENOUGH) < M.RUN_MAX,
                 string.format("pace law: pspeed %d d %d stays under RUN_MAX", ps, dd))
         end
     end
+end
+
+-------------------------------------------------------------------------------- 0.2.5: what the owner saw in first-person games
+-- Poppy Playtime / Mecha Chameleon, 2026-10-20: she ran at his slightest step, walked right up against him, and
+-- trailed a camera turn by ~500 ms. In a first-person game the pawn turns with the camera, so her spot (behind
+-- and to his right) swings round him whenever he looks around.
+local function fresh_her() return { placed = false, x = 0, y = 0, z = 0, yaw = 0 } end
+do
+    -- a steady slow walk: she keeps his pace, no stop-and-go
+    for _, pspeed in ipairs({ 51, 70 }) do
+        local her, p = fresh_her(), { x = 0, y = 0, z = 0, yaw = 0, vx = pspeed, vy = 0, falling = false }
+        M.follow(her, p, 1 / 60)
+        local lo, hi = math.huge, 0
+        for i = 1, 600 do
+            p.x = p.x + pspeed / 60
+            M.follow(her, p, 1 / 60)
+            if i > 60 then lo, hi = math.min(lo, her.speed), math.max(hi, her.speed) end
+        end
+        check(lo > pspeed * 0.01 * 0.95 and hi < pspeed * 0.01 * 1.05,
+            string.format("steady %d cm/s walk: she keeps his pace, no stop-and-go (%.2f..%.2f m/s)", pspeed, lo, hi))
+    end
+end
+do
+    -- he stands, turns round to look at her, then walks TOWARD her slowly (a jittery 36-66 cm/s): her spot is now
+    -- behind him, so she has to pass him - at a walk, and round him, not through him
+    local her, p = fresh_her(), { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+    M.follow(her, p, 1 / 60)
+    for _ = 1, 60 do M.follow(her, p, 1 / 60) end
+    local bx, by = her.x, her.y
+    for _ = 1, 60 do
+        p.yaw = p.yaw + 3
+        M.follow(her, p, 1 / 60)
+    end
+    for _ = 1, 60 do M.follow(her, p, 1 / 60) end
+    check(near(her.x, bx, 0.5) and near(her.y, by, 0.5), "he turns round: she does not chase her spot as it swings")
+    local fastest, closest = 0, math.huge
+    for i = 1, 480 do
+        local v = 51 + 15 * math.sin(i * 0.7)
+        p.vx, p.x = -v, p.x - v / 60
+        M.follow(her, p, 1 / 60)
+        fastest = math.max(fastest, her.speed)
+        closest = math.min(closest, math.sqrt((p.x - her.x) ^ 2 + (p.y - her.y) ^ 2))
+    end
+    check(fastest <= M.CALM_PACE * 0.01 + 1e-6,
+        string.format("a slow walk toward her: she walks to her spot, never runs (fastest %.2f m/s)", fastest))
+    check(closest > 45, string.format("a slow walk toward her: she goes round him, not into him (closest %.0f cm)", closest))
+end
+do
+    -- standing too near him (in front of his face): she steps away once, and a full turn of his view then moves her
+    -- not at all
+    local her, p = fresh_her(), { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+    M.follow(her, p, 1 / 60)
+    her.x, her.y = 25, 0
+    for _ = 1, 180 do M.follow(her, p, 1 / 60) end
+    local d0 = math.sqrt(her.x ^ 2 + her.y ^ 2)
+    check(d0 > M.NEAR_PLAYER and her.y < 1 and her.x > 0,
+        string.format("too near him: she steps away along her own bearing (%.0f cm, at %.0f/%.0f)", d0, her.x, her.y))
+    local cx, cy = her.x, her.y
+    for _ = 1, 120 do
+        p.yaw = p.yaw + 3
+        M.follow(her, p, 1 / 60)
+    end
+    check(near(her.x, cx, 0.5) and near(her.y, cy, 0.5), "too near him, then a full camera turn: she stays where she stepped to")
+    -- too far while he stands: she comes back along her bearing, and a turn then leaves her be
+    her.x, her.y = 0, -400
+    for _ = 1, 360 do M.follow(her, p, 1 / 60) end
+    local d1 = math.sqrt(her.x ^ 2 + her.y ^ 2)
+    check(d1 < M.STAY_RADIUS and near(her.x, 0, 1) and her.y < 0,
+        string.format("too far while he stands: she comes back along her own bearing (%.0f cm)", d1))
+    cx, cy = her.x, her.y
+    for _ = 1, 120 do
+        p.yaw = p.yaw - 3
+        M.follow(her, p, 1 / 60)
+    end
+    check(near(her.x, cx, 0.5) and near(her.y, cy, 0.5), "back near him, then a camera turn: she stays")
 end
 
 -------------------------------------------------------------------------------- 0.2.5: scale-aware distances (F)

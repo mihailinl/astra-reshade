@@ -49,7 +49,7 @@ namespace enginelink
 		unsigned long long g_camId = 0;
 		uint64_t g_sentIndex = ~uint64_t(0); // the provider camera last sent (one picture per game camera)
 		ULONGLONG g_nextLight = 0;
-		int g_delay = camera_pace::kDefaultTargetAgeMs; // the MANUAL pin (ReShade.ini "CameraDelay", in ms), used when auto is off
+		int g_delay = camera_pace::kDefaultTargetAgeMs; // the MANUAL pin (ReShade.ini "CameraDelayMs"), used when auto is off
 		bool g_delayAuto = true;                       // measure camera_delay instead of asking the user to guess it (ReShade.ini "CameraDelayAuto")
 		camera_pace::PushPace g_pace;
 		uint64_t g_lastPushIdx = ~uint64_t(0); // the provider camera ring index last seen, to detect a new push

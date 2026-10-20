@@ -106,7 +106,9 @@ namespace
 	void load_overlay_settings()
 	{
 		int delay = enginelink::camera_delay();
-		reshade::get_config_value(nullptr, "ASTRA", "CameraDelay", delay);
+		// "CameraDelayMs", not 0.2.4's "CameraDelay": that one counted provider cameras, this one is milliseconds -
+		// an old pin read as ms would mean almost no delay, so it is left behind and the default applies
+		reshade::get_config_value(nullptr, "ASTRA", "CameraDelayMs", delay);
 		enginelink::camera_delay() = std::clamp(delay, 0, camera_pace::kAgeCeilingMs);
 		bool delayAuto = enginelink::camera_delay_auto();
 		reshade::get_config_value(nullptr, "ASTRA", "CameraDelayAuto", delayAuto);
@@ -129,7 +131,7 @@ namespace
 
 	void save_overlay_settings()
 	{
-		reshade::set_config_value(nullptr, "ASTRA", "CameraDelay", enginelink::camera_delay());
+		reshade::set_config_value(nullptr, "ASTRA", "CameraDelayMs", enginelink::camera_delay());
 		reshade::set_config_value(nullptr, "ASTRA", "CameraDelayAuto", enginelink::camera_delay_auto());
 		reshade::set_config_value(nullptr, "ASTRA", "WaitMs", layer::wait_ms());
 		reshade::set_config_value(nullptr, "ASTRA", "Size", enginelink::size());

@@ -14,9 +14,11 @@
 // delay_slots * time_per_slot =~ gap^2 / present_fps - QUADRATIC in the push:present cadence ratio, not
 // the intended ~1 present of staleness. A live GTA III DE / Mecha Chameleon log showed ~30% of presented
 // frames had no fresh provider camera of their own even once (Unreal pushes once per UE4SS engine tick,
-// which a present can easily outrun); at a push:present ratio of only ~6-8 that bug alone produced
-// several hundred ms of camera staleness - matching a live owner report of a ~500 ms camera-turn lag in
-// Poppy Playtime. A live Scarlet Skips capture test, 2026-10-19, measured ~14% idle (push keeps up with
+// which a present can easily outrun); at a push:present ratio of ~6-8 that bug alone would produce
+// several hundred ms of camera staleness. (It was NOT the ~500 ms camera-turn lag the owner saw in Poppy
+// Playtime, 2026-10-20: that game's own log shows a push on 81-98% of presents, a ratio near 1, where the
+// old count and the new age pick the same camera - that lag was AstraUE's follow brain chasing a spot that
+// turns with the view.) A live Scarlet Skips capture test, 2026-10-19, measured ~14% idle (push keeps up with
 // present almost always there) and the SAME ~100 ms settled reprojection error at the old camera_delay 1
 // and its old ceiling 3 alike - the ceiling, not the slider position, was the limit on that game, i.e.
 // ~100 ms is already a MEASURED amount of staleness this mechanism can ask for without the picture

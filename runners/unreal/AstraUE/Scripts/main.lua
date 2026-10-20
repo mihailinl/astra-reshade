@@ -28,7 +28,10 @@ M.INTEGRATION = "astra.unreal"
 -- gets a proportionally closer spot - today's numbers are unchanged for a reference-sized capsule).
 M.BACK, M.SIDE = 140.0, 90.0    -- her spot: behind and to the right of the player
 M.NEAR_ENOUGH = 35.0            -- she stops this close to her spot
-M.STAY_RADIUS = 300.0           -- while the player stands, she stays put if she is this near him
+M.STAY_RADIUS = 300.0           -- while the player stands, she stays put if she is this near him (further:
+                                 -- she comes back along her own bearing to her spot's distance from him)
+M.NEAR_PLAYER = 90.0            -- while he stands, nearer him than this she steps away, along her own bearing,
+                                 -- to her spot's distance (the Death Stranding follower's kStayNear, 0.9 m)
 M.TELEPORT = 2500.0             -- further than this from her spot (or a floor apart): she is put there
 M.FLOOR_APART = 300.0
 M.REF_HALF_HEIGHT = 88.0        -- a standard UE ThirdPersonCharacter capsule half-height (cm): BACK/SIDE/
@@ -49,6 +52,9 @@ M.GO_STOP = 20.0                -- ...and only goes back to "staying put" once h
                                  -- frame). Both sit below the owner's own measured slow walk (51-70 cm/s,
                                  -- see above) - raising GO_START to a round "100" would FREEZE her behind a
                                  -- player walking that slow (confirmed: she'd never start tracking him).
+M.CALM_PACE = 120.0             -- her catch-up never runs ahead of a slow player: at most this, or 1.5x his
+                                 -- pace once he is faster (a slow first step after looking around - her spot
+                                 -- swung to his other side - must not send her running there)
 M.ACCEL, M.BRAKE = 700.0, 1000.0 -- her catch-up ramp (cm/s^2, linear - not an exponential filter): the
                                  -- Death Stranding follower's own already-live values
                                  -- (astra-in-death-stranding/src/astra.cpp:20, kAccel/kBrake)
@@ -260,11 +266,12 @@ function M.follow(s, p, dt, now, ground)
         M.update_ground(s, p, now, ground, true)
         s.z = s.ground or p.z
         s.v, s.vx, s.vy, s.speed, s.placed, s.teleports, s.going = 0, 0, 0, 0, true, (s.teleports or 0) + 1, false
+        s.aim_x, s.aim_y = nil, nil
         return s
     end
     -- stand/go (E): she tracks the player once he is really GOING; a hysteresis gap (GO_START to start,
     -- GO_STOP to stop), not one bare threshold, so a tiny speed jitter near it can't flip the stand/catch-up
-    -- branch every frame. While not going (standing, or turning on the spot), she stays where she is near him.
+    -- branch every frame.
     if pspeed >= M.GO_START then
         s.going = true
     elseif pspeed < M.GO_STOP then
@@ -272,21 +279,55 @@ function M.follow(s, p, dt, now, ground)
     end
     local to_player = math.sqrt((p.x - s.x) ^ 2 + (p.y - s.y) ^ 2)
     local goal_x, goal_y = tx, ty
-    if not s.going and to_player < stay_radius and to_player > 60 then goal_x, goal_y = s.x, s.y end
+    if not s.going then
+        -- he stands, or only turns his view: her spot turns with his yaw, so she never chases it (a first-person
+        -- game turns the pawn with the camera). She stays where she is, and only when she is too near him or
+        -- too far from him does she walk, along her OWN bearing from him, to her spot's distance - so turning
+        -- the camera never moves her. That walk is latched (s.aim) until she gets there, so she does not stop
+        -- the moment she crosses the edge and start again at his next sway.
+        if s.aim_x == nil and (to_player < M.NEAR_PLAYER * dscale or to_player > stay_radius) then
+            local r = math.sqrt(back * back + side * side)
+            local ux, uy = -fx, -fy -- right on top of him: behind him
+            if to_player > 1e-3 then ux, uy = (s.x - p.x) / to_player, (s.y - p.y) / to_player end
+            s.aim_x, s.aim_y = p.x + ux * r, p.y + uy * r
+        end
+        if s.aim_x ~= nil then goal_x, goal_y = s.aim_x, s.aim_y else goal_x, goal_y = s.x, s.y end
+    else
+        s.aim_x, s.aim_y = nil, nil
+    end
     local dx, dy = goal_x - s.x, goal_y - s.y
     local d = math.sqrt(dx * dx + dy * dy)
-    local want = M.catchup_want(pspeed, d, near_enough)
+    if s.aim_x ~= nil and d <= near_enough then s.aim_x, s.aim_y = nil, nil end -- there
+    local want
+    if s.going and d <= near_enough then
+        want = math.min(pspeed, M.RUN_MAX) -- at her spot while he walks: keep his pace, never stop-and-go
+    else
+        want = math.min(M.catchup_want(pspeed, d, near_enough), math.max(pspeed * 1.5, M.CALM_PACE))
+    end
     s.v = M.accel_brake(s.v or 0, want, dt)
     local step = math.min(s.v * dt, d)
+    local mx, my = 0, 0 -- this frame's move
     if d > 1e-3 and step > 0 then
-        s.x, s.y = s.x + dx / d * step, s.y + dy / d * step
-        if step > 0.3 then s.yaw = M.turn(s.yaw, math.deg(math.atan(dy, dx)), 540 * dt) end
+        -- on her way she keeps clear of him (the Death Stranding follower's push, twice as strong: a
+        -- first-person player walks INTO her) - going from in front of him to her spot behind him she walks
+        -- round him, not through him
+        local ux, uy = dx / d, dy / d
+        local clear = M.NEAR_PLAYER * dscale
+        if to_player < clear and to_player > 1e-3 then
+            local push = (1 - to_player / clear) * 3.0
+            ux, uy = ux - (p.x - s.x) / to_player * push, uy - (p.y - s.y) / to_player * push
+            local l = math.sqrt(ux * ux + uy * uy)
+            if l > 1e-3 then ux, uy = ux / l, uy / l else ux, uy = dx / d, dy / d end
+        end
+        mx, my = ux * step, uy * step
+        s.x, s.y = s.x + mx, s.y + my
+        if step > 0.3 then s.yaw = M.turn(s.yaw, math.deg(math.atan(uy, ux)), 540 * dt) end
     elseif not s.going then
         s.yaw = M.turn(s.yaw, p.yaw, 90 * dt) -- standing: turn slowly the way he looks
     end
     s.z = s.z + ((s.ground or p.z) - s.z) * math.min(1, dt * 8)
     local inv = dt > 0 and 1 / dt or 0
-    s.vx, s.vy = (d > 1e-3 and dx / d * step or 0) * inv, (d > 1e-3 and dy / d * step or 0) * inv
+    s.vx, s.vy = mx * inv, my * inv
     -- her pace in m/s (C): the SAME quantity that just moved her (the realized step/dt, already clamped by
     -- d) - never a second, independently-filtered copy. The old code low-passed a separate `pace` signal at
     -- its own tau and snapped it to 0 below 0.05, which (decaying faster than s.v/her position) could leave
