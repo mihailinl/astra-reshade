@@ -121,8 +121,9 @@ namespace provider
 
 		/// The NEWEST camera whose age (now_ms - at_ms) is at least age_ms - never more than one push
 		/// staler than that bar requires, so a provider that pushes rarely is never walked back several
-		/// pushes' worth (camera_pace.h's own fix). Falls back to the newest held camera when none is
-		/// old enough (age_ms <= 0, or every push is still fresher than it: nothing to delay for).
+		/// pushes' worth (camera_pace.h's own fix). age_ms <= 0: the newest. When every held camera is
+		/// still fresher than age_ms (a transient: the ring holds ~14 pushes and the asked age is about one
+		/// push gap), the OLDEST held one - the nearest to the asked age.
 		bool get_by_age(int64_t now_ms, int64_t age_ms, Camera &out) const
 		{
 			for (int tries = 0; tries < 8; ++tries)

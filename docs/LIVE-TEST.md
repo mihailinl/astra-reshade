@@ -118,7 +118,8 @@ Look for, in order:
 2. **Walls hide her**: walk so a pillar or wall is between the camera and her — the wall covers her, and she is
    never drawn through it.
 3. **She is glued to the world on fast turns**: swing the camera quickly left and right. If she slides AHEAD of the
-   turn, raise `camera delay`; if she trails it, lower it (0..3; 1 is the default). Note the value that is right.
+   turn, raise `camera delay`; if she trails it, lower it (since 0.2.5 in ms, 0..100; auto is on by default and
+   picks about one provider push gap, ~17 ms at 60 Hz; before 0.2.5 it counted provider cameras, 0..3). Note the value that is right.
 4. **She follows**: run, stop, turn on the spot (she stays put), run far (she catches up; past 25 m she is put
    beside you).
 5. **Pause** (Esc): she disappears while the game is paused.
@@ -128,7 +129,7 @@ desktop` within 0.05 s of the hello, `layer: connected to the engine's frames (6
 `... frames published, 0 dropped`; she stood on the grass beside the player at her size (1); the hill's terrain hid
 her legs when she stood behind its crest (2); with the camera cut 40 degrees back and forth eleven times, every one
 of 70 window grabs (one per 25 ms) showed her where that frame's scenery says - none a frame late, `camera delay` 1
-is right here; swings at 70 degrees/s kept her feet on the ground (3); she followed the player 17 m (4); the game's
+(a count of provider cameras then, before 0.2.5's ms) is right here; swings at 70 degrees/s kept her feet on the ground (3); she followed the player 17 m (4); the game's
 pause hid her and unpausing brought her back (5); quitting gave her back to the desktop (`[switch] no game holds her
 — back to the desktop`). This game's camera never turns: the turns, the walk and the pause came from the test
 driver `tools/ue-test-driver/` (AstraUETest, a UE4SS mod reading commands from a file), not from a player.

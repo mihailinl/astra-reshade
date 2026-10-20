@@ -44,14 +44,16 @@ M.WALK_PACE = 70.0              -- her slowest catch-up pace once she is actuall
                                  -- old M.WALK_MIN=150 fired on ANY >35 cm gap, 2-3x the owner's own measured
                                  -- 51-70 cm/s slow walk in Poppy Playtime, UE4SS.log 2026-10-20).
 M.RUN_MAX = 950.0
-M.GO_START = 40.0               -- she starts tracking (stops "staying put") once the player is going at
-                                 -- least this fast (cm/s)
-M.GO_STOP = 20.0                -- ...and only goes back to "staying put" once he is slower than this - a
+M.GO_START = 15.0               -- she starts tracking (stops "staying put") once the player is going at
+                                 -- least this fast (cm/s): any real movement, a crouch or a half-pushed stick
+                                 -- included - a creep below this edge would never count as going, and she
+                                 -- would stand, then rush to a latched aim once he is STAY_RADIUS away (review
+                                 -- of 0.2.5: a 30 cm/s creep froze-and-burst at an edge of 40). 15 cm/s is
+                                 -- also the engine pack's own walk entry (nayu-anims.toml `speed > 0.15`).
+M.GO_STOP = 8.0                 -- ...and only goes back to "staying put" once he is slower than this - a
                                  -- hysteresis gap, not one bare threshold (M.STILL used to be both edges at
-                                 -- once: a tiny jitter near it could flip the stand/catch-up branch every
-                                 -- frame). Both sit below the owner's own measured slow walk (51-70 cm/s,
-                                 -- see above) - raising GO_START to a round "100" would FREEZE her behind a
-                                 -- player walking that slow (confirmed: she'd never start tracking him).
+                                 -- once: a jitter near it could flip the stand/catch-up branch every frame);
+                                 -- the pack's walk exit is `speed < 0.08`.
 M.CALM_PACE = 120.0             -- her catch-up never runs ahead of a slow player: at most this, or 1.5x his
                                  -- pace once he is faster (a slow first step after looking around - her spot
                                  -- swung to his other side - must not send her running there)

@@ -290,6 +290,28 @@ do
     check(near(her.x, cx, 0.5) and near(her.y, cy, 0.5), "back near him, then a camera turn: she stays")
 end
 
+do
+    -- a creep (crouching, a half-pushed stick) is still going: she walks at his pace from the first steps, never
+    -- standing and then rushing to catch up (review of 0.2.5: a 30 cm/s creep froze-and-burst at GO_START 40)
+    for _, pspeed in ipairs({ 18, 25, 30, 38 }) do
+        local her, p = fresh_her(), { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+        M.follow(her, p, 1 / 60)
+        for _ = 1, 60 do M.follow(her, p, 1 / 60) end
+        p.vx = pspeed
+        local stood, fastest = 0, 0
+        for i = 1, 1800 do
+            p.x = p.x + pspeed / 60
+            M.follow(her, p, 1 / 60)
+            if i > 30 then
+                if her.speed == 0 then stood = stood + 1 end
+                fastest = math.max(fastest, her.speed)
+            end
+        end
+        check(stood == 0 and fastest <= pspeed * 0.01 * 1.05,
+            string.format("a %d cm/s creep: she walks at his pace throughout (stood %d frames, fastest %.2f m/s)", pspeed, stood, fastest))
+    end
+end
+
 -------------------------------------------------------------------------------- 0.2.5: scale-aware distances (F)
 do
     local ref_dist = math.sqrt(M.BACK ^ 2 + M.SIDE ^ 2)

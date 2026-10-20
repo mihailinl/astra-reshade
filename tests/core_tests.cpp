@@ -224,10 +224,14 @@ static void test_provider()
 		}
 		provider::Camera out;
 		CHECK(r2.get_by_age(t, 17, out) && out.frame == 18 && t - out.at_ms >= 17 && t - out.at_ms < 2 * 17);
-		// nothing old enough yet (age 0): falls back to the newest
+		// no delay asked (age 0): the newest
 		CHECK(r2.get_by_age(t, 0, out) && out.frame == 19);
+		// every held camera fresher than asked (the ring holds ~14 pushes, 238 ms here): the OLDEST held one,
+		// the nearest to the asked age - never the newest (which would be the furthest from it)
+		CHECK(r2.get_by_age(t, 1000, out) && out.frame == 6 && t - out.at_ms == 13 * 17);
 	}
-	// a push every 7th present (~117 ms apart, the owner's measured Mecha Chameleon ratio): asking for the
+	// a push every 7th present (~117 ms apart, a sparse provider - not any game measured so far: Poppy Playtime
+	// and Mecha Chameleon push on 60-98% of presents): asking for the
 	// camera_pace.h ceiling's worth old (100 ms) never walks back MORE than one push, however sparse the
 	// provider is - the bug this replaces (a push-count fed a RATE) grew the age with the SQUARE of the ratio
 	{
@@ -480,7 +484,7 @@ static void test_camera_pace()
 {
 	// never ticked: the untouched default is a plausible single-present guess (~17 ms at 60 Hz), so a
 	// provider nobody has measured yet (or one with no camera at all) is not asked to wait at all really -
-	// get_by_age below falls back to the newest when nothing is that old yet
+	// get_by_age below takes the oldest held camera when nothing is that old yet
 	CHECK(camera_pace::PushPace{}.target_age_ms() == camera_pace::kDefaultTargetAgeMs);
 
 	// a push every single presented frame at 60 Hz (today's easy case: the provider's own present callback
