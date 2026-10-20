@@ -1171,20 +1171,54 @@ do
     -- a teleport is no speed
     local st = {}
     local vx, vy
-    for i = 0, 30 do vx, vy = M.real_velocity(st, 300 * i / 60, 0, 300, 0, 1 / 60) end
+    for i = 0, 30 do vx, vy = M.real_velocity(st, 300 * i / 60, 0, 300, 0, i / 60) end
     check(near(vx, 300, 0.01) and near(vy, 0, 0.01), "his speed: a report that agrees is his speed")
     st = {}
-    for i = 0, 30 do vx, vy = M.real_velocity(st, 300 * i / 60, 0, 0, 0, 1 / 60) end
+    for i = 0, 30 do vx, vy = M.real_velocity(st, 300 * i / 60, 0, 0, 0, i / 60) end
     check(near(vx, 300, 3), string.format("his speed: a report of 0 while he walks 300 cm/s is not taken (%.1f)", vx))
     st = {}
-    for i = 0, 30 do vx, vy = M.real_velocity(st, 0, 120 * i / 60, nil, nil, 1 / 60) end
+    for i = 0, 30 do vx, vy = M.real_velocity(st, 0, 120 * i / 60, nil, nil, i / 60) end
     check(near(vy, 120, 2), string.format("his speed: no report - his displacement (%.1f)", vy))
-    vx, vy = M.real_velocity(st, 100000, 0, 0, 0, 1 / 60)
+    vx, vy = M.real_velocity(st, 100000, 0, 0, 0, 31 / 60)
     check(math.abs(vx) < 1 and math.abs(vy) < 200, string.format("his speed: a teleport is no speed (%.0f, %.0f)", vx, vy))
     -- standing still with a jittery position (a few mm a frame): no speed to speak of
     st = {}
-    for i = 0, 120 do vx, vy = M.real_velocity(st, (i % 2) * 0.3, 0, 0, 0, 1 / 60) end
+    for i = 0, 120 do vx, vy = M.real_velocity(st, (i % 2) * 0.3, 0, 0, 0, i / 60) end
     check(math.sqrt(vx * vx + vy * vy) < M.GO_STOP, string.format("his speed: millimetre jitter is standing (%.1f cm/s)", math.sqrt(vx * vx + vy * vy)))
+    -- review of 0.2.6: a 1 s hitch while he walks 300 cm/s (reported right) is no 3000 cm/s spike; a 15 m respawn while
+    -- he stands (reported 0) is no sprint; a stretch with no sample (the actor did not answer) starts over
+    local worst = 0
+    st = {}
+    local t, x = 0, 0
+    for i = 1, 120 do
+        local step = (i == 60) and 1.0 or 1 / 60
+        t, x = t + step, x + 300 * step
+        vx = M.real_velocity(st, x, 0, 300, 0, t)
+        worst = math.max(worst, vx)
+    end
+    check(worst <= 300 * 1.5 + M.GO_START, string.format("his speed: a 1 s hitch is no spike (worst %.0f cm/s)", worst))
+    st, worst = {}, 0
+    for i = 1, 120 do
+        vx = M.real_velocity(st, i == 60 and 1500 or (i > 60 and 1500 or 0), 0, 0, 0, i / 60)
+        worst = math.max(worst, math.abs(vx))
+    end
+    check(worst < M.GO_STOP, string.format("his speed: a 15 m respawn is no speed (worst %.0f cm/s)", worst))
+end
+do
+    -- review of 0.2.6: a camera hovering at the first-person edge (99/101 cm, every other frame) must not flip her
+    -- distance every frame - once in first person she stays there until FIRST_PERSON_LEAVE
+    local her, p = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }, { x = 0, y = 0, z = 0, yaw = 0, vx = 300, vy = 0, falling = false, camera_dist = 99 }
+    M.follow(her, p, 1 / 60)
+    local flips, last = 0, her.first_person
+    for i = 1, 240 do
+        p.x, p.camera_dist = p.x + 5, (i % 2 == 0) and 99 or 101
+        M.follow(her, p, 1 / 60)
+        if her.first_person ~= last then flips, last = flips + 1, her.first_person end
+    end
+    check(flips == 0 and her.first_person == true, string.format("first person: a camera hovering at the edge does not flip her distance (%d flips)", flips))
+    p.camera_dist = 300
+    M.follow(her, p, 1 / 60)
+    check(her.first_person == false, "first person: a camera pulled back past FIRST_PERSON_LEAVE is third person again")
 end
 do
     -- the whole frame, Mecha Chameleon's pawn: GetVelocity says 0 while he walks 300 cm/s for 6 s - she keeps up, at

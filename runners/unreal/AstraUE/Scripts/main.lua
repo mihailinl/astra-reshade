@@ -60,6 +60,8 @@ M.CAMERA_GO_START, M.CAMERA_GO_STOP = 60.0, 30.0 -- the same edges for a speed r
 M.FIRST_PERSON_DIST = 100.0     -- the camera this near the player's centre (cm, times his size) is his eyes: first
                                  -- person (Poppy Playtime's eye sits ~50 cm above its capsule's centre; a third-
                                  -- person boom is 2-4 m away)...
+M.FIRST_PERSON_LEAVE = 140.0    -- ...and only past this is she out of first person again (a hysteresis gap: an aim
+                                 -- camera hovering at the edge must not re-pick her distance every frame)
 M.FIRST_PERSON_SCALE = 1.6      -- ...and in first person her distances are this much larger: the camera IS him, so
                                  -- her whole gap is her distance from the viewer, with no boom to add to it (the
                                  -- owner, 2026-10-20: "she runs too close behind me" - 166 cm read as at his heels)
@@ -282,24 +284,30 @@ function M.accel_brake(v, want, dt)
 end
 
 --- His velocity (UE cm/s) as a raw fact: what the game reports (vx, vy - nil: no report), unless his own displacement
---- since the last frame says he moves much faster - a pawn the game moves without a movement component reports ~0 while
---- it walks (Mecha Chameleon, 2026-10-20: she followed "at a slow walk however far, then teleported"), and the camera-
---- only fallback has no report at all (the camera's displacement). The displacement is averaged over ~50 ms (frame
---- timing jitter); a jump past TELEPORT is a teleport, not a speed. st: this function's own state.
-function M.real_velocity(st, x, y, vx, vy, dt)
-    local jumped = st.x ~= nil and (x - st.x) ^ 2 + (y - st.y) ^ 2 > M.TELEPORT ^ 2
-    if st.x ~= nil and dt > 0 and not jumped then
-        local k = math.min(1, dt * 20)
-        st.vx = (st.vx or 0) + ((x - st.x) / dt - (st.vx or 0)) * k
-        st.vy = (st.vy or 0) + ((y - st.y) / dt - (st.vy or 0)) * k
-    elseif jumped then
-        st.vx, st.vy = 0, 0
+--- says he moves much faster - a pawn the game moves without a movement component reports ~0 while it walks (Mecha
+--- Chameleon, 2026-10-20: she followed "at a slow walk however far, then teleported"), and the camera-only fallback has
+--- no report at all (the camera's displacement). The displacement is measured over the REAL time since the last sample
+--- (now: the tick clock, seconds - never the frame's clamped dt) and averaged over ~50 ms; a gap over GAP_MAX (a hitch,
+--- frames without an answer) or a speed over JUMP_SPEED (a respawn, a cut) starts it over instead of reading as a sprint
+--- (review of 0.2.6: a 1 s hitch read 10x his speed). st: this function's own state.
+M.GAP_MAX, M.JUMP_SPEED = 0.25, 4000.0
+function M.real_velocity(st, x, y, vx, vy, now)
+    local gap = st.t ~= nil and now - st.t or nil
+    if gap ~= nil and gap > 0 then
+        local ux, uy = (x - st.x) / gap, (y - st.y) / gap
+        if gap > M.GAP_MAX or ux * ux + uy * uy > M.JUMP_SPEED ^ 2 then
+            st.vx, st.vy = nil, nil -- a hitch or a jump: no speed from it, a fresh start
+        else
+            local k = math.min(1, gap * 20)
+            st.vx = st.vx == nil and ux or st.vx + (ux - st.vx) * k
+            st.vy = st.vy == nil and uy or st.vy + (uy - st.vy) * k
+        end
     end
-    st.x, st.y = x, y
-    local dvx, dvy = st.vx or 0, st.vy or 0
-    if vx == nil then return dvx, dvy end
-    local said, moved = math.sqrt(vx * vx + vy * vy), math.sqrt(dvx * dvx + dvy * dvy)
-    if moved > said * 1.5 + M.GO_START then return dvx, dvy end
+    if gap == nil or gap > 0 then st.x, st.y, st.t = x, y, now end
+    if st.vx == nil then return vx or 0, vy or 0 end
+    if vx == nil then return st.vx, st.vy end
+    local said, moved = math.sqrt(vx * vx + vy * vy), math.sqrt(st.vx * st.vx + st.vy * st.vy)
+    if moved > said * 1.5 + M.GO_START then return st.vx, st.vy end
     return vx, vy
 end
 
@@ -311,7 +319,14 @@ function M.follow(s, p, dt, now, ground)
     -- radii proportionally; no half_height given (or 0): today's fixed numbers, unchanged
     local dscale = (p.half_height and p.half_height > 0) and (p.half_height / M.REF_HALF_HEIGHT) or 1.0
     -- first person (the camera at his head, p.camera_dist): every comfort distance larger (FIRST_PERSON_SCALE)
-    if p.camera_dist ~= nil and p.camera_dist < M.FIRST_PERSON_DIST * dscale then dscale = dscale * M.FIRST_PERSON_SCALE end
+    if p.camera_dist == nil then
+        s.first_person = false
+    elseif p.camera_dist < M.FIRST_PERSON_DIST * dscale then
+        s.first_person = true
+    elseif p.camera_dist > M.FIRST_PERSON_LEAVE * dscale then
+        s.first_person = false
+    end
+    if s.first_person then dscale = dscale * M.FIRST_PERSON_SCALE end
     local back, side, near_enough, stay_radius = M.BACK * dscale, M.SIDE * dscale, M.NEAR_ENOUGH * dscale, M.STAY_RADIUS * dscale
     local yr = math.rad(p.yaw)
     local fx, fy = math.cos(yr), math.sin(yr)
@@ -753,7 +768,7 @@ local function tick()
         local at, prot, vel, falling = actor_state(actor)
         if at ~= nil then
             if his_motion.actor ~= actor then his_motion = { actor = actor } end -- another actor: no speed from the switch
-            local vx, vy = M.real_velocity(his_motion, at.X, at.Y, vel.X, vel.Y, dt)
+            local vx, vy = M.real_velocity(his_motion, at.X, at.Y, vel.X, vel.Y, now)
             p = { x = at.X, y = at.Y, z = at.Z - (cache.half_height or 0), yaw = prot.Yaw, vx = vx, vy = vy, falling = falling,
                 half_height = cache.half_height,
                 camera_dist = math.sqrt((loc.X - at.X) ^ 2 + (loc.Y - at.Y) ^ 2 + (loc.Z - at.Z) ^ 2) }
@@ -770,7 +785,7 @@ local function tick()
         -- round a still player from a player stepping sideways while the view turns (review r3 of 0.2.5: a
         -- two-ray pivot estimate failed both slow pans and strafing) - so this speed only counts as going past
         -- the higher CAMERA_GO_START (from_camera). A pawnless game wants a provider of its own (astra-gta-trilogy).
-        local vx, vy = M.real_velocity(cam_motion, loc.X, loc.Y, nil, nil, dt)
+        local vx, vy = M.real_velocity(cam_motion, loc.X, loc.Y, nil, nil, now)
         p = { x = loc.X, y = loc.Y, z = loc.Z, yaw = rot.Yaw, vx = vx, vy = vy, falling = false, from_camera = true }
         source, tracer_actor = "camera", pcm
     end
