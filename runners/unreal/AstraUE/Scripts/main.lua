@@ -116,10 +116,52 @@ function M.projected_tan_v(project, x, y, z, fx, fy, fz, ux, uy, uz)
     local _, ty = project(ax + ux * M.PROBE_H, ay + uy * M.PROBE_H, az + uz * M.PROBE_H)
     if ty == nil then return nil end
     local dy = cy - ty -- screen y grows downward: the point above the axis is drawn higher
-    if cy < 2 or dy < 0.25 then return nil end
+    -- `not (a >= b)` rather than `a < b`: a NaN answer (a degenerate view, review r2) fails every comparison
+    if not (cy >= 2 and dy >= 0.25) then return nil end
     local t = (M.PROBE_H / M.PROBE_D) * cy / dy
-    if t < 0.0087 or t > 11.43 then return nil end -- 1..170 degrees
+    if not (t >= 0.0087 and t <= 11.43) then return nil end -- 1..170 degrees
     return t
+end
+
+--- The camera-only fallback's player (no Pawn, no view target - GTA DE's Gameface): the point the view turns about.
+--- A third-person camera orbits the player on a boom, a first-person one turns about itself; either way the camera's
+--- own motion while the view only TURNS is not the player moving (review r2 of 0.2.5: a 300 cm boom turning at 20
+--- deg/s moved the camera 105 cm/s, and she chased her spot as it swung). When the view turns, two frames' horizontal
+--- view rays meet at the pivot: its distance along the ray is the boom (averaged, 3D, so looking up or down keeps the
+--- pivot where it is; 0 until the view first turns - the camera itself, as before). st: this function's own state;
+--- x, y, z (UE cm), pitch and yaw (degrees) of the camera; dt seconds. Returns the pivot x, y, z and its velocity
+--- vx, vy (cm/s) - both under this frame's boom, so a boom first measured is not a jump of the player.
+M.BOOM_MAX = 1500.0
+function M.view_pivot(st, x, y, z, pitch, yaw, dt)
+    local function ray(yaw_deg, pitch_deg)
+        local yr, pr = math.rad(yaw_deg), math.rad(pitch_deg)
+        local cp = math.cos(pr)
+        return math.cos(yr) * cp, math.sin(yr) * cp, math.sin(pr)
+    end
+    local fx, fy, fz = ray(yaw, pitch)
+    if st.x ~= nil then
+        local yr0 = math.rad(st.yaw)
+        local d0x, d0y = math.cos(yr0), math.sin(yr0)
+        local hx, hy = math.cos(math.rad(yaw)), math.sin(math.rad(yaw))
+        local turn = d0x * hy - d0y * hx -- sin of the turn since the last frame
+        if math.abs(turn) > 0.005 then -- more than ~0.3 degrees: the two rays meet at the pivot
+            local wx, wy = x - st.x, y - st.y
+            local s = (wx * d0y - wy * d0x) / turn -- the pivot's distance ahead along the NEW horizontal ray
+            if s >= 0 and s <= M.BOOM_MAX then
+                local boom = s / math.max(math.cos(math.rad(pitch)), 0.2)
+                st.boom = st.boom == nil and boom or st.boom + (boom - st.boom) * 0.2
+            end
+        end
+    end
+    local b = st.boom or 0
+    local px, py, pz = x + fx * b, y + fy * b, z + fz * b
+    local vx, vy = 0, 0
+    if st.x ~= nil and dt > 0 then
+        local qx, qy = ray(st.yaw, st.pitch)
+        vx, vy = (px - (st.x + qx * b)) / dt, (py - (st.y + qy * b)) / dt
+    end
+    st.x, st.y, st.yaw, st.pitch = x, y, yaw, pitch
+    return px, py, pz, vx, vy
 end
 
 --- The camera line: C <frame> <pos gl m> <fwd gl> <up gl> <fov> <h|v> <aspect> <near m>
@@ -326,8 +368,12 @@ function M.follow(s, p, dt, now, ground)
     local want
     if s.going and d <= near_enough then
         want = math.min(pspeed, M.RUN_MAX) -- at her spot while he walks: keep his pace, never stop-and-go
-    else
+    elseif s.going then
         want = math.min(M.catchup_want(pspeed, d, near_enough), math.max(pspeed * 1.5, M.CALM_PACE))
+    else
+        -- he stands (or creeps slower than GO_START): she only ever walks, at her calm walk - never a rush at
+        -- CALM_PACE to an aim while he barely moves (review r2: a 9-14 cm/s creep stood, then burst at 1.2 m/s)
+        want = math.min(M.catchup_want(pspeed, d, near_enough), M.WALK_PACE)
     end
     s.v = M.accel_brake(s.v or 0, want, dt)
     local step = math.min(s.v * dt, d)
@@ -371,7 +417,7 @@ local UEHelpers = require("UEHelpers")
 
 local pipe, next_open = nil, 0
 local pc, next_find = nil, 0
-local cache = { at = -1, paused_at = -1, project_fails = 0 }
+local cache = { at = -1, paused_at = -1, project_misses = 0, project_next = -1 }
 local her = { placed = false, x = 0, y = 0, z = 0, yaw = 0, v = 0, vx = 0, vy = 0, speed = 0 }
 local last_frame, last_clock, own_frame, frame_counter = -1, nil, 0, nil
 local stats = { frames = 0, sent = 0, cost = 0, logged_at = 0, errors = 0 }
@@ -379,7 +425,7 @@ local kismet = nil
 local NO_COLOR = { R = 0, G = 0, B = 0, A = 0 }
 local trace_broken = false
 local sun = { comp = nil, find_at = -1e9, sent_at = -1e9, said = nil, visible = 1 }
-local last_cam_pos = nil -- her camera-only fallback's velocity (no actor at all: GTA DE's Gameface, see player_actor)
+local cam_pivot = {} -- her camera-only fallback's player velocity (no actor at all: GTA DE's Gameface; M.view_pivot)
 
 local function log(fmtstr, ...)
     print(string.format("[AstraUE] " .. fmtstr .. "\n", ...))
@@ -469,7 +515,7 @@ end
 local function refresh_cache(now, pcm, pawn)
     if now - cache.at < 1 then return end
     cache.at = now
-    cache.horizontal, cache.aspect, cache.near = true, 0, 0
+    cache.horizontal, cache.aspect, cache.near, cache.ortho = true, 0, 0, false
     pcall(function()
         local c = pc.Player.AspectRatioAxisConstraint -- 0 MaintainYFOV, 1 MaintainXFOV, 2 MajorAxisFOV
         cache.horizontal = c ~= 0
@@ -478,6 +524,7 @@ local function refresh_cache(now, pcm, pawn)
         local pov = pcm.CameraCachePrivate.POV
         if pov.bConstrainAspectRatio then cache.aspect = pov.AspectRatio end
         if pov.PerspectiveNearClipPlane and pov.PerspectiveNearClipPlane > 0 then cache.near = pov.PerspectiveNearClipPlane end
+        cache.ortho = pov.ProjectionMode == 1 -- ECameraProjectionMode::Orthographic
     end)
     cache.half_height = 0
     pcall(function() cache.half_height = pawn.CapsuleComponent:GetScaledCapsuleHalfHeight() end)
@@ -604,11 +651,13 @@ local function sun_line(now, pawn)
 end
 
 --- The game's own tan(half vertical fov) this frame: M.projected_tan_v through APlayerController::
---- ProjectWorldLocationToScreen (player-viewport-relative pixels), or nil. A nil answer (a loading screen, no
---- viewport yet) is not a failure; a call that throws 30 frames running (a game without the function) is not
---- made again, said once - she keeps the fov from its settings there.
-local function measured_tan_v(pc, loc, rot)
-    if cache.project_off then return nil end
+--- ProjectWorldLocationToScreen (player-viewport-relative pixels), or nil - then she keeps the fov from its settings.
+--- Two seconds without an answer (a game without the function, one that always says no, a long loading screen): it is
+--- asked once a second from then on, until it answers again (said once per such stretch) - never given up for good,
+--- since an alt-tab or a resolution change can make the call fail for a moment (review r2). An orthographic camera
+--- (cache.ortho) is not asked at all: the measure is a pinhole's.
+local function measured_tan_v(pc, loc, rot, now)
+    if cache.ortho or now < cache.project_next then return nil end
     local fx, fy, fz, ux, uy, uz = M.rotator_axes(rot.Pitch, rot.Yaw, rot.Roll)
     local failed = false
     local function project(x, y, z)
@@ -622,14 +671,18 @@ local function measured_tan_v(pc, loc, rot)
         return screen.X, screen.Y
     end
     local t = M.projected_tan_v(project, loc.X, loc.Y, loc.Z, fx, fy, fz, ux, uy, uz)
-    if not failed then
-        cache.project_fails = 0
+    if t ~= nil then
+        cache.project_misses, cache.said_no_projection = 0, false
         return t
     end
-    cache.project_fails = cache.project_fails + 1
-    if cache.project_fails >= 30 then
-        cache.project_off = true
-        log("cannot ask the game where it draws (the fov comes from its settings): %s", tostring(cache.project_error))
+    cache.project_misses = cache.project_misses + 1
+    if cache.project_misses >= 120 then
+        cache.project_next = now + 1
+        if not cache.said_no_projection then
+            cache.said_no_projection = true
+            log("the game does not say where it draws (%s): her fov comes from its settings, asked again once a second",
+                failed and tostring(cache.project_error) or "no answer")
+        end
     end
     return nil
 end
@@ -685,7 +738,7 @@ local function tick()
     -- the fov sent: the game's own projection, measured each frame (M.projected_tan_v); its settings only when it
     -- cannot answer (then GetFOVAngle on the axis its aspect-axis setting names, as before)
     local send_fov, send_horizontal = fov, cache.horizontal
-    local tan_v = measured_tan_v(pc, loc, rot)
+    local tan_v = measured_tan_v(pc, loc, rot, now)
     if tan_v ~= nil then
         send_fov, send_horizontal = math.deg(2 * math.atan(tan_v)), false
         if not cache.said_projection then
@@ -709,13 +762,12 @@ local function tick()
         end
     end
     if actor == nil then
-        -- no actor for the player at all: place her relative to the camera - her spot (M.follow's BACK/SIDE,
-        -- the same fixed distance a Pawn gets) is now behind-and-beside the camera, ground traced from it.
-        -- Her velocity: the camera's own frame-to-frame movement (there is no actor to read one from).
-        local vx, vy = 0, 0
-        if last_cam_pos and dt > 0 then vx, vy = (loc.X - last_cam_pos.X) / dt, (loc.Y - last_cam_pos.Y) / dt end
-        last_cam_pos = { X = loc.X, Y = loc.Y }
-        p = { x = loc.X, y = loc.Y, z = loc.Z, yaw = rot.Yaw, vx = vx, vy = vy, falling = false }
+        -- no actor for the player at all: place her relative to what the camera shows - her spot (M.follow's
+        -- BACK/SIDE, the same fixed distance a Pawn gets) is behind-and-beside him, ground traced from it.
+        -- Him: the point the camera's view turns about (M.view_pivot - the player a third-person camera orbits, the
+        -- camera itself in first person), never the camera's own motion, which a boom has whenever the view turns.
+        local px, py, pz, vx, vy = M.view_pivot(cam_pivot, loc.X, loc.Y, loc.Z, rot.Pitch, rot.Yaw, dt)
+        p = { x = px, y = py, z = pz, yaw = rot.Yaw, vx = vx, vy = vy, falling = false }
         source, tracer_actor = "camera", pcm
     end
     M.follow(her, p, dt, now, trace_down(tracer_actor))

@@ -493,6 +493,7 @@ end
 --- opts.no_pcm: pc.PlayerCameraManager is nil too (no camera at all).
 --- opts.axis: the local player's AspectRatioAxisConstraint (default 1, MaintainXFOV). opts.draws = { tan_v, w, h }: the
 --- PlayerController answers ProjectWorldLocationToScreen with that projection (no answer at all without it).
+--- opts.ortho: the camera's POV is orthographic. w.cam_loc / w.cam_rot (settable): the camera, else a fixed one.
 function make_world(opts)
     opts = opts or {}
     local w = { frame = 1000, view_target = opts.view_target }
@@ -526,10 +527,11 @@ function make_world(opts)
         CharacterMovement = object({ IsFalling = function() return false end }),
     })
     local pcm = object({
-        GetCameraLocation = function() return { X = 700, Y = 1800, Z = 260 } end,
-        GetCameraRotation = function() return { Pitch = -15, Yaw = 80, Roll = 0 } end,
+        GetCameraLocation = function() return w.cam_loc or { X = 700, Y = 1800, Z = 260 } end,
+        GetCameraRotation = function() return w.cam_rot or { Pitch = -15, Yaw = 80, Roll = 0 } end,
         GetFOVAngle = function() return 90 end,
-        CameraCachePrivate = { POV = { bConstrainAspectRatio = false, AspectRatio = 1.7778, PerspectiveNearClipPlane = 10 } },
+        CameraCachePrivate = { POV = { bConstrainAspectRatio = false, AspectRatio = 1.7778, PerspectiveNearClipPlane = 10,
+            ProjectionMode = opts.ortho and 1 or 0 } },
     })
     -- what a real UE 5.6 offers: no IsPaused on the PlayerController (plain C++), GameplayStatics' IsGamePaused
     -- w.level: bumped by a test, a new level - the old PlayerController is gone, a new one is found
@@ -1021,7 +1023,7 @@ do
     check(M.projected_tan_v(function() return 640, 360 end, 0, 0, 0, 1, 0, 0, 0, 0, 1) == nil, "measured fov: a degenerate answer is refused")
 end
 
-local function run_frames(opts, n, before)
+local function run_frames(opts, n, before, hers)
     local written = {}
     local fake_pipe = { write = function(self, str) written[#written + 1] = str return self end, setvbuf = function() end, close = function() end }
     local real_open, real_clock, real_print = io.open, os.clock, print
@@ -1041,7 +1043,16 @@ local function run_frames(opts, n, before)
     for i = 1, n do
         world.frame = 9000 + i
         clock = clock + 1 / 60
+        if world.on_frame then world.on_frame(i) end
+        local before_n = #written
         loop()
+        if hers then
+            for l in table.concat(written, "", before_n + 1):gmatch("A [^\n]+") do
+                local f = {}
+                for x in l:gmatch("%S+") do f[#f + 1] = tonumber(x) end
+                hers[#hers + 1] = { f[1], f[3] } -- glTF x, z: UE x, y (metres; "A" itself is no number)
+            end
+        end
     end
     io.open, os.clock, print = real_open, real_clock, real_print
     local last_c
@@ -1065,11 +1076,87 @@ do
     local f3, world3 = run_frames({ axis = 0, draws = { tan_v = tv, w = 2560, h = 1440 } }, 40, function(w) w.draws_off = true end)
     check(f3[13] == "v" and near(tonumber(f3[12]), 90, 0.001) and (world3.projections or 0) >= 40,
         "drawn fov: no answer - the settings' fov, still asking every frame (" .. tostring(f3[12]) .. tostring(f3[13]) .. ", " .. tostring(world3.projections) .. ")")
-    -- a game without the function: the settings' fov, and it stops asking after 30 frames, said once
-    local f4, world4, logs4 = run_frames({ axis = 1 }, 60)
+    -- a game without the function: the settings' fov; after 2 s it is asked once a second, said once
+    local f4, world4, logs4 = run_frames({ axis = 1 }, 600) -- the stub PlayerController has no ProjectWorldLocationToScreen
     local said = 0
-    for _, l in ipairs(logs4) do if l:find("cannot ask the game where it draws", 1, true) then said = said + 1 end end
-    check(f4[13] == "h" and near(tonumber(f4[12]), 90, 0.001) and said == 1, "drawn fov: no such function - the settings' fov, said once")
+    for _, l in ipairs(logs4) do if l:find("does not say where it draws", 1, true) then said = said + 1 end end
+    check(f4[13] == "h" and near(tonumber(f4[12]), 90, 0.001) and said == 1, "drawn fov: no such function - the settings' fov, said once (" .. said .. ")")
+    -- a long stretch without an answer, then answers again (an alt-tab, a long load): asked about once a second
+    -- meanwhile, and measured again within a second of the game answering - never given up for good
+    local asked_while_off
+    local f5, world5 = run_frames({ axis = 0, draws = { tan_v = tv, w = 2560, h = 1440 } }, 900, function(w)
+        w.draws_off = true
+        w.on_frame = function(i)
+            if i == 600 then asked_while_off, w.draws_off = w.projections, false end
+        end
+    end)
+    check(asked_while_off ~= nil and asked_while_off < 120 + 12, "drawn fov: no answer for 10 s - asked about once a second after the first 2 s (" .. tostring(asked_while_off) .. " asks)")
+    check(near(tonumber(f5[12]), math.deg(2 * math.atan(tv)), 0.01) and f5[13] == "v", "drawn fov: answers again - measured again (" .. tostring(f5[12]) .. tostring(f5[13]) .. ")")
+    -- an orthographic camera: not measured (the measure is a pinhole's), the settings' fov
+    local f6, world6 = run_frames({ axis = 1, ortho = true, draws = { tan_v = tv, w = 2560, h = 1440 } }, 120)
+    check(f6[13] == "h" and (world6.projections or 0) == 0, "drawn fov: an orthographic camera is not measured (" .. tostring(world6.projections) .. " asks)")
+    -- a NaN answer (a degenerate view) is no answer
+    check(M.projected_tan_v(function() return 0 / 0, 0 / 0 end, 0, 0, 0, 1, 0, 0, 0, 0, 1) == nil, "drawn fov: a NaN answer is refused")
+end
+
+-------------------------------------------------------------------------------- the camera alone: its view turning is not him going
+do
+    -- the pure pivot: a 300 cm boom orbiting a still player at 20 deg/s (looking 20 degrees down, then tilting) - the
+    -- point the view turns about stays put; a first-person turn in place, too; a camera carried forward moves it
+    local worst, off = 0, 0
+    for _, case in ipairs({ { boom = 300, pitch0 = -20, tilt = 0 }, { boom = 300, pitch0 = -20, tilt = 15 }, { boom = 0, pitch0 = 0, tilt = 0 } }) do
+        local st = {}
+        for i = 0, 180 do
+            local yaw, pitch = 20 * i / 60, case.pitch0 - case.tilt * i / 180
+            local yr, pr = math.rad(yaw), math.rad(pitch)
+            local cx, cy, cz = 500 - math.cos(yr) * math.cos(pr) * case.boom, 800 - math.sin(yr) * math.cos(pr) * case.boom,
+                150 - math.sin(pr) * case.boom
+            local px, py, pz, vx, vy = M.view_pivot(st, cx, cy, cz, pitch, yaw, 1 / 60)
+            worst = math.max(worst, math.sqrt(vx * vx + vy * vy))
+            if i > 3 then off = math.max(off, math.sqrt((px - 500) ^ 2 + (py - 800) ^ 2 + (pz - 150) ^ 2)) end
+        end
+    end
+    check(worst < M.GO_STOP, string.format("camera alone: a view that only turns (a boom, a tilt, first person) is no movement (worst %.1f cm/s)", worst))
+    check(off < 1, string.format("camera alone: him = the point the view turns about (off by %.2f cm)", off))
+    local st, last = {}, 0
+    for i = 0, 60 do
+        local _, _, _, vx = M.view_pivot(st, 300 * i / 60, 0, 150, -15, 0, 1 / 60)
+        last = vx
+    end
+    check(near(last, 300, 1), string.format("camera alone: a camera carried forward is him going (%.1f cm/s)", last))
+    -- the whole frame, no Pawn and no view target: a 300 cm boom looks at a still player; a small turn shows where he
+    -- is, she settles beside him; then the view orbits him for 3 s - she stays where she is
+    local hers = {}
+    run_frames({ no_pawn = true }, 580, function(w)
+        w.on_frame = function(i)
+            local yaw = i <= 60 and 0 or i <= 80 and (i - 60) * 0.5 or i <= 400 and 10 or 10 + 20 * (i - 400) / 60
+            local yr, pr = math.rad(yaw), math.rad(-15)
+            w.cam_loc = { X = 1000 - math.cos(yr) * math.cos(pr) * 300, Y = 2000 - math.sin(yr) * math.cos(pr) * 300, Z = 100 + math.sin(math.rad(15)) * 300 }
+            w.cam_rot = { Pitch = -15, Yaw = yaw, Roll = 0 }
+        end
+    end, hers)
+    local moved, beside = 0, 100 * math.sqrt((hers[400][1] - 10) ^ 2 + (hers[400][2] - 20) ^ 2)
+    for i = 400, #hers do moved = math.max(moved, 100 * math.sqrt((hers[i][1] - hers[400][1]) ^ 2 + (hers[i][2] - hers[400][2]) ^ 2)) end
+    check(#hers >= 580 and beside < M.STAY_RADIUS, string.format("camera alone: she settles near the player the camera looks at (%.0f cm from him)", beside))
+    check(#hers >= 580 and moved < 1, string.format("camera alone: the view orbits a still player - she stays where she is (moved %.1f cm)", moved))
+end
+
+-------------------------------------------------------------------------------- standing: she only walks
+do
+    -- a creep inside the go/stop gap (9-14 cm/s, from standing) and a stand far away: she only ever walks, at her calm walk
+    for _, pspeed in ipairs({ 0, 9, 14 }) do
+        local her, p = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }, { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+        M.follow(her, p, 1 / 60)
+        her.x, her.y = -400, 0
+        local fastest = 0
+        p.vx = pspeed
+        for _ = 1, 1800 do
+            p.x = p.x + pspeed / 60
+            M.follow(her, p, 1 / 60)
+            fastest = math.max(fastest, her.speed)
+        end
+        check(fastest <= M.WALK_PACE * 0.01 + 1e-6, string.format("standing or creeping %d cm/s: she only walks, never rushes (fastest %.2f m/s)", pspeed, fastest))
+    end
 end
 
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
