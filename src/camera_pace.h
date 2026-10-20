@@ -1,60 +1,84 @@
 #pragma once
-// How many ring slots back "the presented camera" (link.h's camera_delay) should look, measured instead of
+// How stale the camera "the presented frame" uses (link.h's camera_delay) should be, measured instead of
 // guessed. Portable C++ (no Windows): tests/ builds it natively.
 //
 // Why: camera_delay exists because a game's render thread presents a frame its game thread (and the
-// provider riding it) has already moved past - the picture on screen is the newest PROVIDER camera's
-// picture from `camera_delay` pushes ago. A fixed default (1) and a fixed ceiling (3) assume the provider
-// pushes a fresh camera about as often as the game presents one; Unreal pushes once per UE4SS engine tick,
-// which a present can easily outrun (a live GTA III DE / Mecha Chameleon log: ~30% of presented frames had
-// no fresh provider camera of their own even once; a live Scarlet Skips capture test, 2026-10-19, measured
-// ~14% idle and the SAME ~100 ms settled reprojection error at camera_delay 1 and 3 alike - the ceiling,
-// not the slider position, was the limit). PushPace measures the real gap and removes the guess.
+// provider riding it) has already moved past - the picture on screen should use the PROVIDER camera that
+// was current when the game thread produced the frame now being presented, which is a SMALL, roughly
+// constant amount of WALL-CLOCK TIME behind the newest provider camera (about one present's worth of
+// render-thread buffering), not a fixed number of the provider's OWN pushes back.
+//
+// 0.2.4's bug: PushPace measured a RATE (presented frames per distinct push, a unitless ratio) and
+// link.cpp fed that number straight into CameraRing::get() as a COUNT of ring slots to step back. Each
+// slot itself spans about `gap` presents, so the wall-clock age of the picked camera grew like
+// delay_slots * time_per_slot =~ gap^2 / present_fps - QUADRATIC in the push:present cadence ratio, not
+// the intended ~1 present of staleness. A live GTA III DE / Mecha Chameleon log showed ~30% of presented
+// frames had no fresh provider camera of their own even once (Unreal pushes once per UE4SS engine tick,
+// which a present can easily outrun); at a push:present ratio of only ~6-8 that bug alone produced
+// several hundred ms of camera staleness - matching a live owner report of a ~500 ms camera-turn lag in
+// Poppy Playtime. A live Scarlet Skips capture test, 2026-10-19, measured ~14% idle (push keeps up with
+// present almost always there) and the SAME ~100 ms settled reprojection error at the old camera_delay 1
+// and its old ceiling 3 alike - the ceiling, not the slider position, was the limit on that game, i.e.
+// ~100 ms is already a MEASURED amount of staleness this mechanism can ask for without the picture
+// visibly lagging a turn.
+//
+// The fix: PushPace now EMAs the wall-clock gap (ms) between distinct pushes, using each camera's
+// `at_ms`. CameraRing::get_by_age (provider_core.h) picks the newest camera at least `target_age_ms()`
+// old, falling back to the newest when none is - so a game whose provider pushes every present still
+// gets ~1 push-gap of staleness (today's validated default), and a game whose provider pushes only every
+// few presents is asked to look back AT MOST one push (never several, and never a multiple that grows
+// with how rarely it pushes): the per-push age it lands on is however stale that single push already is,
+// capped at kAgeCeilingMs so a very sparse provider is never asked to wait longer than the ~100 ms a live
+// capture has already shown is enough to settle.
 #include <algorithm>
+#include <cstdint>
 
 namespace camera_pace
 {
-	/// Was camera_delay's hard ceiling (and the ImGui slider's); proven too low live, 2026-10-19 (see above) -
-	/// 3 ring slots is ~50 ms at 60 Hz, and the live test still needed more than that to settle.
-	constexpr int kMaxDelay = 8;
-	/// camera_delay's old fixed default - PushPace converges here when a push lands on (almost) every present,
-	/// so a game already well served by the old default sees no change.
-	constexpr int kDefaultDelay = 1;
-	/// How quickly the average reacts to a change (smaller = steadier, bigger = catches a framerate change
-	/// sooner); 20-ish pushes' worth of memory, which is a couple of seconds for a 60 Hz Unreal tick.
+	/// How long to let a sparsely-pushing provider's picked camera be before giving up and using it
+	/// anyway: DERIVED from the live Scarlet Skips capture cited above (its reprojection error was
+	/// already measured to settle at ~100 ms; asking a slower provider to wait longer than that buys
+	/// nothing a live capture has shown), not a fresh guess.
+	constexpr int kAgeCeilingMs = 100;
+	/// The assumed staleness before anything is measured: about one present at a typical 60 Hz Unreal
+	/// tick - the same case the old kDefaultDelay=1 (one ring slot, at a push-per-present provider)
+	/// covered, so an unmeasured provider behaves close to what it did before this existed.
+	constexpr int kDefaultTargetAgeMs = 17;
+	/// How quickly the average reacts to a change (smaller = steadier, bigger = catches a framerate
+	/// change sooner); 20-ish pushes' worth of memory, a couple of seconds for a 60 Hz Unreal tick.
 	constexpr float kEmaAlpha = 0.05f;
 
-	/// Tracks, as an exponential moving average, how many presented frames pass between distinct provider
-	/// camera pushes - the ring slots "host" should look back absent a fresher signal (the present callback's
-	/// own camera, link.cpp's `presented_now` path, always wins over this when it is available).
+	/// Tracks, as an exponential moving average, the wall-clock milliseconds between distinct provider
+	/// camera pushes - the age (ms) the shown camera should be picked at, absent a fresher signal (the
+	/// present callback's own camera, link.cpp's `presented_now` path, always wins over this).
 	struct PushPace
 	{
-		float gap_ema = float(kDefaultDelay);
-		int frames_since_push = -1; // -1: no push observed yet; the gap before the very first one is unknown
+		float gap_ms_ema = -1.0f; // -1: no push observed yet
+		int64_t last_push_ms = -1;
 
-		/// Call once per presented frame. pushed: a provider camera with a NEW ring index arrived since the
-		/// last call (link.cpp: `newest.index` changed). Never called when there is no provider camera at all.
-		void tick(bool pushed)
+		/// Call once per presented frame there is a provider camera at all. pushed: a provider camera
+		/// with a NEW ring index arrived since the last call (link.cpp: `newest.index` changed).
+		/// now_ms: the add-on's clock this present (provider::now_ms()).
+		void tick(bool pushed, int64_t now_ms)
 		{
 			if (!pushed)
-			{
-				if (frames_since_push >= 0)
-					++frames_since_push;
 				return;
-			}
-			if (frames_since_push >= 0)
+			if (last_push_ms >= 0)
 			{
-				const float gap = float(frames_since_push + 1);
-				gap_ema += (gap - gap_ema) * kEmaAlpha;
+				const float gap = float(now_ms - last_push_ms);
+				gap_ms_ema = gap_ms_ema < 0.0f ? gap : gap_ms_ema + (gap - gap_ms_ema) * kEmaAlpha;
 			}
-			frames_since_push = 0;
+			last_push_ms = now_ms;
 		}
 
-		/// The effective camera_delay (ring slots back), rounded and clamped to kMaxDelay (never negative).
-		int delay() const
+		/// The effective camera age (ms) to pick: about one measured push-gap (so a provider pushing
+		/// every present reproduces the old "one ring slot back" behaviour almost exactly), clamped to
+		/// kAgeCeilingMs so a provider that pushes rarely is never asked to look back several pushes'
+		/// worth - just however stale its single most recent push already is, bounded.
+		int target_age_ms() const
 		{
-			const int d = int(gap_ema + 0.5f);
-			return std::clamp(d, 0, kMaxDelay);
+			const float g = gap_ms_ema < 0.0f ? float(kDefaultTargetAgeMs) : gap_ms_ema;
+			return int(std::clamp(g, 0.0f, float(kAgeCeilingMs)) + 0.5f);
 		}
 	};
 }

@@ -119,6 +119,46 @@ namespace provider
 			return false;
 		}
 
+		/// The NEWEST camera whose age (now_ms - at_ms) is at least age_ms - never more than one push
+		/// staler than that bar requires, so a provider that pushes rarely is never walked back several
+		/// pushes' worth (camera_pace.h's own fix). Falls back to the newest held camera when none is
+		/// old enough (age_ms <= 0, or every push is still fresher than it: nothing to delay for).
+		bool get_by_age(int64_t now_ms, int64_t age_ms, Camera &out) const
+		{
+			for (int tries = 0; tries < 8; ++tries)
+			{
+				const uint64_t n = count();
+				if (n == 0)
+					return false;
+				const uint64_t newest = n - 1;
+				const uint64_t oldest = n > kSlots - 2 ? n - (kSlots - 2) : 0; // two slots of slack for writers
+				Camera c;
+				bool ok = m_slots[newest % kSlots].read(c) && c.index == newest;
+				if (!ok)
+					continue; // a writer mid-push: retry the whole lookup
+				if (age_ms > 0)
+				{
+					uint64_t idx = newest;
+					while (idx > oldest && now_ms - c.at_ms < age_ms)
+					{
+						Camera older;
+						if (!m_slots[(idx - 1) % kSlots].read(older) || older.index != idx - 1)
+						{
+							ok = false;
+							break; // a writer mid-push on the way back: retry the whole lookup
+						}
+						--idx;
+						c = older;
+					}
+				}
+				if (!ok)
+					continue;
+				out = c;
+				return true;
+			}
+			return false;
+		}
+
 	private:
 		std::mutex m_push;
 		std::atomic<uint64_t> m_count{0};

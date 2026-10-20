@@ -201,6 +201,57 @@ static void test_provider()
 	CHECK(ring.get(3, c) && c.frame == 1036);
 	CHECK(ring.get(100, c) && c.frame >= 1040 - provider::CameraRing::kSlots + 2); // clamped to the oldest still held
 
+	// get_by_age: camera_pace.h's fix (0.2.5) - pick by wall-clock AGE, never a push-count index. An empty
+	// ring: nothing to find.
+	{
+		provider::CameraRing r2;
+		provider::Camera out;
+		CHECK(!r2.get_by_age(1000, 50, out));
+	}
+	// a push every present at 60 Hz (~17 ms apart, Scarlet Skips' validated case): asking for "at least one
+	// present's worth old" (~17 ms) lands on the SECOND-newest push, not several pushes back - "delay ~= 1
+	// frame" for a game pushing every present
+	{
+		provider::CameraRing r2;
+		int64_t t = 0;
+		for (int i = 0; i < 20; ++i)
+		{
+			t += 17;
+			provider::Camera w;
+			w.frame = uint64_t(i);
+			w.at_ms = t;
+			r2.push(w);
+		}
+		provider::Camera out;
+		CHECK(r2.get_by_age(t, 17, out) && out.frame == 18 && t - out.at_ms >= 17 && t - out.at_ms < 2 * 17);
+		// nothing old enough yet (age 0): falls back to the newest
+		CHECK(r2.get_by_age(t, 0, out) && out.frame == 19);
+	}
+	// a push every 7th present (~117 ms apart, the owner's measured Mecha Chameleon ratio): asking for the
+	// camera_pace.h ceiling's worth old (100 ms) never walks back MORE than one push, however sparse the
+	// provider is - the bug this replaces (a push-count fed a RATE) grew the age with the SQUARE of the ratio
+	{
+		provider::CameraRing r2;
+		int64_t t = 0;
+		uint64_t pushed = 0;
+		for (int i = 0; i < 140; ++i)
+		{
+			t += 17;
+			if (i % 7 != 6)
+				continue;
+			provider::Camera w;
+			w.frame = pushed;
+			w.at_ms = t;
+			r2.push(w);
+			++pushed;
+		}
+		provider::Camera out;
+		CHECK(r2.get_by_age(t, 100, out));
+		// at most one push staler than the newest (never several): the newest held frame is `pushed - 1`
+		CHECK(out.frame + 1 >= pushed - 1);
+		CHECK(t - out.at_ms < 2 * 117); // bounded by ~one push gap, not several (the old bug: several hundred ms more)
+	}
+
 	// a writer hammering one value never shows the reader half of a write
 	struct Pair
 	{
@@ -418,65 +469,77 @@ static bool faulting_copy(void *, const void *, size_t)
 	return false;
 }
 
-/// camera_pace::PushPace: the measured camera_delay (anchor-lane, 2026-10-19 - "she slides with yaw, floats
-/// with pitch" in GTA III DE / Mecha Chameleon). The owner's own live evidence (819 of 2777 presented frames
-/// had no fresh provider camera of their own) and a live Scarlet Skips capture test (idle ~14%, and the SAME
-/// ~100 ms settled reprojection error measured at the old camera_delay 1 AND its old ceiling 3) both point the
-/// same way: a fixed one-frame guess, capped at three, cannot track a provider that ticks slower than the game
-/// presents - which is the common case for Unreal (UE4SS fires once per engine tick). PushPace measures the
-/// real gap instead of asking the user to find it on the overlay's slider.
+/// camera_pace::PushPace: the measured camera_delay, in MILLISECONDS (0.2.5's fix of a 0.2.4 bug - "she
+/// trails a camera turn by ~500 ms" in Poppy Playtime). 0.2.4's PushPace measured a RATE (presented frames
+/// per push) but link.cpp fed it straight into CameraRing::get() as a push-COUNT index, so the wall-clock
+/// staleness of the picked camera grew like gap^2/present_fps - quadratic in the push:present ratio, not the
+/// intended ~1 present of staleness. PushPace now EMAs the wall-clock gap (ms) between pushes directly, and
+/// CameraRing::get_by_age (test_provider, below) walks back by AGE, not count - at most one push staler than
+/// asked for, never several, however rarely the provider pushes.
 static void test_camera_pace()
 {
-	// never ticked: the untouched default is the OLD fixed value, so a provider nobody has measured yet (or
-	// one with no camera at all) behaves exactly as it did before this existed
-	CHECK(camera_pace::PushPace{}.delay() == camera_pace::kDefaultDelay);
+	// never ticked: the untouched default is a plausible single-present guess (~17 ms at 60 Hz), so a
+	// provider nobody has measured yet (or one with no camera at all) is not asked to wait at all really -
+	// get_by_age below falls back to the newest when nothing is that old yet
+	CHECK(camera_pace::PushPace{}.target_age_ms() == camera_pace::kDefaultTargetAgeMs);
 
-	// a push every single presented frame (today's easy case, e.g. the provider's own present callback path,
-	// or a game whose engine tick keeps up with its presents): settles AT the old default, so an already
-	// well-served game sees no change
+	// a push every single presented frame at 60 Hz (today's easy case: the provider's own present callback
+	// path, or a game whose engine tick keeps up with its presents) settles at ~one present's gap (~16-17 ms) -
+	// matching the OLD default's intended one-ring-slot-back behaviour (Scarlet Skips' validated case)
 	{
 		camera_pace::PushPace p;
+		int64_t t = 0;
 		for (int i = 0; i < 200; ++i)
-			p.tick(true);
-		CHECK(p.delay() == 1);
+		{
+			t += 17;
+			p.tick(true, t);
+		}
+		CHECK(p.target_age_ms() >= 14 && p.target_age_ms() <= 20);
 	}
-	// a push every 4th presented frame (an engine ticking a quarter as often as the game presents - ordinary
-	// for Unreal): the OLD code could not express this at all (hard-capped at 3); PushPace measures it
+	// a push every 7th presented frame at 60 Hz (~117 ms apart - an engine ticking far slower than the game
+	// presents, ordinary for Unreal, the owner's own measured Mecha Chameleon ratio): the gap EMA tracks the
+	// true ms apart, clamped to kAgeCeilingMs - never asked to grow past what a live capture already showed
+	// is enough (see camera_pace.h), unlike the OLD count-based delay which had no ceiling derivation at all
 	{
 		camera_pace::PushPace p;
-		for (int i = 0; i < 400; ++i)
-			p.tick(i % 4 == 3);
-		CHECK(p.delay() == 4);
+		int64_t t = 0;
+		for (int i = 0; i < 1400; ++i)
+		{
+			t += 17;
+			p.tick(i % 7 == 6, t);
+		}
+		CHECK(p.target_age_ms() == camera_pace::kAgeCeilingMs);
 	}
-	// a push every 20th frame (far worse than the old ceiling of 3): clamps to kMaxDelay, never runs away
-	{
-		camera_pace::PushPace p;
-		for (int i = 0; i < 2000; ++i)
-			p.tick(i % 20 == 19);
-		CHECK(p.delay() == camera_pace::kMaxDelay);
-	}
-	// mutation rule, confirmed RED against the OLD fixed-default/fixed-ceiling behaviour this replaces: a
-	// provider ticking once every 4 presents must settle on a DIFFERENT delay than one ticking every present -
-	// the old code (always camera_delay()==1, hard-clamped 0..3) answers both the same way
+	// mutation rule, confirmed RED against the OLD rate-as-count behaviour this replaces: a provider ticking
+	// once every 7 presents must settle on a DIFFERENT (larger) target age than one ticking every present
 	{
 		camera_pace::PushPace steady, slow;
-		for (int i = 0; i < 400; ++i)
+		int64_t t = 0;
+		for (int i = 0; i < 1400; ++i)
 		{
-			steady.tick(true);
-			slow.tick(i % 4 == 3);
+			t += 17;
+			steady.tick(true, t);
+			slow.tick(i % 7 == 6, t);
 		}
-		CHECK(steady.delay() != slow.delay());
+		CHECK(slow.target_age_ms() > steady.target_age_ms());
 	}
 	// recovers when the provider speeds back up (a framerate change, a level load settling): the average is
 	// not stuck at its worst-ever value
 	{
 		camera_pace::PushPace p;
-		for (int i = 0; i < 2000; ++i)
-			p.tick(i % 20 == 19);
-		CHECK(p.delay() == camera_pace::kMaxDelay);
-		for (int i = 0; i < 400; ++i)
-			p.tick(true);
-		CHECK(p.delay() == 1);
+		int64_t t = 0;
+		for (int i = 0; i < 1400; ++i)
+		{
+			t += 17;
+			p.tick(i % 7 == 6, t);
+		}
+		CHECK(p.target_age_ms() == camera_pace::kAgeCeilingMs);
+		for (int i = 0; i < 200; ++i)
+		{
+			t += 17;
+			p.tick(true, t);
+		}
+		CHECK(p.target_age_ms() < 30);
 	}
 }
 

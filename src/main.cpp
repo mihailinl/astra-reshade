@@ -107,7 +107,7 @@ namespace
 	{
 		int delay = enginelink::camera_delay();
 		reshade::get_config_value(nullptr, "ASTRA", "CameraDelay", delay);
-		enginelink::camera_delay() = std::clamp(delay, 0, camera_pace::kMaxDelay);
+		enginelink::camera_delay() = std::clamp(delay, 0, camera_pace::kAgeCeilingMs);
 		bool delayAuto = enginelink::camera_delay_auto();
 		reshade::get_config_value(nullptr, "ASTRA", "CameraDelayAuto", delayAuto);
 		enginelink::camera_delay_auto() = delayAuto;
@@ -238,22 +238,22 @@ namespace
 		{
 			changed |= ImGui::Checkbox("auto delay", &enginelink::camera_delay_auto());
 			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("Measures how many presented frames pass between the provider's cameras (a game whose engine\n"
-								  "ticks slower than it presents, most Unreal games, needs more than one) instead of a fixed guess.");
+				ImGui::SetTooltip("Measures the wall-clock gap (ms) between the provider's cameras (a game whose engine ticks\n"
+								  "slower than it presents, most Unreal games, needs more) instead of a fixed guess.");
 			ImGui::SameLine();
 			ImGui::SetNextItemWidth(140);
 			if (enginelink::camera_delay_auto())
 			{
 				int shown = enginelink::camera_delay_effective();
 				ImGui::BeginDisabled();
-				ImGui::SliderInt("camera delay (frames)", &shown, 0, camera_pace::kMaxDelay);
+				ImGui::SliderInt("camera delay (ms)", &shown, 0, camera_pace::kAgeCeilingMs);
 				ImGui::EndDisabled();
 			}
 			else
 			{
-				changed |= ImGui::SliderInt("camera delay (frames)", &enginelink::camera_delay(), 0, camera_pace::kMaxDelay);
+				changed |= ImGui::SliderInt("camera delay (ms)", &enginelink::camera_delay(), 0, camera_pace::kAgeCeilingMs);
 				if (ImGui::IsItemHovered())
-					ImGui::SetTooltip("How many frames the picture on screen is behind the game's newest camera.\n"
+					ImGui::SetTooltip("How many milliseconds old the picture on screen is behind the game's newest camera.\n"
 									  "Turn the camera fast: if she slides AHEAD of the turn, raise it; if she lags behind it, lower it.");
 			}
 		}

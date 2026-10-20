@@ -19,7 +19,7 @@ namespace enginelink
 {
 	namespace
 	{
-		constexpr const char *kFoundation = "0.2.4";       // this add-on's version, told to the engine
+		constexpr const char *kFoundation = "0.2.5";       // this add-on's version, told to the engine
 		constexpr double kRebase = 1500.0;                 // move the floating origin when she is this far from it
 		constexpr float kFar = 300.0f;                     // she is never far: a short depth range keeps it precise
 		constexpr int64_t kStaleMs = 300;                  // a provider silent this long: she is hidden
@@ -49,10 +49,11 @@ namespace enginelink
 		unsigned long long g_camId = 0;
 		uint64_t g_sentIndex = ~uint64_t(0); // the provider camera last sent (one picture per game camera)
 		ULONGLONG g_nextLight = 0;
-		int g_delay = camera_pace::kDefaultDelay; // the MANUAL pin (ReShade.ini "CameraDelay"), used when auto is off
-		bool g_delayAuto = true;                 // measure camera_delay instead of asking the user to guess it (ReShade.ini "CameraDelayAuto")
+		int g_delay = camera_pace::kDefaultTargetAgeMs; // the MANUAL pin (ReShade.ini "CameraDelay", in ms), used when auto is off
+		bool g_delayAuto = true;                       // measure camera_delay instead of asking the user to guess it (ReShade.ini "CameraDelayAuto")
 		camera_pace::PushPace g_pace;
 		uint64_t g_lastPushIdx = ~uint64_t(0); // the provider camera ring index last seen, to detect a new push
+		ULONGLONG g_nextDelayLog = 0;           // throttled: the measured delay (ms) and the picked camera's age
 		float g_size = 1.0f;
 		bool g_enabled = true;
 		Stats g_stats{};
@@ -271,7 +272,7 @@ namespace enginelink
 
 	int camera_delay_effective()
 	{
-		return g_delayAuto ? g_pace.delay() : std::clamp(g_delay, 0, camera_pace::kMaxDelay);
+		return g_delayAuto ? g_pace.target_age_ms() : std::clamp(g_delay, 0, camera_pace::kAgeCeilingMs);
 	}
 
 	float &size()
@@ -306,7 +307,7 @@ namespace enginelink
 		// frame there is a provider at all, so a game that falls silent does not skew the average
 		if (have_cam)
 		{
-			g_pace.tick(newest.index != g_lastPushIdx);
+			g_pace.tick(newest.index != g_lastPushIdx, now);
 			g_lastPushIdx = newest.index;
 		}
 
@@ -471,11 +472,18 @@ namespace enginelink
 			std::copy(g_origin, g_origin + 3, h.origin);
 		}
 
-		// the camera being PRESENTED: the one the present callback just wrote, else `camera_delay` provider cameras
-		// back (0 = the newest) - MEASURED (camera_pace.h) unless the user pinned a value on the overlay's slider
-		const int delay = g_delayAuto ? g_pace.delay() : std::clamp(g_delay, 0, camera_pace::kMaxDelay);
-		if (!ps.cameras.get(presented_now ? 0 : uint64_t(delay), shown))
+		// the camera being PRESENTED: the one the present callback just wrote, else the newest provider camera at
+		// least `delay_ms` OLD - MEASURED in wall-clock time (camera_pace.h) unless the user pinned a value (also
+		// ms) on the overlay's slider; never several pushes of lag just because the provider pushes rarely
+		const int delay_ms = g_delayAuto ? g_pace.target_age_ms() : std::clamp(g_delay, 0, camera_pace::kAgeCeilingMs);
+		if (presented_now || !ps.cameras.get_by_age(now, delay_ms, shown))
 			shown = newest;
+		if (!presented_now && GetTickCount64() >= g_nextDelayLog)
+		{
+			g_nextDelayLog = GetTickCount64() + 10000;
+			logf("link: camera delay %d ms (auto %s), the picture's camera is %lld ms old", delay_ms, g_delayAuto ? "on" : "off",
+				(long long)(now - shown.at_ms));
+		}
 		const float tan_shown = view::tan_half_vertical(shown.fov_deg, shown.fov_horizontal != 0, shown.aspect > 0.0f ? shown.aspect : bb_aspect);
 		view::Pose host;
 		if (view::make_pose(shown.pos, shown.fwd, shown.up, tan_shown, host))
