@@ -99,6 +99,29 @@ local function fmt(v)
     return string.format("%.5f", v)
 end
 
+--- The projection the game really draws with, measured instead of read from its settings: GetFOVAngle's number is
+--- vertical or horizontal depending on an aspect-axis setting that Unreal versions keep moving (the local player's,
+--- a camera's own override, a project default), and a misread draws her ~0.56x too small or 1.8x too big at 16:9
+--- (the owner, 2026-10-20: "in Mecha Chameleon she is so small" - UE 5.6, logged "fov 90.0v"). So: where does the
+--- game put a point PROBE_D ahead on the view axis, and one PROBE_H above it? The first lands on the view's centre
+--- (cx, cy: half its size in pixels), the second dy pixels higher, and tan(half the vertical fov) = (H/D) * cy / dy -
+--- exact for a pinhole, whatever the pixel scale, roll or aspect. project(x, y, z) -> screen x, y (pixels, the
+--- player's own view) or nil. Returns tan(half vfov), or nil when the answer is no use (an off-screen or degenerate
+--- projection, a fov outside 1..170 degrees).
+M.PROBE_D, M.PROBE_H = 1000.0, 100.0 -- UE cm: 10 m ahead, 1 m above the axis (about 6 degrees: on screen in any game)
+function M.projected_tan_v(project, x, y, z, fx, fy, fz, ux, uy, uz)
+    local ax, ay, az = x + fx * M.PROBE_D, y + fy * M.PROBE_D, z + fz * M.PROBE_D
+    local cx, cy = project(ax, ay, az)
+    if cx == nil or cy == nil then return nil end
+    local _, ty = project(ax + ux * M.PROBE_H, ay + uy * M.PROBE_H, az + uz * M.PROBE_H)
+    if ty == nil then return nil end
+    local dy = cy - ty -- screen y grows downward: the point above the axis is drawn higher
+    if cy < 2 or dy < 0.25 then return nil end
+    local t = (M.PROBE_H / M.PROBE_D) * cy / dy
+    if t < 0.0087 or t > 11.43 then return nil end -- 1..170 degrees
+    return t
+end
+
 --- The camera line: C <frame> <pos gl m> <fwd gl> <up gl> <fov> <h|v> <aspect> <near m>
 function M.camera_line(frame, loc, rot, fov, horizontal, aspect, near_cm)
     local px, py, pz = M.to_gl(loc.X, loc.Y, loc.Z)
@@ -348,7 +371,7 @@ local UEHelpers = require("UEHelpers")
 
 local pipe, next_open = nil, 0
 local pc, next_find = nil, 0
-local cache = { at = -1, paused_at = -1 }
+local cache = { at = -1, paused_at = -1, project_fails = 0 }
 local her = { placed = false, x = 0, y = 0, z = 0, yaw = 0, v = 0, vx = 0, vy = 0, speed = 0 }
 local last_frame, last_clock, own_frame, frame_counter = -1, nil, 0, nil
 local stats = { frames = 0, sent = 0, cost = 0, logged_at = 0, errors = 0 }
@@ -580,6 +603,37 @@ local function sun_line(now, pawn)
     return line
 end
 
+--- The game's own tan(half vertical fov) this frame: M.projected_tan_v through APlayerController::
+--- ProjectWorldLocationToScreen (player-viewport-relative pixels), or nil. A nil answer (a loading screen, no
+--- viewport yet) is not a failure; a call that throws 30 frames running (a game without the function) is not
+--- made again, said once - she keeps the fov from its settings there.
+local function measured_tan_v(pc, loc, rot)
+    if cache.project_off then return nil end
+    local fx, fy, fz, ux, uy, uz = M.rotator_axes(rot.Pitch, rot.Yaw, rot.Roll)
+    local failed = false
+    local function project(x, y, z)
+        local screen = {}
+        local ok, on = pcall(function() return pc:ProjectWorldLocationToScreen({ X = x, Y = y, Z = z }, screen, true) end)
+        if not ok then
+            failed, cache.project_error = true, on
+            return nil
+        end
+        if on ~= true or type(screen.X) ~= "number" or type(screen.Y) ~= "number" then return nil end
+        return screen.X, screen.Y
+    end
+    local t = M.projected_tan_v(project, loc.X, loc.Y, loc.Z, fx, fy, fz, ux, uy, uz)
+    if not failed then
+        cache.project_fails = 0
+        return t
+    end
+    cache.project_fails = cache.project_fails + 1
+    if cache.project_fails >= 30 then
+        cache.project_off = true
+        log("cannot ask the game where it draws (the fov comes from its settings): %s", tostring(cache.project_error))
+    end
+    return nil
+end
+
 local function tick()
     local t0 = os.clock()
     local now = t0
@@ -628,6 +682,18 @@ local function tick()
     end
 
     local loc, rot, fov = pcm:GetCameraLocation(), pcm:GetCameraRotation(), pcm:GetFOVAngle()
+    -- the fov sent: the game's own projection, measured each frame (M.projected_tan_v); its settings only when it
+    -- cannot answer (then GetFOVAngle on the axis its aspect-axis setting names, as before)
+    local send_fov, send_horizontal = fov, cache.horizontal
+    local tan_v = measured_tan_v(pc, loc, rot)
+    if tan_v ~= nil then
+        send_fov, send_horizontal = math.deg(2 * math.atan(tan_v)), false
+        if not cache.said_projection then
+            cache.said_projection = true
+            log("the game draws a %.1f degree vertical fov (GetFOVAngle %.1f, its aspect-axis setting reads %s)", send_fov, fov,
+                cache.horizontal and "horizontal" or "vertical")
+        end
+    end
     local dt = last_clock and math.min(math.max(now - last_clock, 0), 0.1) or 0
     last_clock = now
 
@@ -654,7 +720,7 @@ local function tick()
     end
     M.follow(her, p, dt, now, trace_down(tracer_actor))
     -- her placement first, the camera last (the engine draws when the camera comes)
-    if send("V 1\n" .. sun_line(now, tracer_actor) .. M.avatar_line(her) .. M.camera_line(frame, loc, rot, fov, cache.horizontal, cache.aspect, cache.near)) then
+    if send("V 1\n" .. sun_line(now, tracer_actor) .. M.avatar_line(her) .. M.camera_line(frame, loc, rot, send_fov, send_horizontal, cache.aspect, cache.near)) then
         stats.sent = stats.sent + 1
     end
     stats.frames = stats.frames + 1
@@ -662,8 +728,9 @@ local function tick()
     if now - stats.logged_at >= 10 then
         stats.logged_at = now
         local t = her.trace or {}
-        log("frame %d  camera %.0f %.0f %.0f  pitch %.1f yaw %.1f roll %.1f  fov %.1f%s  %s %.0f %.0f %.0f%s  her %.0f %.0f %.0f  ground %s (%d traces, %d missed)  %.3f ms/frame",
-            frame, loc.X, loc.Y, loc.Z, rot.Pitch, rot.Yaw, rot.Roll, fov, cache.horizontal and "h" or "v", source, p.x, p.y, p.z,
+        log("frame %d  camera %.0f %.0f %.0f  pitch %.1f yaw %.1f roll %.1f  fov %.1f%s, drawn %s  %s %.0f %.0f %.0f%s  her %.0f %.0f %.0f  ground %s (%d traces, %d missed)  %.3f ms/frame",
+            frame, loc.X, loc.Y, loc.Z, rot.Pitch, rot.Yaw, rot.Roll, fov, cache.horizontal and "h" or "v",
+            tan_v ~= nil and string.format("%.1fv", send_fov) or "not measured", source, p.x, p.y, p.z,
             p.falling and " (falling)" or "", her.x, her.y, her.z, t.z ~= nil and string.format("%.0f", t.z) or "the player's", t.traces or 0,
             t.misses or 0, stats.frames > 0 and stats.cost * 1000 / stats.frames or 0)
         stats.frames, stats.cost = 0, 0

@@ -491,6 +491,8 @@ end
 --- opts.no_pawn: pc.Pawn is nil (GTA DE's Gameface - no Pawn/Possess at all); w.view_target (settable after
 --- the call, read live by pc:GetViewTarget()) stands in for the controller's view target, nil meaning none.
 --- opts.no_pcm: pc.PlayerCameraManager is nil too (no camera at all).
+--- opts.axis: the local player's AspectRatioAxisConstraint (default 1, MaintainXFOV). opts.draws = { tan_v, w, h }: the
+--- PlayerController answers ProjectWorldLocationToScreen with that projection (no answer at all without it).
 function make_world(opts)
     opts = opts or {}
     local w = { frame = 1000, view_target = opts.view_target }
@@ -535,8 +537,27 @@ function make_world(opts)
     local pc
     local function make_pc()
         local level = w.level
-        pc = object({ Player = { AspectRatioAxisConstraint = 1 } })
+        pc = object({ Player = { AspectRatioAxisConstraint = opts.axis or 1 } })
         if not opts.no_pcm then pc.PlayerCameraManager = pcm end
+        if opts.draws then
+            -- the game's real projection (opts.draws: tan of its half vertical fov, its view in pixels); w.draws_off:
+            -- it answers false (a loading screen). The pinhole is spelled here, not borrowed from main.lua.
+            pc.ProjectWorldLocationToScreen = function(_, at, screen, relative)
+                w.projections, w.relative = (w.projections or 0) + 1, relative
+                if w.draws_off then return false end
+                local d, cl, cr = opts.draws, pcm.GetCameraLocation(), pcm.GetCameraRotation()
+                local P, Y, R = math.rad(cr.Pitch), math.rad(cr.Yaw), math.rad(cr.Roll)
+                local SP, CP, SY, CY, SR, CR = math.sin(P), math.cos(P), math.sin(Y), math.cos(Y), math.sin(R), math.cos(R)
+                local fx, fy, fz = CP * CY, CP * SY, SP                                       -- FRotationMatrix X
+                local ux, uy, uz = -(CR * SP * CY + SR * SY), CY * SR - CR * SP * SY, CR * CP -- FRotationMatrix Z
+                local dx, dy, dz = at.X - cl.X, at.Y - cl.Y, at.Z - cl.Z
+                local depth = dx * fx + dy * fy + dz * fz
+                if depth <= 0 then return false end
+                screen.X = d.w / 2
+                screen.Y = d.h / 2 - ((dx * ux + dy * uy + dz * uz) / depth) / d.tan_v * (d.h / 2)
+                return true
+            end
+        end
         if not opts.no_pawn then pc.Pawn = pawn end
         pc.IsValid = function() return w.level == level end
         pc.GetViewTarget = function() return w.view_target end
@@ -971,6 +992,84 @@ do
     local said = 0
     for _, s in ipairs(logs) do if s:find("no camera sent (no pcm)", 1, true) and s:find("pc.Pawn BP_PlayerController_C", 1, true) then said = said + 1 end end
     check(said >= 2 and said <= 3, "no camera manager: the WHY diagnostic, at most once every 10 s over 25 s (" .. said .. ")")
+end
+
+-------------------------------------------------------------------------------- the fov she is drawn with: the game's own projection
+-- The owner, 2026-10-20: "in Mecha Chameleon she is so small" (UE 5.6, its settings read "fov 90.0v"). A wrong axis
+-- draws her ~0.56x (or 1.8x) her size; so the fov is measured from where the game itself projects two points.
+do
+    -- the pure measure, against an independent pinhole: any pitch/yaw/roll, any fov, any pixel size or scale
+    local worst = 0
+    for _, tv in ipairs({ math.tan(math.rad(17.5)), math.tan(math.rad(29.36)), 1.0, math.tan(math.rad(60)) }) do
+        for _, size in ipairs({ { 2560, 1440 }, { 1280, 720 }, { 3440, 1440 }, { 1080, 1920 } }) do
+            for _, r in ipairs({ { 0, 0, 0 }, { -15, 80, 0 }, { 60, -120, 0 }, { -40, 33, 90 }, { 10, 200, -35 } }) do
+                local fx, fy, fz, ux, uy, uz = M.rotator_axes(r[1], r[2], r[3])
+                local cam = { 500, -300, 120 }
+                local function project(x, y, z)
+                    local dx, dy, dz = x - cam[1], y - cam[2], z - cam[3]
+                    local depth = dx * fx + dy * fy + dz * fz
+                    if depth <= 0 then return nil end
+                    return size[1] / 2, size[2] / 2 - ((dx * ux + dy * uy + dz * uz) / depth) / tv * (size[2] / 2)
+                end
+                local t = M.projected_tan_v(project, cam[1], cam[2], cam[3], fx, fy, fz, ux, uy, uz)
+                worst = math.max(worst, t and math.abs(t - tv) / tv or 1)
+            end
+        end
+    end
+    check(worst < 1e-6, string.format("measured fov: exact for every pose, fov and view size (worst relative error %.2g)", worst))
+    check(M.projected_tan_v(function() return nil end, 0, 0, 0, 1, 0, 0, 0, 0, 1) == nil, "measured fov: no answer, no measure")
+    check(M.projected_tan_v(function() return 640, 360 end, 0, 0, 0, 1, 0, 0, 0, 0, 1) == nil, "measured fov: a degenerate answer is refused")
+end
+
+local function run_frames(opts, n, before)
+    local written = {}
+    local fake_pipe = { write = function(self, str) written[#written + 1] = str return self end, setvbuf = function() end, close = function() end }
+    local real_open, real_clock, real_print = io.open, os.clock, print
+    io.open = function(name, mode)
+        if name == M.PIPE then return fake_pipe end
+        return real_open(name, mode)
+    end
+    local clock = 300.0
+    os.clock = function() return clock end
+    local logs = {}
+    print = function(str) logs[#logs + 1] = str end
+    local world = make_world(opts)
+    if before then before(world) end
+    local loop
+    LoopInGameThreadAfterFrames = function(_, fn) loop = fn end
+    dofile(path)
+    for i = 1, n do
+        world.frame = 9000 + i
+        clock = clock + 1 / 60
+        loop()
+    end
+    io.open, os.clock, print = real_open, real_clock, real_print
+    local last_c
+    for l in table.concat(written):gmatch("[^\n]+") do if l:sub(1, 2) == "C " then last_c = l end end
+    local f = {}
+    for x in (last_c or ""):gmatch("%S+") do f[#f + 1] = x end
+    return f, world, logs
+end
+do
+    -- Mecha Chameleon's case: its settings say MaintainYFOV ("90.0v"), but the game draws 90 degrees ACROSS a 16:9
+    -- view (vertical 58.72): she is sent the drawn fov, not the settings' reading
+    local tv = math.tan(math.rad(45)) * 1440 / 2560
+    local f, world = run_frames({ axis = 0, draws = { tan_v = tv, w = 2560, h = 1440 } }, 10)
+    check(f[13] == "v" and near(tonumber(f[12]), math.deg(2 * math.atan(tv)), 0.01),
+        string.format("drawn fov: the game's own projection is sent (%s%s, want %.2fv)", tostring(f[12]), tostring(f[13]), math.deg(2 * math.atan(tv))))
+    check(world.relative == true, "drawn fov: asked in the player's own view (letterboxing and split screens measure their view)")
+    -- a game whose settings are right: the same fov as before, now measured
+    local f2 = run_frames({ axis = 1, draws = { tan_v = tv, w = 1280, h = 720 } }, 10)
+    check(near(tonumber(f2[12]), 58.72, 0.01) and f2[13] == "v", "drawn fov: a game read right before is drawn the same (" .. tostring(f2[12]) .. f2[13] .. ")")
+    -- no answer this frame (a loading screen): the settings' fov, and it keeps asking
+    local f3, world3 = run_frames({ axis = 0, draws = { tan_v = tv, w = 2560, h = 1440 } }, 40, function(w) w.draws_off = true end)
+    check(f3[13] == "v" and near(tonumber(f3[12]), 90, 0.001) and (world3.projections or 0) >= 40,
+        "drawn fov: no answer - the settings' fov, still asking every frame (" .. tostring(f3[12]) .. tostring(f3[13]) .. ", " .. tostring(world3.projections) .. ")")
+    -- a game without the function: the settings' fov, and it stops asking after 30 frames, said once
+    local f4, world4, logs4 = run_frames({ axis = 1 }, 60)
+    local said = 0
+    for _, l in ipairs(logs4) do if l:find("cannot ask the game where it draws", 1, true) then said = said + 1 end end
+    check(f4[13] == "h" and near(tonumber(f4[12]), 90, 0.001) and said == 1, "drawn fov: no such function - the settings' fov, said once")
 end
 
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
