@@ -128,12 +128,15 @@ M.SLIDE_FACTOR = 0.7            -- ported from astra.cpp:594
 M.COLLIDE_TURN_RATE = 400.0     -- deg/s the WALK direction chases the goal bearing while a sweep is wired (never
                                  -- the raw bearing recomputed fresh every frame - that oscillates against a wall,
                                  -- see M.walk_collide's doc); her cosmetic s.yaw turn (540 deg/s) is unaffected
-M.STUCK_SECONDS, M.STUCK_DISTANCE = 1.6, 300.0 -- ported verbatim (m -> cm) from astra.cpp kStuckSeconds/
-                                 -- kStuckDistance (astra.cpp:32): no progress toward her REAL spot for this long
-                                 -- while still this far from it folds into the EXISTING put-her-at-her-spot
-                                 -- branch below (never a second "teleport" mechanism) - a wall that will never
-                                 -- open must not wedge her against it forever, the same way raw distance already
-                                 -- doesn't (M.TELEPORT)
+M.STUCK_SECONDS = 1.6           -- ported from astra.cpp kStuckSeconds (astra.cpp:32): no progress toward her
+                                 -- REAL spot for this long WHILE A SWEEP IS ACTUALLY REPORTING A BLOCK (s.
+                                 -- collide_blocked - never raw distance from the spot alone: an open-field sprint
+                                 -- at her speed cap plateaus the SAME WAY a genuine wedge does once she can't
+                                 -- close the gap any faster, and sweep == nil must never read as stuck at all -
+                                 -- review finding, 2026-10-20) folds into the EXISTING put-her-at-her-spot branch
+                                 -- below (never a second "teleport" mechanism) - a wall that will never open must
+                                 -- not wedge her against it forever, the same way raw distance already doesn't
+                                 -- (M.TELEPORT)
 M.STUCK_IMPROVE = 30.0          -- "progress" (astra.cpp:495): to_spot must shrink by more than this to count -
                                  -- a noise floor, not a literal zero (her own slow walk covers far more than
                                  -- this every tick, so only truly stuck - pressed against something - trips it)
@@ -469,11 +472,13 @@ end
 --- breaks the cycle ("keep doing what is working" beats "always prefer the smallest turn"). Both are returned
 --- even on a frame that needed no slide at all - dropping them the moment a frame is briefly clear re-opens the
 --- same stall over a wider, less predictable range; the caller drops them only on a real placement/teleport.
---- Returns final x, y, whether she ran out of substeps or every slide angle failed this frame, and the side/
---- direction now committed (both nil: clear, nothing to stay committed to).
+--- Returns final x, y, whether she ran out of substeps or every slide angle failed this frame, the side/
+--- direction now committed (both nil: clear, nothing to stay committed to), and whether a sweep reported a
+--- block AT ALL this frame (even one she slid around successfully) - the stuck detector's own input (see
+--- M.follow), never just the "truly stuck" case below.
 function M.walk_collide(x, y, ux, uy, total, sweep, substep, max_substeps, px, py, clear_r, cross_for_side, prev_side, prev_dir_x, prev_dir_y, stats)
-    if sweep == nil or total <= 0 then return x + ux * total, y + uy * total, false, nil, nil, nil end
-    local left, n, blocked_out, side = total, 0, false, prev_side
+    if sweep == nil or total <= 0 then return x + ux * total, y + uy * total, false, nil, nil, nil, false end
+    local left, n, blocked_out, side, any_blocked = total, 0, false, prev_side, false
     local dir_x, dir_y = prev_dir_x, prev_dir_y
     while left > 1e-4 and n < max_substeps do
         n = n + 1
@@ -482,6 +487,7 @@ function M.walk_collide(x, y, ux, uy, total, sweep, substep, max_substeps, px, p
         if nx ~= nil then
             x, y, left = nx, ny, left - len
         else
+            any_blocked = true
             if side == nil then side = (cross_for_side >= 0) and 1 or -1 end
             local found, slen = false, len * M.SLIDE_FACTOR
             if dir_x ~= nil then
@@ -501,7 +507,7 @@ function M.walk_collide(x, y, ux, uy, total, sweep, substep, max_substeps, px, p
             if not found then blocked_out = true break end
         end
     end
-    return x, y, blocked_out, side, dir_x, dir_y
+    return x, y, blocked_out, side, dir_x, dir_y, any_blocked
 end
 
 --- One step of her walking. s: her state (UE cm); p: the player {x, y, z (feet), yaw, vx, vy, falling,
@@ -531,25 +537,32 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
     if s.placed then M.update_ground(s, p, now, ground) end
     local pspeed = math.sqrt(p.vx * p.vx + p.vy * p.vy)
     local to_spot = math.sqrt((tx - s.x) ^ 2 + (ty - s.y) ^ 2)
-    -- stuck (G): no PROGRESS toward her real spot for a while, although it is far enough to matter - ported
-    -- from the Death Stranding follower's stuck detector (astra.cpp:494-516) and folded into this SAME
+    -- stuck (G): no PROGRESS toward her real spot for a while, AND a sweep is actually reporting a block (s.
+    -- collide_blocked, set below - LAST frame's, the same one-frame lag s.going already uses) - ported from
+    -- the Death Stranding follower's stuck detector (astra.cpp:494-516) and folded into this SAME
     -- put-her-at-her-spot branch, not a second mechanism (she reached "far from her spot" by a different route
     -- - a wall in the way, not raw distance - but the fix is identical). Progress is to_spot SHRINKING by more
-    -- than STUCK_IMPROVE, never elapsed time alone, so she is never cut off mid-progress; collision-unaware
-    -- (sweep == nil) this can still trip on genuinely difficult terrain, which is the same fail-safe direction
-    -- as today (TELEPORT already exists for exactly that). Gated on s.going (last frame's: it is not
-    -- recomputed yet this frame) - while she is standing or wandering her own nearby aim, tx/ty is NOT her
-    -- live goal at all (see the stand/go hysteresis below), so to_spot not shrinking means nothing; that
-    -- quieter case has its own, separate giveup (s.aim_time, below) and must not feed this one, or standing
-    -- still arbitrarily far from her spot while the player himself never moves falsely reads as "stuck" and
-    -- teleports her there every ~1.6 s (found by reproducing exactly that regression while porting this).
+    -- than STUCK_IMPROVE, never elapsed time alone, so she is never cut off mid-progress. Gating accumulation
+    -- on an actual reported block (never raw distance from the spot, and never collision-unaware - review
+    -- finding: with sweep == nil this must be BYTE-IDENTICAL to today, and an open-field sprint at her speed
+    -- cap plateaus the gap the SAME WAY a genuine wedge does once she cannot close it any faster, which must
+    -- never read as stuck either) is what lets this fire even wedged WITHIN what used to be a raw-distance
+    -- gate - that gate's only effect was to EXEMPT a close wedge from ever being rescued at all. Gated on
+    -- s.going (last frame's: it is not recomputed yet this frame) - while she is standing or wandering her own
+    -- nearby aim, tx/ty is NOT her live goal at all (see the stand/go hysteresis below), so to_spot not
+    -- shrinking means nothing; that quieter case has its own, separate giveup (s.aim_time, below) and must not
+    -- feed this one, or standing still arbitrarily far from her spot while the player himself never moves
+    -- falsely reads as "stuck" and teleports her there every ~1.6 s (found by reproducing exactly that
+    -- regression while porting this). A frame that is neither progress nor a reported block (a slide that
+    -- happened to clear a substep on its own, right at a corner, say) FREEZES stuck_time rather than zeroing
+    -- it - only real progress earns a reset; a genuinely sealed wall reports a block on most frames but not
+    -- EVERY single one (the sticky slide direction occasionally finds a substep the wall doesn't block yet),
+    -- and zeroing on every such gap never let the total reach M.STUCK_SECONDS at all (review finding).
     if s.going then
         if to_spot < (s.stuck_best or 1e9) - M.STUCK_IMPROVE then
             s.stuck_best, s.stuck_time = to_spot, 0
-        elseif to_spot > M.STUCK_DISTANCE then
+        elseif s.collide_blocked then
             s.stuck_time = (s.stuck_time or 0) + dt
-        else
-            s.stuck_time = 0
         end
     else
         s.stuck_time, s.stuck_best = 0, 1e9
@@ -583,6 +596,7 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
         s.v, s.vx, s.vy, s.speed, s.placed, s.teleports, s.going = 0, 0, 0, 0, true, (s.teleports or 0) + 1, false
         s.aim_x, s.aim_y, s.aim_time, s.aim_best, s.aim_drops = nil, nil, 0, 1e9, 0
         s.stuck_time, s.stuck_best, s.slide_side, s.slide_dir_x, s.slide_dir_y = 0, 1e9, nil, nil, nil
+        s.collide_blocked = false
         if stuck then s.stuck_teleports = (s.stuck_teleports or 0) + 1 end
         return s
     end
@@ -659,6 +673,9 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
     s.v = M.accel_brake(s.v or 0, want, dt)
     local step = math.min(s.v * dt, d)
     local mx, my = 0, 0 -- this frame's move
+    s.collide_blocked = false -- the stuck detector's input (G, above - read as LAST frame's, the same
+                               -- one-frame lag s.going already uses): a sweep actually reported a block THIS
+                               -- frame (even one she slid around) - set true below only when one did
     if d > 1e-3 and step > 0 then
         -- on her way she keeps clear of him (the Death Stranding follower's push, twice as strong: a
         -- first-person player walks INTO her) - going from in front of him to her spot behind him she walks
@@ -689,10 +706,11 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
             local mh = math.rad(s.move_heading)
             local fux, fuy = math.cos(mh), math.sin(mh)
             local cross_for_side = fux * dy - fuy * dx
-            local nx, ny, blocked_this_frame, used_side, used_dx, used_dy = M.walk_collide(s.x, s.y, fux, fuy, step, sweep,
+            local nx, ny, blocked_this_frame, used_side, used_dx, used_dy, any_blocked = M.walk_collide(s.x, s.y, fux, fuy, step, sweep,
                 M.COLLIDE_SUBSTEP * dscale, M.COLLIDE_MAX_SUBSTEPS, p.x, p.y, clear, cross_for_side, s.slide_side, s.slide_dir_x,
                 s.slide_dir_y, s.collide_stats)
             s.slide_side, s.slide_dir_x, s.slide_dir_y = used_side, used_dx, used_dy
+            s.collide_blocked = any_blocked
             mx, my = nx - s.x, ny - s.y
             s.x, s.y = nx, ny
             if blocked_this_frame then

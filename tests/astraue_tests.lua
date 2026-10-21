@@ -1694,5 +1694,50 @@ do
     check(near(her.v, 300, 1), string.format("review fix: no obstacle - her pace is never halved just for being near him (v %.1f)", her.v))
 end
 
+do
+    -- review fix (N): the stuck detector accumulates only on frames a sweep actually reported a block, never
+    -- on raw distance from the spot alone - (a) an open-field sprint, sweep == nil, must be BYTE-IDENTICAL to
+    -- today (never stuck: there is nothing to block her) even though she plateaus at her own speed cap and the
+    -- gap to a 900 cm/s player never closes.
+    local her = fresh_her()
+    local p = { x = 0, y = 0, z = 0, yaw = 0, vx = 900, vy = 0, falling = false }
+    local now = 0
+    M.follow(her, p, 1 / 60, now, nil, nil)
+    for _ = 1, 600 do -- 10 s
+        p.x = p.x + 900 / 60
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, nil, nil)
+    end
+    check((her.stuck_teleports or 0) == 0, string.format("review fix: a 10 s open-field sprint with no sweep is never read as stuck (stuck_teleports %s)", tostring(her.stuck_teleports)))
+    -- the existing fail-safe test (sweep/nav omitted vs explicitly nil are byte-identical) already covers the
+    -- "byte-identical to today" half of this at the top of the file; this one adds the SUSTAINED-sprint shape
+    -- the review flagged specifically (a plateaued catch-up gap, not just 400 random frames).
+
+    -- (b) wedged against a sealed wall, her spot ~200 cm past it, while he paces nearby (oscillating but always
+    -- "going") - she must never enter the wall, and must be rescued within STUCK_SECONDS + 1 s of the pacing
+    -- (i.e. the steady-state wedge) starting, not left stuck indefinitely by a reported-block flicker right at
+    -- a slide's own corner case resetting her progress baseline.
+    local sweep = box_sweep({ { -20, -1000, 20, 1000 } }, M.SWEEP_RADIUS)
+    local her2, p2, now2, entered_wall = fresh_her(), { x = -500, y = 0, z = 0, yaw = 0, vx = 300, vy = 0, falling = false }, 0, false
+    M.follow(her2, p2, 1 / 60, now2, nil, sweep)
+    for _ = 1, 150 do -- he walks up to ~200 cm past the wall (her spot ends up there, her wedged on this side)
+        p2.x = math.min(p2.x + 5, 286)
+        now2 = now2 + 1 / 60
+        M.follow(her2, p2, 1 / 60, now2, nil, sweep)
+        if her2.x > -20 and her2.x < 20 then entered_wall = true end
+    end
+    local rescued_frame
+    for i = 1, 300 do -- he paces near there, still registering as "going" throughout
+        p2.x = 286 + 10 * math.sin(i * 0.3)
+        p2.vx = 300 * ((i % 2 == 0) and 1 or -1)
+        now2 = now2 + 1 / 60
+        M.follow(her2, p2, 1 / 60, now2, nil, sweep)
+        if her2.x > -20 and her2.x < 20 then entered_wall = true end
+        if (her2.stuck_teleports or 0) > 0 and rescued_frame == nil then rescued_frame = i end
+    end
+    check(not entered_wall, "review fix: wedged near her spot while he paces - she never enters the wall")
+    check(rescued_frame ~= nil and rescued_frame / 60 < M.STUCK_SECONDS + 1, string.format("review fix: wedged near her spot while he paces - rescued within STUCK_SECONDS + 1 s (%s frames)", tostring(rescued_frame)))
+end
+
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
 os.exit(failed == 0 and 0 or 1)
