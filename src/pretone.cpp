@@ -56,10 +56,6 @@ namespace pretone
 				uint64_t va = 0; // a root SRV/UAV's GPU address
 				std::vector<uint32_t> constants;
 			};
-			/// D3D11: which texture is bound at each shader stage's slot right now (no root signature, no descriptor
-			/// heap - *SetShaderResources/*SetUnorderedAccessViews name the slot directly). Unused on D3D12 (which
-			/// uses `gfx`/`cmp` + the recording thread's descriptor-copy ring instead).
-			pretone_rules::D3D11Srv d3d11_srv;
 
 			/// A root signature and its arguments (the graphics one, and the compute one).
 			struct Root
@@ -99,8 +95,6 @@ namespace pretone
 				scissors.clear();
 				gfx.clear();
 				cmp.clear();
-				for (auto &s : d3d11_srv.slots)
-					s.clear();
 			}
 			Root *root(shader_stage stages)
 			{
@@ -374,68 +368,57 @@ namespace pretone
 			}
 		}
 
-		/// The D3D11 stage of a push_descriptors event's `stages` (always exactly one bit for a real D3D11
-		/// *SetShaderResources/*SetUnorderedAccessViews call); `count` for anything else (a combined mask, or a
-		/// stage this add-on does not track - amplification/mesh/ray tracing never appear on D3D11).
-		pretone_rules::D3D11Stage d3d11_stage_of(shader_stage stages)
+		/// D3D11: what a draw (or, `compute`, a dispatch) reads right now, asked of the context itself. Called only at a
+		/// candidate draw (a full-screen shape, or a traced one), so nothing is tracked per *SetShaderResources call; an
+		/// empty slot is skipped before anything touches it (ReShade's get_resource_from_view dereferences a null view);
+		/// a bound view is alive while it is read (the context holds it). A D3D11 resource's ReShade handle IS its
+		/// ID3D11Resource pointer, the same one on_bind_render_targets' get_resource_from_view gives.
+		size_t d3d11_reads(command_list *cmd, bool compute, passfind::Tex *out, size_t cap)
 		{
-			switch (stages)
-			{
-			case shader_stage::vertex:
-				return pretone_rules::D3D11Stage::vs;
-			case shader_stage::hull:
-				return pretone_rules::D3D11Stage::hs;
-			case shader_stage::domain:
-				return pretone_rules::D3D11Stage::ds;
-			case shader_stage::geometry:
-				return pretone_rules::D3D11Stage::gs;
-			case shader_stage::pixel:
-				return pretone_rules::D3D11Stage::ps;
-			case shader_stage::compute:
-				return pretone_rules::D3D11Stage::cs;
-			default:
-				return pretone_rules::D3D11Stage::count;
-			}
-		}
-
-		/// D3D11: *SetShaderResources(binding.., count, views) or CSSetUnorderedAccessViews(binding.., count, uavs)
-		/// resolved to Tex and written into the list's per-stage slot table - `update.binding` IS the register slot
-		/// (D3D11 has no descriptor heap indirection to resolve through); a null view in the array unbinds its slot,
-		/// matching the real call. Returns false (not handled: not a D3D11 SRV/UAV bind) so the caller falls through
-		/// to the D3D12 root-table tracking below.
-		bool d3d11_push_descriptors(command_list *cmd, shader_stage stages, const descriptor_table_update &update)
-		{
-			if (cmd->get_device()->get_api() != device_api::d3d11 || update.count == 0 || update.descriptors == nullptr)
-				return false;
-			if (update.type != descriptor_type::shader_resource_view && update.type != descriptor_type::unordered_access_view)
-				return false; // texture_shader_resource_view / texture_unordered_access_view are the same values
-			const pretone_rules::D3D11Stage stage = d3d11_stage_of(stages);
-			if (stage == pretone_rules::D3D11Stage::count)
-				return false;
-			ListState *s = state(cmd);
-			if (s == nullptr)
-				return true; // handled (a D3D11 bind): nothing else should touch this event
+			auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(cmd->get_native());
 			device *dev = cmd->get_device();
-			const resource_view *views = static_cast<const resource_view *>(update.descriptors);
-			const bool uav = update.type == descriptor_type::unordered_access_view;
-			constexpr uint32_t kCap = 128; // D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT: the most one call can bind
-			passfind::Tex resolved[kCap];
-			const uint32_t count = std::min<uint32_t>(update.count, kCap);
-			for (uint32_t i = 0; i < count; ++i)
+			size_t n = 0;
+			const auto take = [&](ID3D11View *view, bool written) {
+				if (view == nullptr)
+					return;
+				ID3D11Resource *res = nullptr;
+				if (n < cap)
+					view->GetResource(&res);
+				if (res != nullptr)
+				{
+					passfind::Tex t = describe(dev, resource{uint64_t(uintptr_t(res))});
+					res->Release();
+					if (t.id != 0)
+					{
+						t.written = written;
+						out[n++] = t;
+					}
+				}
+				view->Release();
+			};
+			ID3D11ShaderResourceView *srv[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+			if (compute)
+				ctx->CSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, srv);
+			else
+				ctx->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, srv);
+			for (ID3D11ShaderResourceView *v : srv)
+				take(v, false);
+			if (compute)
 			{
-				resolved[i] = describe(dev, dev->get_resource_from_view(views[i]));
-				resolved[i].written = uav && resolved[i].id != 0;
+				ID3D11UnorderedAccessView *uav[D3D11_PS_CS_UAV_REGISTER_COUNT] = {};
+				ctx->CSGetUnorderedAccessViews(0, D3D11_PS_CS_UAV_REGISTER_COUNT, uav);
+				for (ID3D11UnorderedAccessView *v : uav)
+					take(v, true);
 			}
-			s->d3d11_srv.bind(stage, update.binding, count, resolved);
-			return true;
+			return n;
 		}
 
 		void on_push_descriptors(command_list *cmd, shader_stage stages, pipeline_layout layout, uint32_t index, const descriptor_table_update &update)
 		{
 			if (!on())
 				return;
-			if (d3d11_push_descriptors(cmd, stages, update))
-				return;
+			if (cmd->get_device()->get_api() == device_api::d3d11)
+				return; // D3D11: what a draw reads is asked of the context at a candidate draw (d3d11_reads)
 			ListState *s = state(cmd);
 			ListState::Root *r = s != nullptr ? s->root(stages) : nullptr;
 			if (r == nullptr || update.count != 1 || update.descriptors == nullptr)
@@ -1200,7 +1183,7 @@ namespace pretone
 			if (shape && !trace && g_foundAt.load() == g_presents.load())
 				return false; // the tonemapper was this frame's already (the UI's quads come after it)
 			passfind::Tex reads[24];
-			const size_t n = d3d11 ? s->d3d11_srv.resolve(pretone_rules::D3D11Stage::ps, reads, 24) : draw_reads(cmd, s->gfx, window, reads, 24);
+			const size_t n = d3d11 ? d3d11_reads(cmd, false, reads, 24) : draw_reads(cmd, s->gfx, window, reads, 24);
 			bool ambiguous = false;
 			const passfind::Tex scene = shape ? passfind::scene_read(s->find, reads, n, &ambiguous) : passfind::Tex();
 			if (trace)
@@ -1238,7 +1221,7 @@ namespace pretone
 			if (!tracing() || (!d3d11 && s->cmp.layout.handle == 0))
 				return false; // only looked at in a trace: a game's frame has hundreds of dispatches
 			passfind::Tex bound[24];
-			const size_t n = d3d11 ? s->d3d11_srv.resolve(pretone_rules::D3D11Stage::cs, bound, 24) : draw_reads(cmd, s->cmp, window, bound, 24);
+			const size_t n = d3d11 ? d3d11_reads(cmd, true, bound, 24) : draw_reads(cmd, s->cmp, window, bound, 24);
 			bool ambiguous = false, sized = false;
 			const passfind::Tex scene = passfind::compute_scene(bound, n, g_outW, g_outH, &ambiguous);
 			for (size_t i = 0; i < n; ++i)

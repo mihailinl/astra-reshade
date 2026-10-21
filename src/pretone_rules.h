@@ -7,8 +7,6 @@
 //   Retired    a copy of the scene colour no longer used is destroyed frames later, never while the GPU may read it
 //   Staging    the upload buffers her picture goes through on a recording thread: reused only as late
 //   CopyRing   D3D12: which descriptor copies a draw reads - only the ones made since its command list's previous draw
-//   D3D11Srv   D3D11: which texture is bound at each shader stage's slot - D3D11 names the slot directly (no
-//              descriptor heap indirection, no root signature), so this is just a sparse array per stage
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -264,48 +262,4 @@ namespace pretone_rules
 		}
 		return n;
 	}
-
-	// ---- what a draw reads, D3D11: the slot a resource is bound at, per shader stage ----------------------------
-
-	/// The six D3D11 shader stages a resource (SRV or - CSSetUnorderedAccessViews - UAV) can be bound at. No root
-	/// signature, no descriptor heap: *SetShaderResources/*SetUnorderedAccessViews name the slot directly, so there
-	/// is nothing here to resolve through a ring - only which Tex is at which slot, right now.
-	enum class D3D11Stage : uint8_t
-	{
-		vs,
-		hs,
-		ds,
-		gs,
-		ps,
-		cs,
-		count,
-	};
-
-	/// One shader stage's bound slots. `bind()` mirrors the real Set call: a rebind replaces `first..first+count`,
-	/// and a null view in that range (its Tex's id == 0, same as passfind::Tex's default) unbinds its slot - exactly
-	/// what `PSSetShaderResources(slot, 1, &null)` does on the real device. A slot past the table has never been
-	/// bound (resolve() skips it, same as id == 0).
-	struct D3D11Srv
-	{
-		std::vector<passfind::Tex> slots[size_t(D3D11Stage::count)];
-
-		void bind(D3D11Stage stage, uint32_t first, uint32_t count, const passfind::Tex *views)
-		{
-			std::vector<passfind::Tex> &s = slots[size_t(stage)];
-			if (s.size() < size_t(first) + count)
-				s.resize(size_t(first) + count);
-			for (uint32_t i = 0; i < count; ++i)
-				s[first + i] = views[i];
-		}
-		/// Every slot of `stage` with something bound (id != 0), into `out` (cap limited). What a draw at that stage
-		/// reads (pixel stage for a draw, compute stage for a dispatch - UAVs too, a compute tonemapper's output).
-		size_t resolve(D3D11Stage stage, passfind::Tex *out, size_t cap) const
-		{
-			size_t n = 0;
-			for (const passfind::Tex &t : slots[size_t(stage)])
-				if (t.id != 0 && n < cap)
-					out[n++] = t;
-			return n;
-		}
-	};
 }

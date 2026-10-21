@@ -957,74 +957,6 @@ static void test_pretone_rules()
 	}
 }
 
-// ---- pretone's rules, D3D11: which texture is bound at each shader stage's slot --------------------------------
-
-static void test_d3d11_srv()
-{
-	using pretone_rules::D3D11Srv;
-	using pretone_rules::D3D11Stage;
-	D3D11Srv t;
-	passfind::Tex out[32];
-
-	// bind: PSSetShaderResources(0, 2, {scene, bloom}) - both slots resolve, in no particular order guaranteed by
-	// the table, but both must be there
-	const passfind::Tex scene = tex(1, 1920, 1080, 10), bloom = tex(2, 960, 540, 10);
-	{
-		const passfind::Tex views[2] = {scene, bloom};
-		t.bind(D3D11Stage::ps, 0, 2, views);
-		size_t n = t.resolve(D3D11Stage::ps, out, 32);
-		CHECK(n == 2 && ((out[0].id == scene.id && out[1].id == bloom.id) || (out[0].id == bloom.id && out[1].id == scene.id)));
-	}
-	// rebind: slot 0 replaced (PSSetShaderResources(0, 1, {exposure})) - slot 1 (bloom) is untouched
-	const passfind::Tex exposure = tex(3, 60, 34, 54);
-	{
-		const passfind::Tex views[1] = {exposure};
-		t.bind(D3D11Stage::ps, 0, 1, views);
-		size_t n = t.resolve(D3D11Stage::ps, out, 32);
-		CHECK(n == 2 && ((out[0].id == exposure.id && out[1].id == bloom.id) || (out[0].id == bloom.id && out[1].id == exposure.id)));
-	}
-	// unbind with null: PSSetShaderResources(1, 1, {nullptr}) clears slot 1 - the real call's effect on an unbind
-	{
-		const passfind::Tex null_view; // id == 0: unbound, same as never bound
-		t.bind(D3D11Stage::ps, 1, 1, &null_view);
-		size_t n = t.resolve(D3D11Stage::ps, out, 32);
-		CHECK(n == 1 && out[0].id == exposure.id);
-	}
-	// a slot beyond the table (never bound there) resolves to nothing - the table only grows when something is
-	// bound, so slot 10 is simply absent, not a zeroed Tex entry
-	{
-		size_t n = t.resolve(D3D11Stage::ps, out, 32);
-		CHECK(n == 1); // unchanged: asking about a never-bound slot does not add one
-	}
-	// stage separation: binding VS slot 0 must not disturb PS's table, and vice versa
-	const passfind::Tex vs_cb_tex = tex(4, 256, 1, 2);
-	{
-		const passfind::Tex views[1] = {vs_cb_tex};
-		t.bind(D3D11Stage::vs, 0, 1, views);
-		size_t n_vs = t.resolve(D3D11Stage::vs, out, 32);
-		CHECK(n_vs == 1 && out[0].id == vs_cb_tex.id);
-		size_t n_ps = t.resolve(D3D11Stage::ps, out, 32);
-		CHECK(n_ps == 1 && out[0].id == exposure.id); // PS's table is exactly as it was
-		size_t n_cs = t.resolve(D3D11Stage::cs, out, 32);
-		CHECK(n_cs == 0); // CS was never touched
-	}
-	// a compute tonemapper's UAV output lands in the same per-stage table as its SRV inputs (CS only) - written is
-	// carried through untouched, so compute_scene (passfind.h) can still tell input from output
-	{
-		const passfind::Tex cs_in = tex(5, 1920, 1080, 10), cs_out = tex(6, 1920, 1080, 27, /*written*/ true);
-		const passfind::Tex views[2] = {cs_in, cs_out};
-		t.bind(D3D11Stage::cs, 0, 2, views);
-		size_t n = t.resolve(D3D11Stage::cs, out, 32);
-		bool have_in = false, have_out_written = false;
-		for (size_t i = 0; i < n; ++i)
-		{
-			have_in = have_in || (out[i].id == cs_in.id && !out[i].written);
-			have_out_written = have_out_written || (out[i].id == cs_out.id && out[i].written);
-		}
-		CHECK(n == 2 && have_in && have_out_written);
-	}
-}
-
 // ---- the link's outbox: a frame never waits for the network ---------------------------------------------------
 
 static void test_outbox()
@@ -1945,7 +1877,6 @@ int main(int argc, char **argv)
 	test_ring();
 	test_passfind();
 	test_pretone_rules();
-	test_d3d11_srv();
 	test_outbox();
 	test_link_sends_through_the_outbox();
 	test_hello_rules();
