@@ -79,8 +79,72 @@ M.TRACE_MIN, M.TRACE_MAX = 0.05, 0.25 -- never more often than this; at least th
 M.TRACE_MOVE = 15.0             -- sooner than TRACE_MAX once she moved this far
 M.TRACE_UP, M.TRACE_DOWN = 100.0, 300.0 -- from this far above the higher of her and the player's feet, to this far below the lower
 M.STEP_UP = 50.0                -- ground higher than this above her feet is hers only with no ceiling between (a ledge, not a balcony)
+M.OBJECT_BAND = M.STEP_UP       -- ...and even then, only if the PLAYER's own feet are within this of it too - the
+                                 -- discriminator between a ledge/balcony he actually climbed (his feet are up
+                                 -- there) and an isolated prop near him he is not standing on or near the height
+                                 -- of (a crate, a table, a railing): she must not end up standing ON the latter
+                                 -- (the owner, 2026-10-20: "sometimes stays on them"). Checked on BOTH the
+                                 -- walking path and a forced teleport - a teleport landing over furniture was
+                                 -- accepted completely unconditionally before this (UNVERIFIED tuning: reusing
+                                 -- STEP_UP's number for symmetry, not measured against real game furniture).
 M.GROUND_KEEP = 1.0             -- a trace that misses keeps the last ground this long, then the player's
 M.TRACE_CHANNEL = 0             -- ETraceTypeQuery: 0 = TraceTypeQuery1, the Visibility channel in every UE game
+
+-- her body against the world (UE centimetres, seconds, degrees) - collision-aware walking. ALL of this is
+-- reached only through the optional `sweep` function M.follow's 6th argument: nil (today, or a game where the
+-- capsule sweep call threw once and it was withdrawn for the session - see the glue's `sweep_broken` latch)
+-- takes the exact original unconditional-move code path, byte for byte. Ported in spirit from the Death
+-- Stranding follower's try_step/slide/stuck (astra-in-death-stranding/src/astra.cpp:111-149, 580-607, 494-516),
+-- adapted to AstraUE's one-call-per-engine-frame model (no DS-style fixed substep loop is needed for tunnelling
+-- - a SWEEP, not a point sample, cannot miss a thin wall at any speed - COLLIDE_SUBSTEP exists only to bound
+-- how far she commits before re-aiming near a corner, i.e. cost, not correctness).
+M.SWEEP_RADIUS, M.SWEEP_HALF_HEIGHT = 34.0, 85.0 -- her capsule (cm): close to UE's default ThirdPersonCharacter
+                                 -- (radius 34, half-height 88) so a sweep against the SAME collision the
+                                 -- player's own capsule would hit reads as "her body", not a point
+M.SWEEP_OBJECT_TYPES = { 0, 1 } -- EObjectTypeQuery: 0 = ObjectTypeQuery1 (WorldStatic), 1 = ObjectTypeQuery2
+                                 -- (WorldDynamic) - by analogy with M.TRACE_CHANNEL's CONFIRMED 0-based
+                                 -- ETraceTypeQuery encoding (UNVERIFIED for object types specifically). Chosen
+                                 -- over the Visibility channel the ground/sun traces use: "what a character's
+                                 -- capsule collides with" is the general proxy for a wall/prop a game actually
+                                 -- blocks movement with, and is silent on other Pawns and on Trigger volumes
+                                 -- (overlap-only by default in virtually every UE project) with NO extra filter
+                                 -- code needed - never hers to push through, never hers to stop on an invisible
+                                 -- trigger.
+M.COLLIDE_SUBSTEP = 120.0       -- longest move committed before re-checking (cm); not a tunnelling guard (see
+                                 -- above) - only how often a blocked frame re-aims
+M.COLLIDE_MAX_SUBSTEPS = 6      -- a hard cap on sweeps/frame: bounds worst-case cost (see notes/engine-rules
+                                 -- budget note at the call site)
+M.SLIDE_ANGLES = { 0.6, -0.6, 1.2, -1.2, 1.6, -1.6 } -- radians, ported verbatim from astra.cpp:590 (the 1.6 rad
+                                 -- member is just past perpendicular on purpose: pressed flush against a wall,
+                                 -- every angle under 90 degrees still drifts INTO it over any nonzero slide
+                                 -- length - astra-in-death-stranding's own report on this port)
+M.SLIDE_FACTOR = 0.7            -- ported from astra.cpp:594
+M.COLLIDE_TURN_RATE = 400.0     -- deg/s the WALK direction chases the goal bearing while a sweep is wired (never
+                                 -- the raw bearing recomputed fresh every frame - that oscillates against a wall,
+                                 -- see M.walk_collide's doc); her cosmetic s.yaw turn (540 deg/s) is unaffected
+M.STUCK_SECONDS, M.STUCK_DISTANCE = 1.6, 300.0 -- ported verbatim (m -> cm) from astra.cpp kStuckSeconds/
+                                 -- kStuckDistance (astra.cpp:32): no progress toward her REAL spot for this long
+                                 -- while still this far from it folds into the EXISTING put-her-at-her-spot
+                                 -- branch below (never a second "teleport" mechanism) - a wall that will never
+                                 -- open must not wedge her against it forever, the same way raw distance already
+                                 -- doesn't (M.TELEPORT)
+M.STUCK_IMPROVE = 30.0          -- "progress" (astra.cpp:495): to_spot must shrink by more than this to count -
+                                 -- a noise floor, not a literal zero (her own slow walk covers far more than
+                                 -- this every tick, so only truly stuck - pressed against something - trips it)
+M.STUCK_GIVEUP = 1.5            -- her optional stand-mode step-away/stroll aim (never her real spot) is just
+                                 -- DROPPED after this long stuck, not teleported for - low stakes, recomputed
+                                 -- next time she needs one (astra.cpp's own aim/stay distinction)
+M.STUCK_AIM_DROPS = 3            -- ...but dropping an aim changes nothing about the geometry, so an unreachable
+                                 -- one is set again identically next frame and would retry forever with no
+                                 -- escape at all; this many consecutive giveups with no arrival between them
+                                 -- escalates to the real teleport above (a genuinely sealed-off spot, the
+                                 -- player himself never moving) - about STUCK_GIVEUP * (this + 1) seconds
+M.NAV_EVERY = 0.5               -- seconds between navmesh path queries (optional, best-effort - never per frame;
+                                 -- a synchronous query is comparatively expensive and only needs to be roughly
+                                 -- right). A level with no baked NavMesh (plausible for a scripted first-person
+                                 -- game with no AI) answers invalid/empty every time - unchanged, see M.nav_goal
+M.NAV_LOOKAHEAD = 150.0         -- cm: a path point this near her is skipped for the next one - she steers at the
+                                 -- next useful bend, not every polyline vertex
 
 -- the game's sun
 M.SUN_FIND_EVERY = 5.0          -- seconds before searching again when no sun was found, doubling while none is (a level
@@ -236,7 +300,10 @@ end
 --- hits, down or up, or nil), rate-limited; a miss keeps the last one GROUND_KEEP seconds; with no trace, the player's
 --- ground while he stands on it. The trace starts above the higher of her and the player's feet (she steps up onto the
 --- ledge he climbed); a surface more than STEP_UP above her own feet is hers only if nothing is between her and it - a
---- balcony the player stands on over her head is a ceiling to her, and she stays on her floor.
+--- balcony the player stands on over her head is a ceiling to her, and she stays on her floor. Separately, a surface
+--- more than OBJECT_BAND above the PLAYER's own feet is never hers either, ceiling or not - a ledge/balcony he
+--- actually climbed has HIM up there too; an isolated prop (a crate, a table, a railing) near him does not, and a
+--- single downward ray cannot otherwise tell the two apart (both read as "higher surface, nothing overhead").
 function M.update_ground(s, p, now, ground, force)
     s.trace = s.trace or {}
     local g = s.trace
@@ -246,6 +313,10 @@ function M.update_ground(s, p, now, ground, force)
         if z ~= nil and not force and z > s.z + M.STEP_UP and ground(s.x, s.y, s.z + M.STEP_UP * 0.5, z - 1) ~= nil then
             z = ground(s.x, s.y, s.z + M.STEP_UP, bottom) -- under a ceiling: her own floor
             g.ceilings = (g.ceilings or 0) + 1
+        end
+        if z ~= nil and z > p.z + M.OBJECT_BAND then
+            z = ground(s.x, s.y, z - 1, bottom) -- not a ledge he's on: the real floor beneath/around the object
+            g.objects = (g.objects or 0) + 1
         end
         g.at, g.x, g.y, g.traces = now, s.x, s.y, (g.traces or 0) + 1
         if z ~= nil then
@@ -311,10 +382,102 @@ function M.real_velocity(st, x, y, vx, vy, now)
     return vx, vy
 end
 
+--- Is a fresh navmesh path query due (optional long-range steering hint)? `at`: when the last one was taken
+--- (nil: never). Gates the GLUE's call, not a frame-rate thing M here decides on its own - never more than
+--- once per NAV_EVERY seconds, so a comparatively expensive synchronous query never runs every frame.
+function M.nav_due(at, now)
+    return at == nil or now - at >= M.NAV_EVERY
+end
+
+--- Her next steering goal given a cached navmesh path (optional - nil/empty `points`: the plain goal,
+--- unchanged, so a level with no baked NavMesh, or a game where the query call is missing or threw, behaves
+--- exactly as without this). `points`: {x, y} pairs from the last successful, non-partial path query, nearest
+--- first. Skips every point already within NAV_LOOKAHEAD of her (she steers at the next useful bend, not every
+--- polyline vertex - a dense path would otherwise stall her re-aiming every few cm); the LAST point replaces
+--- the plain goal only once she is past every point before it.
+function M.nav_goal(x, y, goal_x, goal_y, points)
+    if points == nil or #points == 0 then return goal_x, goal_y end
+    for _, pt in ipairs(points) do
+        local dx, dy = pt[1] - x, pt[2] - y
+        if dx * dx + dy * dy > M.NAV_LOOKAHEAD * M.NAV_LOOKAHEAD then return pt[1], pt[2] end
+    end
+    return goal_x, goal_y
+end
+
+--- One try: from (x, y), by (dx, dy) - nil if it would land nearer the player than clear_r (she must never be
+--- pushed into him by a slide), or if `sweep` finds her body blocked there; else the landing x, y. `sweep(x1,
+--- y1, x2, y2) -> true if blocked` is ALREADY fail-safe at the call site (the glue's capsule-sweep closure, or
+--- the test stub) - a throw there is the glue's job to latch, not this pure function's; `sweep == nil` always
+--- answers clear (the caller only reaches here once a sweep IS given - see M.follow).
+local function try_move(x, y, dx, dy, sweep, px, py, clear_r, stats)
+    local nx, ny = x + dx, y + dy
+    if clear_r and clear_r > 0 then
+        local ddx, ddy = nx - px, ny - py
+        if ddx * ddx + ddy * ddy < clear_r * clear_r then return nil end
+    end
+    if sweep == nil then return nx, ny end
+    if stats then stats.sweeps = (stats.sweeps or 0) + 1 end
+    if sweep(x, y, nx, ny) then return nil end
+    return nx, ny
+end
+
+--- The substepped walk, collision-aware: from (x, y), `total` cm along unit (ux, uy); `sweep` a capsule sweep
+--- (see try_move) - ported from the Death Stranding follower's frame()-loop + try_step/slide (astra.cpp:580-
+--- 607, in spirit: ONE capsule sweep per try here, where astra.cpp tests two spheres, since UE4SS gives one
+--- call that already sweeps her whole body). `cross_for_side`: (her walk direction x the raw goal direction) -
+--- only its SIGN matters, and only the FIRST time a slide is needed this stretch. `prev_side`/`prev_dir_x,y`:
+--- what the LAST frame committed to (nil: nothing yet) - both are STICKY across frames (round-tripped through
+--- the caller's persisted state), for two reasons astra-in-death-stranding's own port notes found by
+--- reproducing the stalls directly: (1) with nothing committed yet, the walk direction and the raw goal
+--- direction are the SAME vector, so their cross product is noise - re-picking a side fresh every frame
+--- flip-flops between the two slide options and she never commits; (2) even with a side fixed, retrying the
+--- fixed angle list smallest-first every frame oscillates in a stable 2-frame cycle right at a hard boundary
+--- (pressed flush against a wall) - trying the exact direction that worked last FIRST, before the fixed list,
+--- breaks the cycle ("keep doing what is working" beats "always prefer the smallest turn"). Both are returned
+--- even on a frame that needed no slide at all - dropping them the moment a frame is briefly clear re-opens the
+--- same stall over a wider, less predictable range; the caller drops them only on a real placement/teleport.
+--- Returns final x, y, whether she ran out of substeps or every slide angle failed this frame, and the side/
+--- direction now committed (both nil: clear, nothing to stay committed to).
+function M.walk_collide(x, y, ux, uy, total, sweep, substep, max_substeps, px, py, clear_r, cross_for_side, prev_side, prev_dir_x, prev_dir_y, stats)
+    if sweep == nil or total <= 0 then return x + ux * total, y + uy * total, false, nil, nil, nil end
+    local left, n, blocked_out, side = total, 0, false, prev_side
+    local dir_x, dir_y = prev_dir_x, prev_dir_y
+    while left > 1e-4 and n < max_substeps do
+        n = n + 1
+        local len = math.min(left, substep)
+        local nx, ny = try_move(x, y, ux * len, uy * len, sweep, px, py, clear_r, stats)
+        if nx ~= nil then
+            x, y, left = nx, ny, left - len
+        else
+            if side == nil then side = (cross_for_side >= 0) and 1 or -1 end
+            local found, slen = false, len * M.SLIDE_FACTOR
+            if dir_x ~= nil then
+                local sxn, syn = try_move(x, y, dir_x * slen, dir_y * slen, sweep, px, py, clear_r, stats)
+                if sxn ~= nil then x, y, found = sxn, syn, true end
+            end
+            if not found then
+                for _, ang in ipairs(M.SLIDE_ANGLES) do
+                    local a = ang * side
+                    local c, sn = math.cos(a), math.sin(a)
+                    local sx, sy = ux * c - uy * sn, ux * sn + uy * c
+                    local sxn, syn = try_move(x, y, sx * slen, sy * slen, sweep, px, py, clear_r, stats)
+                    if sxn ~= nil then x, y, found, dir_x, dir_y = sxn, syn, true, sx, sy break end
+                end
+            end
+            left = left - len -- the full substep is spent whether she slid 0.7x of it or not at all (astra.cpp:605)
+            if not found then blocked_out = true break end
+        end
+    end
+    return x, y, blocked_out, side, dir_x, dir_y
+end
+
 --- One step of her walking. s: her state (UE cm); p: the player {x, y, z (feet), yaw, vx, vy, falling,
---- half_height (optional: the pawn's capsule half-height, for scale - F)}; dt seconds; now: a clock
---- (seconds) and ground: a line trace down (both optional: without them she stands on the player's ground).
-function M.follow(s, p, dt, now, ground)
+--- half_height (optional: the pawn's capsule half-height, for scale - F)}; dt seconds; now: a clock (seconds);
+--- ground: a line trace down (optional: without it she stands on the player's ground); sweep(x1, y1, x2, y2) ->
+--- blocked (optional: without it - missing, or withdrawn by the glue after it threw once - every line below it
+--- touches is skipped and she moves exactly as before, one unclamped straight-line step); nav: a cached navmesh
+--- path's points (optional, see M.nav_goal - a best-effort long-range hint only, never required).
+function M.follow(s, p, dt, now, ground, sweep, nav)
     -- scale-aware distances (F): a smaller/taller capsule than the reference moves her spot and comfort
     -- radii proportionally; no half_height given (or 0): today's fixed numbers, unchanged
     local dscale = (p.half_height and p.half_height > 0) and (p.half_height / M.REF_HALF_HEIGHT) or 1.0
@@ -335,14 +498,46 @@ function M.follow(s, p, dt, now, ground)
     if s.placed then M.update_ground(s, p, now, ground) end
     local pspeed = math.sqrt(p.vx * p.vx + p.vy * p.vy)
     local to_spot = math.sqrt((tx - s.x) ^ 2 + (ty - s.y) ^ 2)
-    if not s.placed or to_spot > M.TELEPORT or math.abs((s.ground or p.z) - s.z) > M.FLOOR_APART then
+    -- stuck (G): no PROGRESS toward her real spot for a while, although it is far enough to matter - ported
+    -- from the Death Stranding follower's stuck detector (astra.cpp:494-516) and folded into this SAME
+    -- put-her-at-her-spot branch, not a second mechanism (she reached "far from her spot" by a different route
+    -- - a wall in the way, not raw distance - but the fix is identical). Progress is to_spot SHRINKING by more
+    -- than STUCK_IMPROVE, never elapsed time alone, so she is never cut off mid-progress; collision-unaware
+    -- (sweep == nil) this can still trip on genuinely difficult terrain, which is the same fail-safe direction
+    -- as today (TELEPORT already exists for exactly that). Gated on s.going (last frame's: it is not
+    -- recomputed yet this frame) - while she is standing or wandering her own nearby aim, tx/ty is NOT her
+    -- live goal at all (see the stand/go hysteresis below), so to_spot not shrinking means nothing; that
+    -- quieter case has its own, separate giveup (s.aim_time, below) and must not feed this one, or standing
+    -- still arbitrarily far from her spot while the player himself never moves falsely reads as "stuck" and
+    -- teleports her there every ~1.6 s (found by reproducing exactly that regression while porting this).
+    if s.going then
+        if to_spot < (s.stuck_best or 1e9) - M.STUCK_IMPROVE then
+            s.stuck_best, s.stuck_time = to_spot, 0
+        elseif to_spot > M.STUCK_DISTANCE then
+            s.stuck_time = (s.stuck_time or 0) + dt
+        else
+            s.stuck_time = 0
+        end
+    else
+        s.stuck_time, s.stuck_best = 0, 1e9
+    end
+    -- a SECOND escape, for when she is never "going" at all (the player never moves - the quieter aim giveup
+    -- below just drops an unreachable aim rather than teleporting for it, since on its own that is low stakes;
+    -- but dropping it changes nothing about the geometry, so the SAME conditions set an identical new aim next
+    -- frame and she would otherwise retry forever, in lockstep with STUCK_GIVEUP, with no escape at all - a
+    -- genuinely sealed-off spot must still free her eventually). s.aim_drops counts consecutive giveups with no
+    -- successful arrival between them (reset on arrival or on any placement/teleport, including this one).
+    local stuck = s.placed and ((s.going and (s.stuck_time or 0) > M.STUCK_SECONDS) or (s.aim_drops or 0) > M.STUCK_AIM_DROPS)
+    if not s.placed or to_spot > M.TELEPORT or stuck or math.abs((s.ground or p.z) - s.z) > M.FLOOR_APART then
         -- put at her spot, on the ground there (traced at once)
         s.x, s.y, s.z, s.yaw = tx, ty, p.z, p.yaw
         if s.trace then s.trace.z = nil end
         M.update_ground(s, p, now, ground, true)
         s.z = s.ground or p.z
         s.v, s.vx, s.vy, s.speed, s.placed, s.teleports, s.going = 0, 0, 0, 0, true, (s.teleports or 0) + 1, false
-        s.aim_x, s.aim_y = nil, nil
+        s.aim_x, s.aim_y, s.aim_time, s.aim_best, s.aim_drops = nil, nil, 0, 1e9, 0
+        s.stuck_time, s.stuck_best, s.slide_side, s.slide_dir_x, s.slide_dir_y = 0, 1e9, nil, nil, nil
+        if stuck then s.stuck_teleports = (s.stuck_teleports or 0) + 1 end
         return s
     end
     -- stand/go (E): she tracks the player once he is really GOING; a hysteresis gap (GO_START to start,
@@ -375,7 +570,35 @@ function M.follow(s, p, dt, now, ground)
     end
     local dx, dy = goal_x - s.x, goal_y - s.y
     local d = math.sqrt(dx * dx + dy * dy)
-    if s.aim_x ~= nil and d <= near_enough then s.aim_x, s.aim_y = nil, nil end -- there
+    if s.aim_x ~= nil and d <= near_enough then s.aim_x, s.aim_y, s.aim_drops = nil, nil, 0 end -- there
+    if s.aim_x ~= nil then
+        -- a quieter stuck case (astra.cpp's own aim/stay distinction): only her OPTIONAL step-away/stroll aim
+        -- is unreachable, never her real spot - drop it rather than teleport for it (low stakes; recomputed
+        -- next time she needs one, from wherever she actually is) - UNLESS it keeps happening with no arrival
+        -- in between (s.aim_drops, counted and escalated at the top of this function).
+        if d < (s.aim_best or 1e9) - M.STUCK_IMPROVE then
+            s.aim_best, s.aim_time = d, 0
+        else
+            s.aim_time = (s.aim_time or 0) + dt
+            if s.aim_time > M.STUCK_GIVEUP then
+                s.aim_x, s.aim_y, s.aim_time, s.aim_best = nil, nil, 0, 1e9
+                s.aim_drops = (s.aim_drops or 0) + 1
+                goal_x, goal_y, dx, dy, d = s.x, s.y, 0, 0, 0
+            end
+        end
+    else
+        s.aim_time, s.aim_best = 0, 1e9
+    end
+    -- the navmesh hint (optional - M.nav_goal is a no-op without a usable path): steer toward the next useful
+    -- bend of a cached path instead of straight at the goal, ONLY while actually heading for her real spot
+    -- (s.going; goal_x, goal_y == tx, ty in that branch) - never while standing still or walking her short,
+    -- close-by stand-mode aim, where a cached path toward the far spot would be the wrong target entirely.
+    -- Recomputing dx, dy, d keeps every line below (push-off, pace, stuck) working from the live goal.
+    if nav ~= nil and s.going then
+        goal_x, goal_y = M.nav_goal(s.x, s.y, goal_x, goal_y, nav)
+        dx, dy = goal_x - s.x, goal_y - s.y
+        d = math.sqrt(dx * dx + dy * dy)
+    end
     local want
     if s.going and d <= near_enough then
         want = math.min(pspeed, M.RUN_MAX) -- at her spot while he walks: keep his pace, never stop-and-go
@@ -402,9 +625,37 @@ function M.follow(s, p, dt, now, ground)
             local l = math.sqrt(ux * ux + uy * uy)
             if l > 1e-3 then ux, uy = ux / l, uy / l else ux, uy = dx / d, dy / d end
         end
-        mx, my = ux * step, uy * step
-        s.x, s.y = s.x + mx, s.y + my
-        if step > 0.3 then s.yaw = M.turn(s.yaw, math.deg(math.atan(uy, ux)), 540 * dt) end
+        if sweep == nil then
+            -- today's exact behaviour: one unclamped straight-line step, byte for byte (the fail-safe test
+            -- requires this, not just "close enough" - see the glue's sweep_broken latch).
+            mx, my = ux * step, uy * step
+            s.x, s.y = s.x + mx, s.y + my
+            if step > 0.3 then s.yaw = M.turn(s.yaw, math.deg(math.atan(uy, ux)), 540 * dt) end
+        else
+            -- a STABLE heading to walk/slide along, not the raw bearing-to-goal recomputed fresh every frame -
+            -- that bearing is perturbed by a slide's own small lateral moves, and feeding it straight back into
+            -- "which slide angle is clear first" is exactly the 2-frame oscillation M.walk_collide's own doc
+            -- describes (astra.cpp avoids this because ITS heading is the avatar's own slowly-turning facing,
+            -- decoupled from the instantaneous goal bearing - ported fix: chase the goal bearing at a capped
+            -- turn rate, same mechanism as her existing cosmetic yaw turn, and walk/slide along THAT).
+            local target_deg = math.deg(math.atan(uy, ux))
+            s.move_heading = s.move_heading and M.turn(s.move_heading, target_deg, M.COLLIDE_TURN_RATE * dt) or target_deg
+            local mh = math.rad(s.move_heading)
+            local fux, fuy = math.cos(mh), math.sin(mh)
+            local cross_for_side = fux * dy - fuy * dx
+            local nx, ny, blocked_this_frame, used_side, used_dx, used_dy = M.walk_collide(s.x, s.y, fux, fuy, step, sweep,
+                M.COLLIDE_SUBSTEP * dscale, M.COLLIDE_MAX_SUBSTEPS, p.x, p.y, clear, cross_for_side, s.slide_side, s.slide_dir_x,
+                s.slide_dir_y, s.collide_stats)
+            s.slide_side, s.slide_dir_x, s.slide_dir_y = used_side, used_dx, used_dy
+            mx, my = nx - s.x, ny - s.y
+            s.x, s.y = nx, ny
+            if blocked_this_frame then
+                s.v = s.v * 0.5 -- astra.cpp:611: slow down instead of staying slammed at full pace against a wall
+                s.blocked_frames = (s.blocked_frames or 0) + 1
+            end
+            local moved = math.sqrt(mx * mx + my * my)
+            if moved > 0.3 then s.yaw = M.turn(s.yaw, math.deg(math.atan(my, mx)), 540 * dt) end
+        end
     elseif not s.going then
         -- standing: turn slowly the way he looks - in first person, where his body turns with his view, toward HIM
         -- instead (the owner, Poppy Playtime, 2026-10-20: "when I turn my head she rotates in place, like I'm moving
@@ -604,6 +855,82 @@ local function trace_down(pawn)
         return type(z) == "number" and z or nil
     end
     return tracer
+end
+
+--- Her body against the world, horizontally: a capsule sweep between two XY points at her current feet height
+--- (cm), against WorldStatic/WorldDynamic (M.SWEEP_OBJECT_TYPES - silent on other Pawns and on Trigger volumes
+--- by the engine's own defaults, with no extra filter code). A game where the call fails disables collision-
+--- aware walking for the rest of the session (sweep_broken, permanent - same shape as trace_broken/trace_down)
+--- and says so once; M.follow is then given `nil` for its sweep argument, taking the exact unconditional-move
+--- code path, byte for byte - "today's behaviour", not a softer, still-different fallback. UNVERIFIED: whether
+--- UE4SS's Lua reflection marshals CapsuleTraceSingleForObjects at all (only LineTraceSingle is exercised
+--- anywhere in this codebase or its installed UE4SS examples) - this is exactly what the latch is for.
+local sweeper, sweeper_pawn, sweep_broken = nil, nil, false
+local function capsule_sweep(pawn)
+    if sweep_broken then return nil end
+    if sweeper_pawn == pawn and sweeper ~= nil then return sweeper end
+    sweeper_pawn = pawn
+    sweeper = function(x1, y1, x2, y2)
+        local hit = {}
+        local ok, did = pcall(function()
+            return kismet:CapsuleTraceSingleForObjects(pawn, { X = x1, Y = y1, Z = her.z + M.SWEEP_HALF_HEIGHT },
+                { X = x2, Y = y2, Z = her.z + M.SWEEP_HALF_HEIGHT }, M.SWEEP_RADIUS, M.SWEEP_HALF_HEIGHT, M.SWEEP_OBJECT_TYPES,
+                false, { pawn }, 0, hit, true, NO_COLOR, NO_COLOR, 0.0)
+        end)
+        if not ok then
+            sweep_broken = true
+            log("cannot sweep for collision (she walks through walls as before): %s", tostring(did))
+            return false
+        end
+        return did == true
+    end
+    return sweeper
+end
+
+--- A long-range steering hint from the game's navmesh (optional, best-effort - never required; see
+--- M.nav_goal). Re-asked at most every NAV_EVERY seconds (M.nav_due), never per frame: a synchronous path
+--- query is comparatively expensive and only needs to be roughly right. UNVERIFIED: whether
+--- NavigationSystemV1's CDO is reachable (StaticFindObject on its default object) and its
+--- FindPathToLocationSynchronously is callable through UE4SS the same general way KismetSystemLibrary/
+--- GameplayStatics already are in this codebase - and whether either game even carries a baked NavMesh at all
+--- (plausible for a scripted first-person game with no AI; a missing NavMesh answers invalid/empty every time,
+--- handled the same as the call itself being missing - never a hard dependency). A throw disables it for the
+--- session (nav_broken, permanent) and `nil` is given to M.follow from then on - unchanged from today.
+local navsys, nav_broken, nav_at, nav_points = nil, false, nil, nil
+local function nav_update(pawn, fx, fy, fz, tx, ty, tz, now)
+    if nav_broken or not M.nav_due(nav_at, now) then return nav_points end
+    nav_at = now
+    if navsys == nil then
+        local ok, found = pcall(function() return StaticFindObject("/Script/NavigationSystem.Default__NavigationSystemV1") end)
+        if not ok or found == nil then
+            nav_broken = true
+            log("no navmesh query available (her route is the straight line to her spot, as before): %s", tostring(found))
+            return nil
+        end
+        navsys = found
+    end
+    local ok, path = pcall(function()
+        return navsys:FindPathToLocationSynchronously(pawn, { X = fx, Y = fy, Z = fz }, { X = tx, Y = ty, Z = tz })
+    end)
+    if not ok then
+        nav_broken = true
+        log("cannot query a path (her route is the straight line to her spot, as before): %s", tostring(path))
+        return nil
+    end
+    if path == nil or path.PathPoints == nil then
+        nav_points = nil
+        return nil
+    end
+    local vok, is_valid = pcall(function() return path:IsValid() end)
+    local pok, is_partial = pcall(function() return path:IsPartial() end)
+    if not (vok and is_valid) or (pok and is_partial) then
+        nav_points = nil
+        return nil
+    end
+    local pts = {}
+    for _, v in ipairs(path.PathPoints) do pts[#pts + 1] = { v.X, v.Y } end
+    nav_points = pts
+    return nav_points
 end
 
 --- The game's sun. UE4SS's FindAllOf walks every object (a hitch), so it is searched for only when there is none (then
@@ -811,7 +1138,10 @@ local function tick()
         p = { x = loc.X, y = loc.Y, z = loc.Z, yaw = rot.Yaw, vx = vx, vy = vy, falling = false, from_camera = true }
         source, tracer_actor = "camera", pcm
     end
-    M.follow(her, p, dt, now, trace_down(tracer_actor))
+    -- her route to the player's vicinity (never the exact spot - a small approximation; M.nav_goal only uses
+    -- a path point once it is further than NAV_LOOKAHEAD away, so the BACK/SIDE offset is lost in the noise)
+    local nav = nav_update(tracer_actor, her.x, her.y, her.z, p.x, p.y, p.z, now)
+    M.follow(her, p, dt, now, trace_down(tracer_actor), capsule_sweep(tracer_actor), nav)
     -- her placement first, the camera last (the engine draws when the camera comes)
     if send("V 1\n" .. sun_line(now, tracer_actor) .. M.avatar_line(her) .. M.camera_line(frame, loc, rot, send_fov, send_horizontal, cache.aspect, cache.near)) then
         stats.sent = stats.sent + 1
@@ -821,11 +1151,12 @@ local function tick()
     if now - stats.logged_at >= 10 then
         stats.logged_at = now
         local t = her.trace or {}
-        log("frame %d  camera %.0f %.0f %.0f  pitch %.1f yaw %.1f roll %.1f  fov %.1f%s, drawn %s  %s %.0f %.0f %.0f%s  her %.0f %.0f %.0f  ground %s (%d traces, %d missed)  %.3f ms/frame",
+        log("frame %d  camera %.0f %.0f %.0f  pitch %.1f yaw %.1f roll %.1f  fov %.1f%s, drawn %s  %s %.0f %.0f %.0f%s  her %.0f %.0f %.0f  ground %s (%d traces, %d missed, %d objects)  collide %s (%d blocked, %d stuck)  %.3f ms/frame",
             frame, loc.X, loc.Y, loc.Z, rot.Pitch, rot.Yaw, rot.Roll, fov, cache.horizontal and "h" or "v",
             tan_v ~= nil and string.format("%.1fv", send_fov) or "not measured", source, p.x, p.y, p.z,
             p.falling and " (falling)" or "", her.x, her.y, her.z, t.z ~= nil and string.format("%.0f", t.z) or "the player's", t.traces or 0,
-            t.misses or 0, stats.frames > 0 and stats.cost * 1000 / stats.frames or 0)
+            t.misses or 0, t.objects or 0, sweep_broken and "off (threw)" or (capsule_sweep(tracer_actor) and "on" or "off"),
+            her.blocked_frames or 0, her.stuck_teleports or 0, stats.frames > 0 and stats.cost * 1000 / stats.frames or 0)
         stats.frames, stats.cost = 0, 0
     end
 end

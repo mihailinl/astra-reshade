@@ -521,6 +521,41 @@ function make_world(opts)
             hit.bBlockingHit = true
             return true
         end,
+        -- UE4SS's call for the *ForObjects family (object types replace the trace channel): (world context,
+        -- start, end, radius, half height, object types, complex, ignore, draw, out hit, ignore self, colours,
+        -- time). w.capsule_error: the call throws (a UE4SS build without this binding). w.boxes: axis-aligned
+        -- {x1, y1, x2, y2} obstacles in the XY plane (Z ignored - good enough to exercise the slide/stuck logic
+        -- without a real capsule-vs-mesh test). w.capsule_calls: how many times this was actually invoked.
+        CapsuleTraceSingleForObjects = function(_, from, to, radius, half_height, object_types, complex, ignore, draw, hit, ignore_self)
+            w.capsule_calls = (w.capsule_calls or 0) + 1
+            if w.capsule_error then error("CapsuleTraceSingleForObjects is not a function in this game") end
+            for _, b in ipairs(w.boxes or {}) do
+                local bx1, by1, bx2, by2 = b[1] - radius, b[2] - radius, b[3] + radius, b[4] + radius
+                -- segment (from.X,from.Y)-(to.X,to.Y) vs the inflated box, Liang-Barsky slab test
+                local dx, dy = to.X - from.X, to.Y - from.Y
+                local tmin, tmax = 0, 1
+                local function clip(p, q)
+                    if p == 0 then
+                        if q < 0 then return false end
+                    elseif p < 0 then
+                        local r = q / p
+                        if r > tmax then return false end
+                        if r > tmin then tmin = r end
+                    else
+                        local r = q / p
+                        if r < tmin then return false end
+                        if r < tmax then tmax = r end
+                    end
+                    return true
+                end
+                if clip(-dx, from.X - bx1) and clip(dx, bx2 - from.X) and clip(-dy, from.Y - by1) and clip(dy, by2 - from.Y) and tmin <= tmax then
+                    hit.ImpactPoint = { X = from.X + dx * tmin, Y = from.Y + dy * tmin, Z = from.Z }
+                    hit.bBlockingHit = true
+                    return true
+                end
+            end
+            return false
+        end,
     })
     local pawn = object({
         K2_GetActorLocation = function() return w.pawn_loc or { X = 1000, Y = 2000, Z = 188 } end,
@@ -578,6 +613,24 @@ function make_world(opts)
     end
     UnrealVersion = { GetMajor = function() return 5 end, GetMinor = function() return 6 end }
     EngineTickAvailable = true
+    -- a navmesh path stub, reached through StaticFindObject the same way GameplayStatics/KismetSystemLibrary's
+    -- CDOs already are. w.nav_error: the lookup itself throws (no NavigationSystem module). w.nav_points: the
+    -- path's PathPoints, an array of {X=,Y=,Z=} (nil/absent: IsValid() answers false, as a level with no baked
+    -- NavMesh would). w.nav_partial: IsPartial() answers true (a path that doesn't actually reach the goal).
+    -- w.nav_calls: how many times FindPathToLocationSynchronously was actually invoked.
+    local navsys = object({
+        FindPathToLocationSynchronously = function(_, context, from, to)
+            w.nav_calls = (w.nav_calls or 0) + 1
+            return { PathPoints = w.nav_points,
+                IsValid = function() return w.nav_points ~= nil end,
+                IsPartial = function() return w.nav_partial == true end }
+        end,
+    })
+    StaticFindObject = function(name)
+        if w.nav_error then error("StaticFindObject is not a function in this game") end
+        if name == "/Script/NavigationSystem.Default__NavigationSystemV1" then return navsys end
+        return nil
+    end
     -- two directional lights: a fill and the sun (40 degrees up, warm). w.lights_valid = false: they are gone (a level
     -- change). w.ue4: Unreal 4's properties - no bAtmosphereSunLight (reading it throws), bUsedAsAtmosphereSunLight on the
     -- sun, which is the dimmer light there (picked only if that flag is read)
@@ -1293,6 +1346,234 @@ do
     check(diff(after, to_him) < 2 and diff(after, before) < 2, string.format("first person: looking round, she faces him and does not spin (yaw %.0f -> %.0f, him at %.0f)", before, after, to_him))
     local _, after3 = stand_and_look(300)
     check(diff(after3, 180) < 2, string.format("third person: standing, she still turns the way he looks (yaw %.0f)", after3))
+end
+
+-------------------------------------------------------------------------------- collision-aware walking + the ground fix
+-- A pure-Lua stand-in for a capsule sweep against axis-aligned boxes in the XY plane (Z ignored - exercises
+-- M.walk_collide/M.follow's logic without a game; the integration tests further down use the REAL stub's
+-- CapsuleTraceSingleForObjects, which does the identical segment-vs-box test). boxes: {x1, y1, x2, y2}.
+local function box_sweep(boxes, radius)
+    radius = radius or 0
+    return function(x1, y1, x2, y2)
+        for _, b in ipairs(boxes) do
+            local bx1, by1, bx2, by2 = b[1] - radius, b[2] - radius, b[3] + radius, b[4] + radius
+            local dx, dy = x2 - x1, y2 - y1
+            local tmin, tmax = 0, 1
+            local function clip(p, q)
+                if p == 0 then
+                    if q < 0 then return false end
+                elseif p < 0 then
+                    local r = q / p
+                    if r > tmax then return false end
+                    if r > tmin then tmin = r end
+                else
+                    local r = q / p
+                    if r < tmin then return false end
+                    if r < tmax then tmax = r end
+                end
+                return true
+            end
+            if clip(-dx, x1 - bx1) and clip(dx, bx2 - x1) and clip(-dy, y1 - by1) and clip(dy, by2 - y1) and tmin <= tmax then return true end
+        end
+        return false
+    end
+end
+
+do
+    -- fail-safe (A): `sweep == nil` and `nav == nil` (the call is missing, or was withdrawn after it threw) is
+    -- BYTE FOR BYTE today's behaviour, not just "close enough" - every M.follow line the new parameters touch
+    -- is skipped entirely. Driven with a player who moves, turns, stops and starts over 400 random frames.
+    math.randomseed(20261020)
+    for trial = 1, 5 do
+        local her1, her2 = fresh_her(), fresh_her()
+        local p = { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+        local now, diverged = 0, false
+        for i = 1, 400 do
+            p.x, p.y = p.x + (math.random() - 0.5) * 20, p.y + (math.random() - 0.5) * 20
+            p.yaw = p.yaw + (math.random() - 0.5) * 10
+            p.vx, p.vy = (math.random() - 0.5) * 300, (math.random() - 0.5) * 300
+            now = now + 1 / 60
+            M.follow(her1, p, 1 / 60, now)
+            M.follow(her2, p, 1 / 60, now, nil, nil, nil)
+            if her1.x ~= her2.x or her1.y ~= her2.y or her1.z ~= her2.z or her1.yaw ~= her2.yaw then diverged = true end
+        end
+        check(not diverged, string.format("fail-safe: sweep/nav omitted vs explicitly nil are byte-identical (trial %d)", trial))
+    end
+end
+
+do
+    -- the ground fix (B): an isolated prop (a crate/table/railing) near the player, who stays on the real
+    -- floor - she must not end up standing ON it (the owner, 2026-10-20: "sometimes stays on them"). Modelled
+    -- as a solid with a top face and NO bottom face registered (world_with's "s[4] = nil": nothing reads back
+    -- as a ceiling above it, exactly the isolated-prop case M.OBJECT_BAND targets - see update_ground's doc).
+    local function world_with(solids)
+        return function(x, _, from, to)
+            local best
+            if from >= to then
+                if from >= 0 and to <= 0 then best = 0 end
+                for _, s in ipairs(solids) do
+                    if x >= s[1] and x <= s[2] and s[3] <= from and s[3] >= to and (best == nil or s[3] > best) then best = s[3] end
+                end
+            else
+                for _, s in ipairs(solids) do
+                    if s[4] and x >= s[1] and x <= s[2] and s[4] >= from and s[4] <= to and (best == nil or s[4] < best) then best = s[4] end
+                end
+            end
+            return best
+        end
+    end
+    local crate = world_with({ { 150, 250, 75, nil } }) -- a 75 cm crate spanning x in [150, 250]
+    local her, p, now, climbed = fresh_her(), { x = 0, y = 0, z = 0, yaw = 0, vx = 120, vy = 0, falling = false }, 0, false
+    M.follow(her, p, 1 / 60, now, crate)
+    for _ = 1, 600 do
+        p.x = p.x + 2
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, crate)
+        if her.x >= 150 and her.x <= 250 and her.z > 10 then climbed = true end
+    end
+    check(not climbed and near(her.z, 0, 0.5), string.format("the ground fix: she never stands on a crate near the player's own floor (z %.1f)", her.z))
+    -- the SAME fix on the teleport path (force = true): a teleport destination landing over the crate's
+    -- footprint is accepted completely unconditionally before this fix - it must land on the real floor instead.
+    local her2 = fresh_her()
+    local p2 = { x = 320, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false } -- her spot (p.x - BACK = 180) lands inside [150,250]
+    M.follow(her2, p2, 1 / 60, 0, crate)
+    check(near(her2.z, 0, 0.5) and (her2.trace.objects or 0) > 0,
+        string.format("the ground fix: a teleport landing over the crate lands on the floor, not on it (z %.1f, objects %s)",
+            her2.z, tostring(her2.trace.objects)))
+end
+
+do
+    -- collision (C): a wall with a gap, offset from her natural walking line - she must slide to find it. Ported
+    -- in spirit from the Death Stranding follower's try_step/slide (astra.cpp:580-607): never straight through
+    -- the wall, never stuck forever either (the gap IS reachable).
+    local sweep = box_sweep({ { -20, -1000, 20, 150 }, { -20, 250, 20, 1000 } }, M.SWEEP_RADIUS) -- gap in y: [150, 250]
+    local her, p, now, entered_wall = fresh_her(), { x = -400, y = 0, z = 0, yaw = 0, vx = 300, vy = 0, falling = false }, 0, false
+    M.follow(her, p, 1 / 60, now, nil, sweep) -- her natural offset (y ~= 90) sits inside the FIRST wall segment
+    for _ = 1, 900 do
+        p.x = math.min(p.x + 4, 400)
+        p.vx = (p.x < 400) and 300 or 0
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, nil, sweep)
+        if her.x > -20 and her.x < 20 and (her.y < 150 or her.y > 250) then entered_wall = true end
+    end
+    check(not entered_wall, "collision: a wall with a gap - she never enters the solid part of it")
+    check(her.stuck_teleports == nil, string.format("collision: a wall with a gap - she reaches it without needing the stuck escape (her %.0f %.0f)", her.x, her.y))
+end
+
+do
+    -- collision + stuck (D): a SEALED wall (no gap) while the player keeps walking away - the TELEPORT distance
+    -- threshold (2500 cm) would eventually rescue her anyway, but the stuck detector (astra.cpp:494-516, ported)
+    -- must do it much sooner, and she must never have entered the wall first.
+    local sweep = box_sweep({ { -20, -1000, 20, 1000 } }, M.SWEEP_RADIUS)
+    local her, p, now, entered_wall = fresh_her(), { x = -500, y = 0, z = 0, yaw = 0, vx = 300, vy = 0, falling = false }, 0, false
+    M.follow(her, p, 1 / 60, now, nil, sweep)
+    local rescued_frame
+    for i = 1, 600 do
+        p.x = p.x + 5
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, nil, sweep)
+        if her.x > -20 and her.x < 20 then entered_wall = true end
+        if (her.stuck_teleports or 0) > 0 and rescued_frame == nil then rescued_frame = i end
+    end
+    check(not entered_wall, "collision + stuck: a sealed wall, player walking away - she never enters it")
+    check(rescued_frame ~= nil and rescued_frame / 60 < M.TELEPORT / 300,
+        string.format("collision + stuck: rescued well before the raw TELEPORT distance would have caught it (%s frames)", tostring(rescued_frame)))
+end
+
+do
+    -- collision + stuck (E): a SEALED wall with the PLAYER STANDING STILL the whole time - raw distance
+    -- (TELEPORT) never grows at all here, so only the quieter aim-giveup-escalation path (M.STUCK_AIM_DROPS)
+    -- can rescue her; she must still never enter the wall, and must eventually be freed, not loop forever.
+    local sweep = box_sweep({ { -20, -1000, 20, 1000 } }, M.SWEEP_RADIUS)
+    local her, p, now, entered_wall = fresh_her(), { x = -500, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }, 0, false
+    M.follow(her, p, 1 / 60, now, nil, sweep)
+    for i = 1, 160 do -- he walks to the far side of the wall (x = 300, well past the [-20, 20] band), then stops
+        p.x = math.min(p.x + 5, 300)
+        p.vx = (p.x < 300) and 300 or 0
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, nil, sweep)
+    end
+    local rescued_frame
+    for i = 1, 900 do -- up to 15 s
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, nil, sweep)
+        if her.x > -20 and her.x < 20 then entered_wall = true end
+        if (her.stuck_teleports or 0) > 0 and rescued_frame == nil then rescued_frame = i end
+    end
+    check(not entered_wall, "collision + stuck: a sealed wall, player standing still - she never enters it")
+    check(rescued_frame ~= nil and rescued_frame < 900, string.format("collision + stuck: a stationary player still frees her, not an infinite loop (%s frames)", tostring(rescued_frame)))
+end
+
+do
+    -- collision (F): never pushed into the player while sliding - a wall channels her toward him.
+    local sweep = box_sweep({ { -20, -1000, 20, 1000 }, { 20, -1000, 300, -50 } }, M.SWEEP_RADIUS)
+    local her, p, now, closest = fresh_her(), { x = -400, y = 0, z = 0, yaw = 0, vx = 300, vy = 0, falling = false }, 0, 1e9
+    M.follow(her, p, 1 / 60, now, nil, sweep)
+    for _ = 1, 600 do
+        p.x = math.min(p.x + 4, 100)
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, nil, sweep)
+        closest = math.min(closest, math.sqrt((her.x - p.x) ^ 2 + (her.y - p.y) ^ 2))
+    end
+    check(closest > M.NEAR_PLAYER, string.format("collision: sliding along a channelling wall never pushes her into the player (closest %.0f cm)", closest))
+end
+
+do
+    -- integration (G): the REAL stub's CapsuleTraceSingleForObjects against w.boxes, through the FULL game
+    -- glue (tick()'s own kismet call shape, not a hand-rolled sweep) - a wall box sits across her usual
+    -- walking offset the whole way; run_frames drives the whole tick(), not just M.follow.
+    local _, world = run_frames({}, 480, function(w)
+        w.ground = 0
+        w.boxes = { { -1000, 50, 1000, 300 } } -- walls off her usual offset band (y in [50, 300]) the whole corridor
+        w.pawn_loc = { X = -400, Y = 0, Z = 88 }
+        w.on_frame = function(i)
+            w.pawn_loc.X = math.min(w.pawn_loc.X + 3, 400)
+            w.pawn_vel = { X = (w.pawn_loc.X < 400) and 180 or 0, Y = 0, Z = 0 }
+        end
+    end)
+    check((world.capsule_calls or 0) > 0, string.format("integration: CapsuleTraceSingleForObjects is actually called through the real glue (%s calls)", tostring(world.capsule_calls)))
+end
+
+do
+    -- integration (H), fail-safe: the stub's capsule sweep THROWS (a UE4SS build without this binding) - she
+    -- must end up exactly where the SAME run with no wall at all would put her (today's behaviour resumes).
+    local f1, world1 = run_frames({}, 200, function(w)
+        w.ground = 0
+        w.capsule_error = true
+        w.boxes = { { -1000, 50, 1000, 300 } }
+        w.pawn_loc = { X = -400, Y = 0, Z = 88 }
+        w.on_frame = function(i) w.pawn_loc.X = w.pawn_loc.X + 3 w.pawn_vel = { X = 180, Y = 0, Z = 0 } end
+    end)
+    local f2, world2 = run_frames({}, 200, function(w)
+        w.ground = 0 -- no boxes at all: today, unmodified
+        w.pawn_loc = { X = -400, Y = 0, Z = 88 }
+        w.on_frame = function(i) w.pawn_loc.X = w.pawn_loc.X + 3 w.pawn_vel = { X = 180, Y = 0, Z = 0 } end
+    end)
+    check((world1.capsule_calls or 0) > 0, "integration fail-safe: the throwing call is actually attempted (not skipped)")
+    local said = false
+    -- (logs are not captured here without `hers`/a logs sink in this call form; the throw's own effect - matching
+    -- the no-wall run exactly - is the behavioural proof that today's behaviour resumed, see check below)
+    check(f1[1] == f2[1] and f1[2] == f2[2], "integration fail-safe: a throwing capsule sweep ends up exactly where no sweep at all would (camera line matches)")
+end
+
+do
+    -- integration (I), the nav stub: FindPathToLocationSynchronously is asked no more than once per NAV_EVERY
+    -- (0.5 s) - never per frame - and a missing/invalid path changes nothing (today's straight-line goal).
+    local _, world = run_frames({}, 120, function(w) -- 2 s at 60 fps: at most 4-5 queries, never ~120
+        w.ground = 0
+        w.nav_points = { { X = 100, Y = 0, Z = 0 }, { X = 200, Y = 0, Z = 0 } }
+        w.pawn_loc = { X = -400, Y = 0, Z = 88 }
+        w.on_frame = function(i) w.pawn_loc.X = w.pawn_loc.X + 3 w.pawn_vel = { X = 180, Y = 0, Z = 0 } end
+    end)
+    check((world.nav_calls or 0) >= 1 and (world.nav_calls or 0) <= 6,
+        string.format("integration: the navmesh query is rate-limited to about every %.1f s, never per frame (%s calls in 2 s)", M.NAV_EVERY, tostring(world.nav_calls)))
+    local _, world2 = run_frames({}, 60, function(w)
+        w.ground = 0
+        w.nav_error = true
+        w.pawn_loc = { X = -400, Y = 0, Z = 88 }
+        w.on_frame = function(i) w.pawn_loc.X = w.pawn_loc.X + 3 w.pawn_vel = { X = 180, Y = 0, Z = 0 } end
+    end)
+    check((world2.nav_calls or 0) == 0, "integration: a throwing navmesh lookup is asked once, then withdrawn for the session")
 end
 
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
