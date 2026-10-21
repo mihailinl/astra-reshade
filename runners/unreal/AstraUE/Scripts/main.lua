@@ -147,7 +147,13 @@ M.STUCK_AIM_DROPS = 3            -- ...but dropping an aim changes nothing about
                                  -- one is set again identically next frame and would retry forever with no
                                  -- escape at all; this many consecutive giveups with no arrival between them
                                  -- escalates to the real teleport above (a genuinely sealed-off spot, the
-                                 -- player himself never moving) - about STUCK_GIVEUP * (this + 1) seconds
+                                 -- player himself never moving) - about STUCK_GIVEUP * (this + 1) seconds...
+M.AIM_DROP_DIST, M.AIM_DROP_GAP = 100.0, 5.0 -- ...PROVIDED the drops are actually related (review finding): a
+                                 -- new aim set more than AIM_DROP_DIST from the LAST dropped one, or more than
+                                 -- AIM_DROP_GAP seconds after it, resets s.aim_drops to 0 first - two giveups
+                                 -- at opposite sides of him minutes apart are unrelated stand-mode failures,
+                                 -- never "a sealed-off spot" - only a RUN of drops at roughly the SAME aim,
+                                 -- close together in time, escalates
 M.NAV_EVERY = 0.5               -- seconds between navmesh path queries (optional, best-effort - never per frame;
                                  -- a synchronous query is comparatively expensive and only needs to be roughly
                                  -- right). A level with no baked NavMesh (plausible for a scripted first-person
@@ -611,6 +617,7 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
         s.z = s.ground or p.z
         s.v, s.vx, s.vy, s.speed, s.placed, s.teleports, s.going = 0, 0, 0, 0, true, (s.teleports or 0) + 1, false
         s.aim_x, s.aim_y, s.aim_time, s.aim_best, s.aim_drops = nil, nil, 0, 1e9, 0
+        s.aim_drop_x, s.aim_drop_y, s.aim_drop_time = nil, nil, nil
         s.stuck_time, s.stuck_best, s.slide_side, s.slide_dir_x, s.slide_dir_y = 0, 1e9, nil, nil, nil
         s.collide_blocked = false
         if stuck then s.stuck_teleports = (s.stuck_teleports or 0) + 1 end
@@ -639,6 +646,15 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
             local ux, uy = -fx, -fy -- right on top of him: behind him
             if to_player > 1e-3 then ux, uy = (s.x - p.x) / to_player, (s.y - p.y) / to_player end
             s.aim_x, s.aim_y = p.x + ux * r, p.y + uy * r
+            -- review finding: a NEW aim far from (M.AIM_DROP_DIST) or long after (M.AIM_DROP_GAP) the LAST
+            -- dropped one is an unrelated stand-mode failure - never let it inherit an escalating count toward
+            -- a teleport that belongs to a different spot entirely.
+            if s.aim_drop_x ~= nil then
+                local ddx, ddy = s.aim_x - s.aim_drop_x, s.aim_y - s.aim_drop_y
+                if ddx * ddx + ddy * ddy > M.AIM_DROP_DIST * M.AIM_DROP_DIST or now - s.aim_drop_time > M.AIM_DROP_GAP then
+                    s.aim_drops = 0
+                end
+            end
         end
         if s.aim_x ~= nil then goal_x, goal_y = s.aim_x, s.aim_y else goal_x, goal_y = s.x, s.y end
     else
@@ -657,6 +673,7 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
         else
             s.aim_time = (s.aim_time or 0) + dt
             if s.aim_time > M.STUCK_GIVEUP then
+                s.aim_drop_x, s.aim_drop_y, s.aim_drop_time = s.aim_x, s.aim_y, now
                 s.aim_x, s.aim_y, s.aim_time, s.aim_best = nil, nil, 0, 1e9
                 s.aim_drops = (s.aim_drops or 0) + 1
                 goal_x, goal_y, dx, dy, d = s.x, s.y, 0, 0, 0

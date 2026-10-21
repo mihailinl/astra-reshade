@@ -1755,5 +1755,31 @@ do
     check(not inside, string.format("review fix: a 120 cm corridor, both swept side spots fail - she never lands inside a wall box (y %.1f)", her.y))
 end
 
+do
+    -- review fix (P): s.aim_drops must not accumulate across UNRELATED stand-mode aim failures - a new aim
+    -- more than M.AIM_DROP_DIST from the last dropped one, or more than M.AIM_DROP_GAP seconds after it,
+    -- resets the count first. Here the player never moves (so every dropped aim is at the SAME spot - only
+    -- the 20 s real-time gap between episodes makes each one "unrelated"); 5 such drops, 20 s apart, must
+    -- never escalate to a teleport (more than enough to cross M.STUCK_AIM_DROPS if they wrongly accumulated).
+    local sweep = function() return true, 0 end -- always blocked: her stand-mode aim can never be reached
+    local her, p, now = fresh_her(), { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }, 0
+    M.follow(her, p, 1 / 60, now, nil, sweep) -- placed (last resort: his own feet, since every sweep call blocks)
+    local drops_seen = 0
+    for _ = 1, 5 do
+        for _ = 1, 200 do
+            now = now + 1 / 60
+            local before = her.aim_drops or 0
+            M.follow(her, p, 1 / 60, now, nil, sweep)
+            if (her.aim_drops or 0) > before then
+                drops_seen = drops_seen + 1
+                break
+            end
+        end
+        now = now + 20 -- a 20 s idle gap before the next, unrelated episode
+    end
+    check(drops_seen == 5, string.format("review fix: five unrelated drops actually happened (saw %d)", drops_seen))
+    check((her.stuck_teleports or 0) == 0, string.format("review fix: unrelated drops, 20 s apart, never escalate to a teleport (stuck_teleports %s)", tostring(her.stuck_teleports)))
+end
+
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
 os.exit(failed == 0 and 0 or 1)
