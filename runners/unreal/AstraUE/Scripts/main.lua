@@ -78,7 +78,10 @@ M.ACCEL, M.BRAKE = 700.0, 1000.0 -- her catch-up ramp (cm/s^2, linear - not an e
 M.TRACE_MIN, M.TRACE_MAX = 0.05, 0.25 -- never more often than this; at least this often
 M.TRACE_MOVE = 15.0             -- sooner than TRACE_MAX once she moved this far
 M.TRACE_UP, M.TRACE_DOWN = 100.0, 300.0 -- from this far above the higher of her and the player's feet, to this far below the lower
-M.STEP_UP = 50.0                -- ground higher than this above her feet is hers only with no ceiling between (a ledge, not a balcony)
+M.STEP_UP = 50.0                -- ground higher than this above her feet is hers only with no ceiling between (a ledge,
+                                 -- not a balcony) - and (fix #2, M.SWEEP_RADIUS below) the swept capsule's own step
+                                 -- allowance: a stair/kerb no taller than this never blocks her sweep either, the
+                                 -- same number Unreal's own CharacterMovement sweeps a MaxStepHeight allowance with
 M.OBJECT_BAND = M.STEP_UP       -- ...and even then, only if the PLAYER's own feet are within this of it too - the
                                  -- discriminator between a ledge/balcony he actually climbed (his feet are up
                                  -- there) and an isolated prop near him he is not standing on or near the height
@@ -98,9 +101,14 @@ M.TRACE_CHANNEL = 0             -- ETraceTypeQuery: 0 = TraceTypeQuery1, the Vis
 -- adapted to AstraUE's one-call-per-engine-frame model (no DS-style fixed substep loop is needed for tunnelling
 -- - a SWEEP, not a point sample, cannot miss a thin wall at any speed - COLLIDE_SUBSTEP exists only to bound
 -- how far she commits before re-aiming near a corner, i.e. cost, not correctness).
-M.SWEEP_RADIUS, M.SWEEP_HALF_HEIGHT = 34.0, 85.0 -- her capsule (cm): close to UE's default ThirdPersonCharacter
-                                 -- (radius 34, half-height 88) so a sweep against the SAME collision the
-                                 -- player's own capsule would hit reads as "her body", not a point
+M.SWEEP_RADIUS = 34.0           -- her capsule radius (cm): close to UE's default ThirdPersonCharacter (34) so a
+                                 -- sweep against the SAME collision the player's own capsule would hit reads as
+                                 -- "her body", not a point
+M.SWEEP_BODY_HEIGHT = 150.0     -- her body height (cm) for the sweep's own half-height (fix #2, below), scaled by
+                                 -- dscale like every other distance in M.follow - NOT the fixed ThirdPersonCharacter
+                                 -- half-height (her VRM body isn't that pawn's capsule): max(M.SWEEP_RADIUS,
+                                 -- (M.SWEEP_BODY_HEIGHT * dscale - M.STEP_UP) / 2), so the capsule's bottom can sit
+                                 -- M.STEP_UP above her feet without shrinking to nothing on a short/tall pawn
 -- Her sweep reads the SAME trace channel as the ground ray (M.TRACE_CHANNEL, Visibility) - never an
 -- object-type query (EObjectTypeQuery, a TArray<TEnumAsByte<EObjectTypeQuery>> UE4SS marshals as a Lua table):
 -- that TArray can arrive silently empty under some UE4SS versions (RE-UE4SS#378, a dropped sweep that never
@@ -874,20 +882,30 @@ local function trace_capsule(pawn, x1, y1, x2, y2, z, radius, half_height)
 end
 
 --- Her body against the world, horizontally: a capsule sweep between two XY points at her current feet
---- height (cm), through trace_capsule above. A game where the call fails disables collision-aware walking
---- for the rest of the session (sweep_broken, permanent - same shape as trace_broken/trace_down) and says so
---- once; M.follow is then given `nil` for its sweep argument, taking the exact unconditional-move code
---- path, byte for byte - "today's behaviour", not a softer, still-different fallback. UNVERIFIED: whether
---- UE4SS's Lua reflection marshals CapsuleTraceSingle at all (only LineTraceSingle is exercised anywhere in
---- this codebase or its installed UE4SS examples) - this is exactly what the latch is for.
-local sweeper, sweeper_pawn, sweep_broken = nil, nil, false
-local function capsule_sweep(pawn)
+--- height (cm), through trace_capsule above. `half_height` (optional, cm - the followed pawn's own capsule
+--- half-height, same as M.follow's own scale argument): fix #2's step allowance. Her swept capsule's BOTTOM
+--- sits M.STEP_UP above her feet, not at them - centre Z = her feet + M.STEP_UP + sweep_half, sweep_half =
+--- max(M.SWEEP_RADIUS, (M.SWEEP_BODY_HEIGHT * dscale - M.STEP_UP) / 2) - so a stair/kerb no taller than
+--- M.STEP_UP sits entirely below the swept capsule and never blocks (Unreal's own CharacterMovement sweeps
+--- with exactly this kind of MaxStepHeight allowance); a wall taller than that still fills the band and
+--- blocks as before. The ground ray (M.update_ground, with its own, separate M.STEP_UP/M.OBJECT_BAND rule)
+--- still decides her actual Z - this only keeps a step from reading as a wall to the HORIZONTAL sweep.
+--- A game where the call fails disables collision-aware walking for the rest of the session (sweep_broken,
+--- permanent - same shape as trace_broken/trace_down) and says so once; M.follow is then given `nil` for its
+--- sweep argument, taking the exact unconditional-move code path, byte for byte - "today's behaviour", not a
+--- softer, still-different fallback. UNVERIFIED: whether UE4SS's Lua reflection marshals CapsuleTraceSingle at
+--- all (only LineTraceSingle is exercised anywhere in this codebase or its installed UE4SS examples) - this is
+--- exactly what the latch is for.
+local sweeper, sweeper_pawn, sweeper_half, sweep_broken = nil, nil, nil, false
+local function capsule_sweep(pawn, half_height)
     if sweep_broken then return nil end
-    if sweeper_pawn == pawn and sweeper ~= nil then return sweeper end
-    sweeper_pawn = pawn
+    local dscale = (half_height and half_height > 0) and (half_height / M.REF_HALF_HEIGHT) or 1.0
+    local sweep_half = math.max(M.SWEEP_RADIUS, (M.SWEEP_BODY_HEIGHT * dscale - M.STEP_UP) / 2)
+    local center = M.STEP_UP + sweep_half
+    if sweeper_pawn == pawn and sweeper_half == sweep_half and sweeper ~= nil then return sweeper end
+    sweeper_pawn, sweeper_half = pawn, sweep_half
     sweeper = function(x1, y1, x2, y2)
-        local ok, blocked, time, err = trace_capsule(pawn, x1, y1, x2, y2, her.z + M.SWEEP_HALF_HEIGHT, M.SWEEP_RADIUS,
-            M.SWEEP_HALF_HEIGHT)
+        local ok, blocked, time, err = trace_capsule(pawn, x1, y1, x2, y2, her.z + center, M.SWEEP_RADIUS, sweep_half)
         if not ok then
             sweep_broken = true
             log("cannot sweep for collision (she walks through walls as before): %s", tostring(err))
@@ -1152,7 +1170,7 @@ local function tick()
     -- her route to the player's vicinity (never the exact spot - a small approximation; M.nav_goal only uses
     -- a path point once it is further than NAV_LOOKAHEAD away, so the BACK/SIDE offset is lost in the noise)
     local nav = nav_update(tracer_actor, her.x, her.y, her.z, p.x, p.y, p.z, now)
-    M.follow(her, p, dt, now, trace_down(tracer_actor), capsule_sweep(tracer_actor), nav)
+    M.follow(her, p, dt, now, trace_down(tracer_actor), capsule_sweep(tracer_actor, p.half_height), nav)
     -- her placement first, the camera last (the engine draws when the camera comes)
     if send("V 1\n" .. sun_line(now, tracer_actor) .. M.avatar_line(her) .. M.camera_line(frame, loc, rot, send_fov, send_horizontal, cache.aspect, cache.near)) then
         stats.sent = stats.sent + 1
@@ -1166,7 +1184,7 @@ local function tick()
             frame, loc.X, loc.Y, loc.Z, rot.Pitch, rot.Yaw, rot.Roll, fov, cache.horizontal and "h" or "v",
             tan_v ~= nil and string.format("%.1fv", send_fov) or "not measured", source, p.x, p.y, p.z,
             p.falling and " (falling)" or "", her.x, her.y, her.z, t.z ~= nil and string.format("%.0f", t.z) or "the player's", t.traces or 0,
-            t.misses or 0, t.objects or 0, sweep_broken and "off (threw)" or (capsule_sweep(tracer_actor) and "on" or "off"),
+            t.misses or 0, t.objects or 0, sweep_broken and "off (threw)" or (capsule_sweep(tracer_actor, p.half_height) and "on" or "off"),
             her.blocked_frames or 0, her.stuck_teleports or 0, stats.frames > 0 and stats.cost * 1000 / stats.frames or 0)
         stats.frames, stats.cost = 0, 0
     end

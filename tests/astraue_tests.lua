@@ -1612,5 +1612,45 @@ do
     check(a.ignore_self == true, "fix #1: bIgnoreSelf is true")
 end
 
+do
+    -- fix #2 (K): step allowance - a riser no taller than M.STEP_UP (20 cm, three of them: "stairs") never
+    -- blocks her sweep; a 1 m box in the same spot still does. w.boxes' 5th field is the box's world-Z top
+    -- (the stub's Z-aware CapsuleTraceSingle, see make_world's own comment); her feet stay flat at 0 throughout
+    -- (w.ground = 0) - this is purely the horizontal sweep's own tolerance, independent of the ground ray.
+    local function entered(hers, bx1, by1, bx2, by2)
+        for _, h in ipairs(hers) do
+            local x, y = h[1] * 100, h[2] * 100 -- glTF metres -> UE cm
+            if x >= bx1 and x <= bx2 and y >= by1 and y <= by2 then return true end
+        end
+        return false
+    end
+    local steps = { { 0, -250, 40, -30, 20 }, { 200, -250, 240, -30, 20 }, { 400, -250, 440, -30, 20 } }
+    local hers = {}
+    local _, world = run_frames({}, 400, function(w)
+        w.ground = 0
+        w.boxes = steps
+        w.pawn_loc = { X = -400, Y = 0, Z = 88 }
+        w.on_frame = function(i)
+            w.pawn_loc.X = math.min(w.pawn_loc.X + 4, 900)
+            w.pawn_vel = { X = (w.pawn_loc.X < 900) and 240 or 0, Y = 0, Z = 0 }
+        end
+    end, hers)
+    check((world.capsule_calls or 0) > 0, "fix #2: the capsule sweep is actually exercised")
+    for i, b in ipairs(steps) do
+        check(entered(hers, b[1], b[2], b[3], b[4]), string.format("fix #2: a %d cm riser (step %d) never blocks her sweep", b[5], i))
+    end
+    local hers2 = {}
+    run_frames({}, 400, function(w)
+        w.ground = 0
+        w.boxes = { { 0, -250, 40, -30, 100 } } -- same footprint, 1 m tall
+        w.pawn_loc = { X = -400, Y = 0, Z = 88 }
+        w.on_frame = function(i)
+            w.pawn_loc.X = math.min(w.pawn_loc.X + 4, 900)
+            w.pawn_vel = { X = (w.pawn_loc.X < 900) and 240 or 0, Y = 0, Z = 0 }
+        end
+    end, hers2)
+    check(not entered(hers2, 0, -250, 40, -30), "fix #2: the same footprint, 1 m tall, still blocks her sweep")
+end
+
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
 os.exit(failed == 0 and 0 or 1)
