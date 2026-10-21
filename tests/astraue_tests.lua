@@ -521,39 +521,55 @@ function make_world(opts)
             hit.bBlockingHit = true
             return true
         end,
-        -- UE4SS's call for the *ForObjects family (object types replace the trace channel): (world context,
-        -- start, end, radius, half height, object types, complex, ignore, draw, out hit, ignore self, colours,
-        -- time). w.capsule_error: the call throws (a UE4SS build without this binding). w.boxes: axis-aligned
-        -- {x1, y1, x2, y2} obstacles in the XY plane (Z ignored - good enough to exercise the slide/stuck logic
-        -- without a real capsule-vs-mesh test). w.capsule_calls: how many times this was actually invoked.
-        CapsuleTraceSingleForObjects = function(_, from, to, radius, half_height, object_types, complex, ignore, draw, hit, ignore_self)
+        -- UE4SS's call for the capsule-on-a-channel family (fix #1 - NEVER *ForObjects: see main.lua's own
+        -- comment on M.SWEEP_RADIUS): (world context, start, end, radius, half height, trace channel, complex,
+        -- ignore, draw, out hit, ignore self, colours, time). w.capsule_error: the call throws (a UE4SS build
+        -- without this binding). w.boxes: axis-aligned {x1, y1, x2, y2[, top[, bottom]]} obstacles in the XY
+        -- plane - top/bottom (world Z, cm) optional: absent, the box blocks at any height (today's wall); given,
+        -- it blocks only a capsule whose swept Z range [z-half_height, z+half_height] overlaps [bottom or 0,
+        -- top] - good enough to exercise the slide/stuck logic AND fix #2's step allowance without a real
+        -- capsule-vs-mesh test. w.capsule_calls: how many times this was actually invoked; w.capsule_args: the
+        -- last call's context/channel/ignore/ignore_self, for the contract checks below.
+        CapsuleTraceSingle = function(_, context, from, to, radius, half_height, channel, complex, ignore, draw, hit, ignore_self)
             w.capsule_calls = (w.capsule_calls or 0) + 1
-            if w.capsule_error then error("CapsuleTraceSingleForObjects is not a function in this game") end
+            if w.capsule_error then error("CapsuleTraceSingle is not a function in this game") end
+            w.capsule_args = { context = context, channel = channel, ignore = ignore, ignore_self = ignore_self }
+            local lo, hi = from.Z - half_height, from.Z + half_height
+            local best_t
             for _, b in ipairs(w.boxes or {}) do
-                local bx1, by1, bx2, by2 = b[1] - radius, b[2] - radius, b[3] + radius, b[4] + radius
-                -- segment (from.X,from.Y)-(to.X,to.Y) vs the inflated box, Liang-Barsky slab test
-                local dx, dy = to.X - from.X, to.Y - from.Y
-                local tmin, tmax = 0, 1
-                local function clip(p, q)
-                    if p == 0 then
-                        if q < 0 then return false end
-                    elseif p < 0 then
-                        local r = q / p
-                        if r > tmax then return false end
-                        if r > tmin then tmin = r end
-                    else
-                        local r = q / p
-                        if r < tmin then return false end
-                        if r < tmax then tmax = r end
+                if b[5] == nil or (lo <= b[5] and hi >= (b[6] or 0)) then
+                    local bx1, by1, bx2, by2 = b[1] - radius, b[2] - radius, b[3] + radius, b[4] + radius
+                    -- segment (from.X,from.Y)-(to.X,to.Y) vs the inflated box, Liang-Barsky slab test
+                    local dx, dy = to.X - from.X, to.Y - from.Y
+                    local tmin, tmax = 0, 1
+                    local function clip(p, q)
+                        if p == 0 then
+                            if q < 0 then return false end
+                        elseif p < 0 then
+                            local r = q / p
+                            if r > tmax then return false end
+                            if r > tmin then tmin = r end
+                        else
+                            local r = q / p
+                            if r < tmin then return false end
+                            if r < tmax then tmax = r end
+                        end
+                        return true
                     end
-                    return true
-                end
-                if clip(-dx, from.X - bx1) and clip(dx, bx2 - from.X) and clip(-dy, from.Y - by1) and clip(dy, by2 - from.Y) and tmin <= tmax then
-                    hit.ImpactPoint = { X = from.X + dx * tmin, Y = from.Y + dy * tmin, Z = from.Z }
-                    hit.bBlockingHit = true
-                    return true
+                    if clip(-dx, from.X - bx1) and clip(dx, bx2 - from.X) and clip(-dy, from.Y - by1) and clip(dy, by2 - from.Y) and tmin <= tmax then
+                        if best_t == nil or tmin < best_t then best_t = tmin end
+                    end
                 end
             end
+            if best_t ~= nil then
+                local dx, dy = to.X - from.X, to.Y - from.Y
+                hit.ImpactPoint = { X = from.X + dx * best_t, Y = from.Y + dy * best_t, Z = from.Z }
+                hit.bBlockingHit = true
+                hit.Time = best_t
+                hit.bStartPenetrating = best_t <= 0
+                return true
+            end
+            hit.Time = 1
             return false
         end,
     })
@@ -1351,7 +1367,7 @@ end
 -------------------------------------------------------------------------------- collision-aware walking + the ground fix
 -- A pure-Lua stand-in for a capsule sweep against axis-aligned boxes in the XY plane (Z ignored - exercises
 -- M.walk_collide/M.follow's logic without a game; the integration tests further down use the REAL stub's
--- CapsuleTraceSingleForObjects, which does the identical segment-vs-box test). boxes: {x1, y1, x2, y2}.
+-- CapsuleTraceSingle, which does the identical segment-vs-box test). boxes: {x1, y1, x2, y2}.
 local function box_sweep(boxes, radius)
     radius = radius or 0
     return function(x1, y1, x2, y2)
@@ -1519,7 +1535,7 @@ do
 end
 
 do
-    -- integration (G): the REAL stub's CapsuleTraceSingleForObjects against w.boxes, through the FULL game
+    -- integration (G): the REAL stub's CapsuleTraceSingle against w.boxes, through the FULL game
     -- glue (tick()'s own kismet call shape, not a hand-rolled sweep) - a wall box sits across her usual
     -- walking offset the whole way; run_frames drives the whole tick(), not just M.follow.
     local _, world = run_frames({}, 480, function(w)
@@ -1531,7 +1547,7 @@ do
             w.pawn_vel = { X = (w.pawn_loc.X < 400) and 180 or 0, Y = 0, Z = 0 }
         end
     end)
-    check((world.capsule_calls or 0) > 0, string.format("integration: CapsuleTraceSingleForObjects is actually called through the real glue (%s calls)", tostring(world.capsule_calls)))
+    check((world.capsule_calls or 0) > 0, string.format("integration: CapsuleTraceSingle is actually called through the real glue (%s calls)", tostring(world.capsule_calls)))
 end
 
 do
@@ -1574,6 +1590,26 @@ do
         w.on_frame = function(i) w.pawn_loc.X = w.pawn_loc.X + 3 w.pawn_vel = { X = 180, Y = 0, Z = 0 } end
     end)
     check((world2.nav_calls or 0) == 0, "integration: a throwing navmesh lookup is asked once, then withdrawn for the session")
+end
+
+do
+    -- fix #1 (J): the sweep is a TRACE CHANNEL query (CapsuleTraceSingle, M.TRACE_CHANNEL), never an object-type
+    -- one (CapsuleTraceSingleForObjects) - RE-UE4SS#378's silently-empty ObjectTypes array, and an object-type
+    -- query hitting Trigger volumes a channel trace does not (both named in main.lua's own comment). The player
+    -- himself is the WorldContextObject with bIgnoreSelf = true, and ActorsToIgnore is empty - never a reliance
+    -- on naming him there instead.
+    local _, world = run_frames({}, 60, function(w)
+        w.ground = 0
+        w.boxes = { { -1000, 50, 1000, 300 } }
+        w.pawn_loc = { X = -400, Y = 0, Z = 88 }
+        w.on_frame = function(i) w.pawn_loc.X = w.pawn_loc.X + 3 w.pawn_vel = { X = 180, Y = 0, Z = 0 } end
+    end)
+    check((world.capsule_calls or 0) > 0, "fix #1: the capsule sweep is actually exercised")
+    local a = world.capsule_args or {}
+    check(a.context ~= nil and a.context.IsValid ~= nil, "fix #1: the sweep's WorldContextObject is the followed actor (the pawn/view target), not nil")
+    check(a.channel == M.TRACE_CHANNEL, string.format("fix #1: the sweep is a TRACE CHANNEL query, M.TRACE_CHANNEL (got %s)", tostring(a.channel)))
+    check(type(a.ignore) == "table" and #a.ignore == 0, string.format("fix #1: ActorsToIgnore is empty - bIgnoreSelf keeps the player out, not this array (got %s entries)", tostring(a.ignore and #a.ignore)))
+    check(a.ignore_self == true, "fix #1: bIgnoreSelf is true")
 end
 
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))

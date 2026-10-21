@@ -101,15 +101,13 @@ M.TRACE_CHANNEL = 0             -- ETraceTypeQuery: 0 = TraceTypeQuery1, the Vis
 M.SWEEP_RADIUS, M.SWEEP_HALF_HEIGHT = 34.0, 85.0 -- her capsule (cm): close to UE's default ThirdPersonCharacter
                                  -- (radius 34, half-height 88) so a sweep against the SAME collision the
                                  -- player's own capsule would hit reads as "her body", not a point
-M.SWEEP_OBJECT_TYPES = { 0, 1 } -- EObjectTypeQuery: 0 = ObjectTypeQuery1 (WorldStatic), 1 = ObjectTypeQuery2
-                                 -- (WorldDynamic) - by analogy with M.TRACE_CHANNEL's CONFIRMED 0-based
-                                 -- ETraceTypeQuery encoding (UNVERIFIED for object types specifically). Chosen
-                                 -- over the Visibility channel the ground/sun traces use: "what a character's
-                                 -- capsule collides with" is the general proxy for a wall/prop a game actually
-                                 -- blocks movement with, and is silent on other Pawns and on Trigger volumes
-                                 -- (overlap-only by default in virtually every UE project) with NO extra filter
-                                 -- code needed - never hers to push through, never hers to stop on an invisible
-                                 -- trigger.
+-- Her sweep reads the SAME trace channel as the ground ray (M.TRACE_CHANNEL, Visibility) - never an
+-- object-type query (EObjectTypeQuery, a TArray<TEnumAsByte<EObjectTypeQuery>> UE4SS marshals as a Lua table):
+-- that TArray can arrive silently empty under some UE4SS versions (RE-UE4SS#378, a dropped sweep that never
+-- blocks), and an object-type query hits Trigger volumes - their object type is WorldDynamic, same as a solid
+-- prop's, so she would bump into something invisible. A channel trace instead asks each primitive's own
+-- per-channel response, and a Trigger's default response block list ignores Visibility the same way it
+-- ignores the ground ray already - no extra filter code needed, and never hers to push through either.
 M.COLLIDE_SUBSTEP = 120.0       -- longest move committed before re-checking (cm); not a tunnelling guard (see
                                  -- above) - only how often a blocked frame re-aims
 M.COLLIDE_MAX_SUBSTEPS = 6      -- a hard cap on sweeps/frame: bounds worst-case cost (see notes/engine-rules
@@ -857,32 +855,45 @@ local function trace_down(pawn)
     return tracer
 end
 
---- Her body against the world, horizontally: a capsule sweep between two XY points at her current feet height
---- (cm), against WorldStatic/WorldDynamic (M.SWEEP_OBJECT_TYPES - silent on other Pawns and on Trigger volumes
---- by the engine's own defaults, with no extra filter code). A game where the call fails disables collision-
---- aware walking for the rest of the session (sweep_broken, permanent - same shape as trace_broken/trace_down)
---- and says so once; M.follow is then given `nil` for its sweep argument, taking the exact unconditional-move
---- code path, byte for byte - "today's behaviour", not a softer, still-different fallback. UNVERIFIED: whether
---- UE4SS's Lua reflection marshals CapsuleTraceSingleForObjects at all (only LineTraceSingle is exercised
---- anywhere in this codebase or its installed UE4SS examples) - this is exactly what the latch is for.
+--- One capsule trace along the horizontal segment (x1,y1)-(x2,y2) at world Z `z` (her sweep height), on
+--- M.TRACE_CHANNEL - the SAME channel the ground ray already uses, never an object-type query (see the
+--- M.SWEEP_RADIUS comment above for why). `pawn` is the WorldContextObject, with bIgnoreSelf = true - the
+--- player must never block her own sweep, and never only because he happens to be named in ActorsToIgnore
+--- (passed empty here, {}). Returns: ok (the call did not throw), blocked (a clean blocking hit OR
+--- bStartPenetrating - she must never read "clear" while already inside something), hit.Time (0..1, nil
+--- without a hit or without ok). The one place AstraUE calls CapsuleTraceSingle; both the walking sweep below
+--- and the placement sweep (M.follow's teleport branch) go through this, never a second call site.
+local function trace_capsule(pawn, x1, y1, x2, y2, z, radius, half_height)
+    local hit = {}
+    local ok, did = pcall(function()
+        return kismet:CapsuleTraceSingle(pawn, { X = x1, Y = y1, Z = z }, { X = x2, Y = y2, Z = z }, radius, half_height,
+            M.TRACE_CHANNEL, false, {}, 0, hit, true, NO_COLOR, NO_COLOR, 0.0)
+    end)
+    if not ok then return false, false, nil, did end
+    return true, did == true or hit.bStartPenetrating == true, hit.Time, nil
+end
+
+--- Her body against the world, horizontally: a capsule sweep between two XY points at her current feet
+--- height (cm), through trace_capsule above. A game where the call fails disables collision-aware walking
+--- for the rest of the session (sweep_broken, permanent - same shape as trace_broken/trace_down) and says so
+--- once; M.follow is then given `nil` for its sweep argument, taking the exact unconditional-move code
+--- path, byte for byte - "today's behaviour", not a softer, still-different fallback. UNVERIFIED: whether
+--- UE4SS's Lua reflection marshals CapsuleTraceSingle at all (only LineTraceSingle is exercised anywhere in
+--- this codebase or its installed UE4SS examples) - this is exactly what the latch is for.
 local sweeper, sweeper_pawn, sweep_broken = nil, nil, false
 local function capsule_sweep(pawn)
     if sweep_broken then return nil end
     if sweeper_pawn == pawn and sweeper ~= nil then return sweeper end
     sweeper_pawn = pawn
     sweeper = function(x1, y1, x2, y2)
-        local hit = {}
-        local ok, did = pcall(function()
-            return kismet:CapsuleTraceSingleForObjects(pawn, { X = x1, Y = y1, Z = her.z + M.SWEEP_HALF_HEIGHT },
-                { X = x2, Y = y2, Z = her.z + M.SWEEP_HALF_HEIGHT }, M.SWEEP_RADIUS, M.SWEEP_HALF_HEIGHT, M.SWEEP_OBJECT_TYPES,
-                false, { pawn }, 0, hit, true, NO_COLOR, NO_COLOR, 0.0)
-        end)
+        local ok, blocked, time, err = trace_capsule(pawn, x1, y1, x2, y2, her.z + M.SWEEP_HALF_HEIGHT, M.SWEEP_RADIUS,
+            M.SWEEP_HALF_HEIGHT)
         if not ok then
             sweep_broken = true
-            log("cannot sweep for collision (she walks through walls as before): %s", tostring(did))
+            log("cannot sweep for collision (she walks through walls as before): %s", tostring(err))
             return false
         end
-        return did == true
+        return blocked, time
     end
     return sweeper
 end
