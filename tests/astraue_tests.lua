@@ -1850,5 +1850,31 @@ do
     check(near(her2.z, 0, 0.5), string.format("OBJECT_BAND fix: the crate case still gives 0 (z %.1f)", her2.z))
 end
 
+do
+    -- review fix (R), round 2: the placement cascade's last resort must never use his EXACT (p.x, p.y) - a
+    -- tight room (170 cm, first person - the comfort radii are all FIRST_PERSON_SCALE larger) can leave every
+    -- one of the five swept candidates short of near_player; the old code then fell back to his exact
+    -- position, inside his own capsule. Now it keeps the best PARTIAL result among the five (provided it
+    -- clears at least M.SWEEP_RADIUS), or - every candidate even tighter than that, and she already had a
+    -- position - stays exactly where she was rather than moving into something worse. This drives a
+    -- RE-placement (she starts far away, well past M.TELEPORT) so "already placed" is the live branch; the
+    -- room is small enough that the best candidate here (~27 cm) is itself under M.SWEEP_RADIUS (34 cm).
+    local walls = {
+        { 85, -1000, 1086, 1000 }, { -1086, -1000, -85, 1000 }, -- right / left
+        { -1000, 85, 1000, 1086 }, { -1000, -1086, 1000, -85 }, -- top / bottom (a 170 cm square room)
+    }
+    local sweep = box_sweep(walls, M.SWEEP_RADIUS)
+    local her = { placed = true, x = 5000, y = 5000, z = 0, yaw = 0, v = 0 } -- already placed, far past M.TELEPORT
+    local p = { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false, camera_dist = 50 } -- first person
+    M.follow(her, p, 1 / 60, 0, nil, sweep)
+    local dist = math.sqrt((her.x - p.x) ^ 2 + (her.y - p.y) ^ 2)
+    check(dist >= M.SWEEP_RADIUS, string.format("review fix: a 170 cm first-person room - never within M.SWEEP_RADIUS of him (dist %.1f)", dist))
+    local inside = false
+    for _, b in ipairs(walls) do
+        if her.x >= b[1] - M.SWEEP_RADIUS and her.x <= b[3] + M.SWEEP_RADIUS and her.y >= b[2] - M.SWEEP_RADIUS and her.y <= b[4] + M.SWEEP_RADIUS then inside = true end
+    end
+    check(not inside, string.format("review fix: a 170 cm first-person room - never inside a wall (her %.1f, %.1f)", her.x, her.y))
+end
+
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
 os.exit(failed == 0 and 0 or 1)

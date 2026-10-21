@@ -457,22 +457,23 @@ end
 --- time) - see trace_capsule/capsule_sweep's own doc; `sweep == nil` always answers clear (the caller only
 --- reaches here once a sweep IS given, same convention as try_move above). From the PLAYER's own position
 --- (px, py) toward the candidate (cx, cy): if clear, she lands there exactly (today's behaviour). If blocked,
---- she lands at the free point along that SAME line - hit.Time short by about her own radius (M.SWEEP_RADIUS,
---- a margin, not literally her edge) - but never nearer him than `near_player` (M.NEAR_PLAYER * scale, the
---- same comfort radius her walking already keeps); "too little room" (that clamp would put her AT or past the
---- hit) is reported as a miss (nil, nil, false) rather than left flush against the wall at his own feet, so
---- the caller can try a different candidate instead.
+--- the free point along that SAME line - hit.Time short by about her own radius (M.SWEEP_RADIUS, a margin,
+--- not literally her edge). Returns x, y (the landing point - ALWAYS a real point along the line, even when
+--- not `ok`, so the caller can fall back to the best of several partial results - review finding, round 2:
+--- the old "too little room" miss returned nil, nil, pushing the caller all the way to an unswept last
+--- resort), ok (true once `free` reaches `near_player`, M.NEAR_PLAYER * scale - the same comfort radius her
+--- walking already keeps), and free itself (the achieved distance - math.huge with no sweep, 0 if px,py and
+--- cx,cy already coincide).
 local function sweep_place(px, py, cx, cy, sweep, near_player)
-    if sweep == nil then return cx, cy, true end
+    if sweep == nil then return cx, cy, true, math.huge end
     local dx, dy = cx - px, cy - py
     local dist = math.sqrt(dx * dx + dy * dy)
-    if dist < 1e-3 then return px, py, true end
+    if dist < 1e-3 then return px, py, true, 0 end
     local blocked, time = sweep(px, py, cx, cy)
-    if not blocked then return cx, cy, true end
+    if not blocked then return cx, cy, true, dist end
     local free = math.max(0, (time or 0) * dist - M.SWEEP_RADIUS)
-    if free < near_player then return nil, nil, false end
     local ux, uy = dx / dist, dy / dist
-    return px + ux * free, py + uy * free, true
+    return px + ux * free, py + uy * free, free >= near_player, free
 end
 
 --- The substepped walk, collision-aware: from (x, y), `total` cm along unit (ux, uy); `sweep` a capsule sweep
@@ -603,26 +604,41 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
         -- happens to equal M.NEAR_PLAYER (90 cm each), and an UNBLOCKED sweep_place lands a candidate exactly
         -- where it was aimed, so aiming "his side" at M.SIDE put her exactly on the comfort-radius boundary,
         -- which the very next frame's own walking dynamics could nudge inside of (the same coincidence fix #3
-        -- itself already had to correct for its own last resort). Only if EVERY swept candidate fails does she
-        -- fall back to his own feet - never inside geometry, because he stands there, and the existing step-
-        -- away rule (to_player < NEAR_PLAYER) moves her clear of him again next frame.
+        -- itself already had to correct for its own last resort). If EVERY swept candidate falls short of
+        -- near_player (review finding, round 2: the old code then fell back to his EXACT position - inside
+        -- his own capsule, or inside the camera in a tight first-person room), keep the best PARTIAL result
+        -- among the five instead - whichever reached the most free distance - provided that clears at least
+        -- her own body (M.SWEEP_RADIUS); never his exact (p.x, p.y). If even the best partial result is
+        -- tighter than that and she already had a position, stay there rather than move into something worse
+        -- - only a first placement (nothing to stay at yet) takes the best point anyway.
         local near_player = M.NEAR_PLAYER * dscale
         local beside = near_player + M.SWEEP_RADIUS
-        local px2, py2, ok = sweep_place(p.x, p.y, tx, ty, sweep, near_player)
-        if not ok then
-            px2, py2, ok = sweep_place(p.x, p.y, p.x - fx * back - rx * side, p.y - fy * back - ry * side, sweep, near_player)
+        local was_placed = s.placed
+        local candidates = {
+            { tx, ty },                                             -- her real spot
+            { p.x - fx * back - rx * side, p.y - fy * back - ry * side }, -- the mirror: the other side of him
+            { p.x + rx * beside, p.y + ry * beside },               -- his right side
+            { p.x - rx * beside, p.y - ry * beside },               -- his left side
+            { p.x - fx * beside, p.y - fy * beside },               -- directly behind him
+        }
+        local px2, py2, ok = nil, nil, false
+        local best_x, best_y, best_free = nil, nil, -1
+        for _, c in ipairs(candidates) do
+            local x, y, cok, free = sweep_place(p.x, p.y, c[1], c[2], sweep, near_player)
+            if free > best_free then best_x, best_y, best_free = x, y, free end
+            if cok then
+                px2, py2, ok = x, y, true
+                break
+            end
         end
         if not ok then
-            px2, py2, ok = sweep_place(p.x, p.y, p.x + rx * beside, p.y + ry * beside, sweep, near_player) -- his right side
-        end
-        if not ok then
-            px2, py2, ok = sweep_place(p.x, p.y, p.x - rx * beside, p.y - ry * beside, sweep, near_player) -- his left side
-        end
-        if not ok then
-            px2, py2, ok = sweep_place(p.x, p.y, p.x - fx * beside, p.y - fy * beside, sweep, near_player) -- behind him
-        end
-        if not ok then
-            px2, py2 = p.x, p.y -- last resort: his own feet
+            if best_free >= M.SWEEP_RADIUS then
+                px2, py2 = best_x, best_y
+            elseif was_placed then
+                px2, py2 = s.x, s.y -- every candidate too tight, already somewhere: stay put
+            else
+                px2, py2 = best_x, best_y -- first placement: nothing to stay at, take the best anyway
+            end
         end
         s.x, s.y, s.z, s.yaw = px2, py2, p.z, p.yaw
         if s.trace then s.trace.z = nil end
