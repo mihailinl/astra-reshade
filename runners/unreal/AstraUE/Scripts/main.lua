@@ -411,10 +411,14 @@ function M.nav_goal(x, y, goal_x, goal_y, points)
 end
 
 --- One try: from (x, y), by (dx, dy) - nil if it would land nearer the player than clear_r (she must never be
---- pushed into him by a slide), or if `sweep` finds her body blocked there; else the landing x, y. `sweep(x1,
---- y1, x2, y2) -> true if blocked` is ALREADY fail-safe at the call site (the glue's capsule-sweep closure, or
---- the test stub) - a throw there is the glue's job to latch, not this pure function's; `sweep == nil` always
---- answers clear (the caller only reaches here once a sweep IS given - see M.follow).
+--- pushed into him by a SLIDE - the caller passes clear_r for a slide candidate only, nil/0 for the direct
+--- move: the direct move already has its own push-away steering in M.follow, before M.walk_collide is ever
+--- called, and vetoing it too would read a merely-nearby direct step as "blocked", halving her pace and
+--- counting a blocked frame for no obstacle at all), or if `sweep` finds her body blocked there; else the
+--- landing x, y. `sweep(x1, y1, x2, y2) -> true if blocked` is ALREADY fail-safe at the call site (the glue's
+--- capsule-sweep closure, or the test stub) - a throw there is the glue's job to latch, not this pure
+--- function's; `sweep == nil` always answers clear (the caller only reaches here once a sweep IS given - see
+--- M.follow).
 local function try_move(x, y, dx, dy, sweep, px, py, clear_r, stats)
     local nx, ny = x + dx, y + dy
     if clear_r and clear_r > 0 then
@@ -474,7 +478,7 @@ function M.walk_collide(x, y, ux, uy, total, sweep, substep, max_substeps, px, p
     while left > 1e-4 and n < max_substeps do
         n = n + 1
         local len = math.min(left, substep)
-        local nx, ny = try_move(x, y, ux * len, uy * len, sweep, px, py, clear_r, stats)
+        local nx, ny = try_move(x, y, ux * len, uy * len, sweep, px, py, nil, stats) -- the direct move: no clear_r veto
         if nx ~= nil then
             x, y, left = nx, ny, left - len
         else

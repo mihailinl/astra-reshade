@@ -1675,5 +1675,24 @@ do
     check(near(her2.x, -140) and near(her2.y, 90), string.format("fix #3: without a sweep, today's behaviour - she lands exactly at her spot (x %.1f, y %.1f)", her2.x, her2.y))
 end
 
+do
+    -- review fix (M): try_move's near-player veto must reject only SLIDE candidates, never the plain direct
+    -- move - with no obstacle at all, walking near him (45 cm, well inside NEAR_PLAYER=90) while he moves away
+    -- must never count as "blocked" or halve her pace, just because the veto's own clear_r check fired on a
+    -- step that had nothing to do with an obstacle.
+    local her = fresh_her()
+    her.placed, her.x, her.y, her.z, her.yaw, her.v = true, 45, 0, 0, 180, 0
+    local p = { x = 0, y = 0, z = 0, yaw = 0, vx = 300, vy = 0, falling = false }
+    local sweep = function() return false end -- never blocks: there is no obstacle in this test
+    local now = 0
+    for _ = 1, 90 do
+        p.x = p.x + 5
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, nil, sweep)
+    end
+    check((her.blocked_frames or 0) == 0, string.format("review fix: no obstacle - a direct move near him is never read as blocked (blocked_frames %s)", tostring(her.blocked_frames)))
+    check(near(her.v, 300, 1), string.format("review fix: no obstacle - her pace is never halved just for being near him (v %.1f)", her.v))
+end
+
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
 os.exit(failed == 0 and 0 or 1)
