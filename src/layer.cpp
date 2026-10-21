@@ -36,7 +36,7 @@ namespace layer
 		std::atomic<uint32_t> g_hdrVpW{0}, g_hdrVpH{0}; // the tonemapper's viewport this hdr pass (0, 0: none/Present)
 		// the depth buffer ReShade's depth add-on had bound at the last run of the effects (0, 0: none) - read by
 		// pretone on a recording thread to tell the main view's tonemapper from a scene capture's (passfind.h)
-		std::atomic<uint32_t> g_depthW{0}, g_depthH{0};
+		std::atomic<uint64_t> g_depthSize{0}; // w << 32 | h: one store, so a reader never sees half a change
 		std::atomic<unsigned long long> g_herRuns{0};
 		Layer g_toneLut; // tone.h's curve and its inverse (ASTRATONE), for her pass before the game's tonemapper
 		bool g_toneFailed = false;
@@ -573,11 +573,10 @@ namespace layer
 				uint32_t dw = 0, dh = 0;
 				if (!depth_buffer_size(runtime, dw, dh))
 					dw = dh = 0;
-				if (dw != g_depthW.load() || dh != g_depthH.load())
+				const uint64_t size = (uint64_t(dw) << 32) | dh;
+				if (g_depthSize.exchange(size) != size)
 					logf("layer: the depth buffer ReShade's depth add-on binds is %ux%u%s", dw, dh,
 						dw == 0 ? " (none: no 3D drawn yet - a menu - or none it would pick)" : "");
-				g_depthW = dw;
-				g_depthH = dh;
 			}
 			// into the game's HDR scene colour (before its tonemapper), or onto the presented picture
 			const bool hdr = g_hdrPass;
@@ -670,7 +669,8 @@ namespace layer
 				// fresh this run (at its top), against whatever size ReShade's own depth add-on actually picked
 				// (config_rules.h). One smaller than her copy is not this view's (a candidate the depth add-on has not
 				// settled on yet): the user's own DepthUvScale then, never a scale above 1
-				const uint32_t dw = g_depthW, dh = g_depthH;
+				const uint64_t size = g_depthSize;
+				const uint32_t dw = uint32_t(size >> 32), dh = uint32_t(size);
 				const uint32_t vp_w = g_hdrVpW, vp_h = g_hdrVpH;
 				if (vp_w != 0 && vp_h != 0 && dw >= vp_w && dh >= vp_h)
 				{
@@ -737,8 +737,9 @@ namespace layer
 
 	bool depth_size(uint32_t &w, uint32_t &h)
 	{
-		w = g_depthW;
-		h = g_depthH;
+		const uint64_t size = g_depthSize;
+		w = uint32_t(size >> 32);
+		h = uint32_t(size);
 		return w != 0 && h != 0;
 	}
 
