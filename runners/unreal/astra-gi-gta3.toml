@@ -19,7 +19,7 @@ schema = 1
 [integration]
 id = "astra.unreal.gta3-definitive-edition"
 name = "Astra for GTA III - The Definitive Edition"
-version = "0.2.10"
+version = "0.2.11"
 authors = ["mihailinl"]
 license = "MIT AND BSD-3-Clause AND CC0-1.0" # ours and UE4SS: MIT; ReShade: BSD-3-Clause; ReShade.fxh: CC0-1.0
 repo = "https://github.com/mihailinl/astra-reshade"

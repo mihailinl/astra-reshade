@@ -19,7 +19,7 @@ namespace enginelink
 {
 	namespace
 	{
-		constexpr const char *kFoundation = "0.2.10";      // this add-on's version, told to the engine
+		constexpr const char *kFoundation = "0.2.11";      // this add-on's version, told to the engine
 		constexpr double kRebase = 1500.0;                 // move the floating origin when she is this far from it
 		constexpr float kFar = 300.0f;                     // she is never far: a short depth range keeps it precise
 		constexpr int64_t kStaleMs = 300;                  // a provider silent this long: she is hidden
