@@ -1781,5 +1781,58 @@ do
     check((her.stuck_teleports or 0) == 0, string.format("review fix: unrelated drops, 20 s apart, never escalate to a teleport (stuck_teleports %s)", tostring(her.stuck_teleports)))
 end
 
+do
+    -- review fix (Q): M.OBJECT_BAND's retrace (from z - 1 down) must only REPLACE z when it actually finds
+    -- something lower (a crate over a floor) - finding NOTHING there is not "no floor": on a continuous
+    -- slope, the surface already found IS the only floor there is, and discarding it (the old code) sank her
+    -- through her own real floor the moment she stood more than OBJECT_BAND above the player's own feet on
+    -- one. A plain slope, height 0.6 * y: her natural spot's y is 90 (M.SIDE, p.yaw = 0, p.y = 0) - 54 cm up,
+    -- comfortably past M.OBJECT_BAND (50) above the player's floor (0).
+    local function slope(x, y, from, to)
+        local h = 0.6 * y
+        if from >= to then
+            if h <= from and h >= to then return h end
+        else
+            if h >= from and h <= to then return h end
+        end
+        return nil
+    end
+    local her = fresh_her()
+    local p = { x = 0, y = 0, z = 0, yaw = 0, vx = 120, vy = 0, falling = false }
+    M.follow(her, p, 1 / 60, 0, slope)
+    check(near(her.z, 54, 1), string.format("OBJECT_BAND fix: placed on a slope, she stands on it, not on the player's floor (z %.1f)", her.z))
+    local now = 0
+    for _ = 1, 300 do
+        p.x = p.x + 2
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, slope)
+    end
+    check(near(her.z, 54, 1), string.format("OBJECT_BAND fix: walking on a slope, she stays on it, not on the player's floor (z %.1f)", her.z))
+    -- the crate case (a solid WITH a bottom face registered separately, so the retrace DOES find the floor
+    -- under it) must still give 0 - the "the ground fix (B)" tests above already cover this unchanged; this
+    -- is the same assertion, inline, as the two-sided confirmation this fix's own test asks for.
+    local function world_with(solids)
+        return function(x, _, from, to)
+            local best
+            if from >= to then
+                if from >= 0 and to <= 0 then best = 0 end
+                for _, s in ipairs(solids) do
+                    if x >= s[1] and x <= s[2] and s[3] <= from and s[3] >= to and (best == nil or s[3] > best) then best = s[3] end
+                end
+            end
+            return best
+        end
+    end
+    local crate = world_with({ { 150, 250, 75 } })
+    local her2 = fresh_her()
+    local p2 = { x = 0, y = 0, z = 0, yaw = 0, vx = 120, vy = 0, falling = false }
+    M.follow(her2, p2, 1 / 60, 0, crate)
+    for _ = 1, 300 do
+        p2.x = p2.x + 2
+        M.follow(her2, p2, 1 / 60, _ / 60, crate)
+    end
+    check(near(her2.z, 0, 0.5), string.format("OBJECT_BAND fix: the crate case still gives 0 (z %.1f)", her2.z))
+end
+
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
 os.exit(failed == 0 and 0 or 1)

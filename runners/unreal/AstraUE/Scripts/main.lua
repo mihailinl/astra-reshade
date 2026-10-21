@@ -318,7 +318,11 @@ end
 --- balcony the player stands on over her head is a ceiling to her, and she stays on her floor. Separately, a surface
 --- more than OBJECT_BAND above the PLAYER's own feet is never hers either, ceiling or not - a ledge/balcony he
 --- actually climbed has HIM up there too; an isolated prop (a crate, a table, a railing) near him does not, and a
---- single downward ray cannot otherwise tell the two apart (both read as "higher surface, nothing overhead").
+--- single downward ray cannot otherwise tell the two apart (both read as "higher surface, nothing overhead"). The
+--- retrace below (from z - 1 down) ONLY replaces z when it actually finds something lower (a crate sitting on a
+--- floor); finding nothing there is not "no floor" - on a continuous slope or a hill, the surface already found
+--- (z itself) IS the only floor there is, and the OLD retrace discarding it (review finding) sank her through
+--- her own real floor the moment she stood more than OBJECT_BAND above the player's feet on one.
 function M.update_ground(s, p, now, ground, force)
     s.trace = s.trace or {}
     local g = s.trace
@@ -330,8 +334,11 @@ function M.update_ground(s, p, now, ground, force)
             g.ceilings = (g.ceilings or 0) + 1
         end
         if z ~= nil and z > p.z + M.OBJECT_BAND then
-            z = ground(s.x, s.y, z - 1, bottom) -- not a ledge he's on: the real floor beneath/around the object
-            g.objects = (g.objects or 0) + 1
+            local under = ground(s.x, s.y, z - 1, bottom) -- not a ledge he's on: is there a real floor under/around it?
+            if under ~= nil then
+                z = under -- yes - a crate (or similar) over a floor: the floor is hers, not the crate's top
+                g.objects = (g.objects or 0) + 1
+            end -- no: z itself is the only floor here (a slope/hill) - KEEP it, never discard the only surface found
         end
         g.at, g.x, g.y, g.traces = now, s.x, s.y, (g.traces or 0) + 1
         if z ~= nil then
