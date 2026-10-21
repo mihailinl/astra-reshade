@@ -281,5 +281,13 @@ namespace config_rules
 		{ "GENERAL", "PresetPath", ".\\astra-reshade\\AstraPreset.ini" },
 		// ReShade's first-start tutorial banner skipped, as the ReShade.ini the manual install shipped did
 		{ "OVERLAY", "TutorialProgress", "4" },
+		// The game's depth buffer, which hides her behind walls (ReShade's own generic-depth add-on picks it, reading
+		// these at the game's first device - after add-ons load, so these seeds reach its first session): Unreal draws
+		// its scene below the output resolution (screen percentage, TSR, DLSS, FSR), and the default "similar aspect
+		// ratio" rule throws out a depth buffer more than 1.85x smaller than the screen - Poppy Playtime draws at 768x436
+		// for 2560x1440 and she showed through every wall (the owner, 2026-10-20: picking it by hand fixed it). So no
+		// size rule (0), and only Unreal's scene depth format, D32S8 (6): its shadow maps are D16 and never chosen.
+		{ "DEPTH", "UseAspectRatioHeuristics", "0" },
+		{ "DEPTH", "FilterFormat", "6" },
 	};
 }

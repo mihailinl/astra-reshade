@@ -1843,13 +1843,18 @@ static void test_config_rules()
 	paths = { "./Astra-ReShade/shaders/**" };
 	CHECK(!config_rules::add_search_path(paths, config_rules::kEffectSearchPath));
 	// the seeds name what the manual install's ReShade.ini set and ReShade's defaults lack
-	bool preset = false, tutorial = false;
+	bool preset = false, tutorial = false, any_size = false, d32s8 = false;
 	for (const config_rules::Seed &s : config_rules::kSeeds)
 	{
 		preset |= std::string(s.section) == "GENERAL" && std::string(s.key) == "PresetPath" && std::string(s.value) == ".\\astra-reshade\\AstraPreset.ini";
 		tutorial |= std::string(s.section) == "OVERLAY" && std::string(s.key) == "TutorialProgress" && std::string(s.value) == "4";
+		// the game's depth: any size (Unreal draws below the screen's resolution), Unreal's scene format only (D32S8 = 6
+		// in ReShade's generic-depth add-on's FilterFormat; its shadow maps are D16)
+		any_size |= std::string(s.section) == "DEPTH" && std::string(s.key) == "UseAspectRatioHeuristics" && std::string(s.value) == "0";
+		d32s8 |= std::string(s.section) == "DEPTH" && std::string(s.key) == "FilterFormat" && std::string(s.value) == "6";
 	}
 	CHECK(preset && tutorial);
+	CHECK(any_size && d32s8);
 }
 
 int main(int argc, char **argv)
