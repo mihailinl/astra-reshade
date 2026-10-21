@@ -1367,10 +1367,13 @@ end
 -------------------------------------------------------------------------------- collision-aware walking + the ground fix
 -- A pure-Lua stand-in for a capsule sweep against axis-aligned boxes in the XY plane (Z ignored - exercises
 -- M.walk_collide/M.follow's logic without a game; the integration tests further down use the REAL stub's
--- CapsuleTraceSingle, which does the identical segment-vs-box test). boxes: {x1, y1, x2, y2}.
+-- CapsuleTraceSingle, which does the identical segment-vs-box test). boxes: {x1, y1, x2, y2}. Returns
+-- (blocked, time) - time (0..1, the nearest hit) is read by fix #3's placement sweep (sweep_place); every
+-- existing caller only reads the first value, so this is unchanged for them.
 local function box_sweep(boxes, radius)
     radius = radius or 0
     return function(x1, y1, x2, y2)
+        local best_t
         for _, b in ipairs(boxes) do
             local bx1, by1, bx2, by2 = b[1] - radius, b[2] - radius, b[3] + radius, b[4] + radius
             local dx, dy = x2 - x1, y2 - y1
@@ -1389,8 +1392,11 @@ local function box_sweep(boxes, radius)
                 end
                 return true
             end
-            if clip(-dx, x1 - bx1) and clip(dx, bx2 - x1) and clip(-dy, y1 - by1) and clip(dy, by2 - y1) and tmin <= tmax then return true end
+            if clip(-dx, x1 - bx1) and clip(dx, bx2 - x1) and clip(-dy, y1 - by1) and clip(dy, by2 - y1) and tmin <= tmax then
+                if best_t == nil or tmin < best_t then best_t = tmin end
+            end
         end
+        if best_t ~= nil then return true, best_t end
         return false
     end
 end
@@ -1650,6 +1656,23 @@ do
         end
     end, hers2)
     check(not entered(hers2, 0, -250, 40, -30), "fix #2: the same footprint, 1 m tall, still blocks her sweep")
+end
+
+do
+    -- fix #3 (L): placement never lands her inside a wall. A wall sits squarely between the player and her
+    -- spot (both her spot's line AND its mirror cross it, by construction) - she must end up on HIS side of
+    -- it, never inside or past it, on first placement (s.placed == false, exactly the branch this fix changes).
+    local sweep = box_sweep({ { -90, -1000, -70, 1000 } }, M.SWEEP_RADIUS)
+    local her, p = fresh_her(), { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+    M.follow(her, p, 1 / 60, 0, nil, sweep)
+    check(her.x > -70, string.format("fix #3: a wall between him and her spot - she lands on his side of it (x %.1f)", her.x))
+    check(not (her.x >= -90 and her.x <= -70), string.format("fix #3: never placed inside the wall itself (x %.1f)", her.x))
+    check(math.sqrt((her.x - p.x) ^ 2 + (her.y - p.y) ^ 2) >= M.NEAR_PLAYER, string.format("fix #3: still never closer to him than NEAR_PLAYER (dist %.1f)", math.sqrt((her.x - p.x) ^ 2 + (her.y - p.y) ^ 2)))
+
+    -- without a sweep, today's behaviour: she still lands exactly at her spot, wall or not (no regression).
+    local her2 = fresh_her()
+    M.follow(her2, p, 1 / 60, 0, nil, nil)
+    check(near(her2.x, -140) and near(her2.y, 90), string.format("fix #3: without a sweep, today's behaviour - she lands exactly at her spot (x %.1f, y %.1f)", her2.x, her2.y))
 end
 
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))

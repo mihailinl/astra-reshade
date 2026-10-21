@@ -427,6 +427,29 @@ local function try_move(x, y, dx, dy, sweep, px, py, clear_r, stats)
     return nx, ny
 end
 
+--- Fix #3: where she lands when she is PUT at a spot (first placement, TELEPORT, floor apart, stuck) - never
+--- inside geometry, the way an unconditional teleport could before this. `sweep` already answers (blocked,
+--- time) - see trace_capsule/capsule_sweep's own doc; `sweep == nil` always answers clear (the caller only
+--- reaches here once a sweep IS given, same convention as try_move above). From the PLAYER's own position
+--- (px, py) toward the candidate (cx, cy): if clear, she lands there exactly (today's behaviour). If blocked,
+--- she lands at the free point along that SAME line - hit.Time short by about her own radius (M.SWEEP_RADIUS,
+--- a margin, not literally her edge) - but never nearer him than `near_player` (M.NEAR_PLAYER * scale, the
+--- same comfort radius her walking already keeps); "too little room" (that clamp would put her AT or past the
+--- hit) is reported as a miss (nil, nil, false) rather than left flush against the wall at his own feet, so
+--- the caller can try a different candidate instead.
+local function sweep_place(px, py, cx, cy, sweep, near_player)
+    if sweep == nil then return cx, cy, true end
+    local dx, dy = cx - px, cy - py
+    local dist = math.sqrt(dx * dx + dy * dy)
+    if dist < 1e-3 then return px, py, true end
+    local blocked, time = sweep(px, py, cx, cy)
+    if not blocked then return cx, cy, true end
+    local free = math.max(0, (time or 0) * dist - M.SWEEP_RADIUS)
+    if free < near_player then return nil, nil, false end
+    local ux, uy = dx / dist, dy / dist
+    return px + ux * free, py + uy * free, true
+end
+
 --- The substepped walk, collision-aware: from (x, y), `total` cm along unit (ux, uy); `sweep` a capsule sweep
 --- (see try_move) - ported from the Death Stranding follower's frame()-loop + try_step/slide (astra.cpp:580-
 --- 607, in spirit: ONE capsule sweep per try here, where astra.cpp tests two spheres, since UE4SS gives one
@@ -535,8 +558,21 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
     -- successful arrival between them (reset on arrival or on any placement/teleport, including this one).
     local stuck = s.placed and ((s.going and (s.stuck_time or 0) > M.STUCK_SECONDS) or (s.aim_drops or 0) > M.STUCK_AIM_DROPS)
     if not s.placed or to_spot > M.TELEPORT or stuck or math.abs((s.ground or p.z) - s.z) > M.FLOOR_APART then
-        -- put at her spot, on the ground there (traced at once)
-        s.x, s.y, s.z, s.yaw = tx, ty, p.z, p.yaw
+        -- put at her spot (fix #3: swept from the player, never landing her inside geometry) - on the ground
+        -- there (traced at once). Tried in order: her real spot; its mirror (the other side of him, same
+        -- back/side magnitudes - "behind him on the other side"); simply beside him, unswept - he already
+        -- stands somewhere clear, and by then a sweep would rarely find more room anyway (never AT the
+        -- near_player edge itself - the same SWEEP_RADIUS margin the first two tries land short by).
+        local near_player = M.NEAR_PLAYER * dscale
+        local px2, py2, ok = sweep_place(p.x, p.y, tx, ty, sweep, near_player)
+        if not ok then
+            px2, py2, ok = sweep_place(p.x, p.y, p.x - fx * back - rx * side, p.y - fy * back - ry * side, sweep, near_player)
+        end
+        if not ok then
+            local beside = near_player + M.SWEEP_RADIUS
+            px2, py2 = p.x + rx * beside, p.y + ry * beside
+        end
+        s.x, s.y, s.z, s.yaw = px2, py2, p.z, p.yaw
         if s.trace then s.trace.z = nil end
         M.update_ground(s, p, now, ground, true)
         s.z = s.ground or p.z
