@@ -68,24 +68,26 @@ namespace pretone_rules
 
 	/// Her pass at the tonemapper that did not draw: ReShade marks the frame's effects drawn BEFORE it checks they are
 	/// ready (compiling for the scene colour's format, reloading), so that frame nothing is drawn - neither she nor the
-	/// user's other effects, at the tonemapper or at Present. After such a miss the Present path is held (1 s at 60
-	/// frames a second, doubling to 16 s while misses repeat) - the effects compile meanwhile - and the tonemapper is
-	/// tried again; after kGiveUp misses in a row, the Present path for the rest of the session. One frame per try.
+	/// user's other effects, at the tonemapper or at Present. After such a miss the Present path is held (1 s, doubling
+	/// to 16 s while misses repeat) - the effects compile meanwhile - and the tonemapper is tried again; after kGiveUp
+	/// misses in a row, the Present path for the rest of the session. One frame per try. Held by the CLOCK, never by a
+	/// frame count: a compile takes seconds whatever the frame rate, and Poppy Playtime's menu at 700 frames a second
+	/// spent all 8 tries of a 60-frame hold in 5 s, before its 6.3 s compile for a 384x217 scene colour was done.
 	struct Fallback
 	{
-		static constexpr uint64_t kFirstHold = 60, kMaxHold = 960;
+		static constexpr uint64_t kFirstHold = 1000, kMaxHold = 16000; // ms
 		static constexpr int kGiveUp = 8;
-		uint64_t until = 0, hold = 0;
+		uint64_t until = 0, hold = 0; // ms
 		int misses = 0;
 		bool given_up = false;
 
-		/// The Present path is held at this frame.
-		bool holding(uint64_t frame) const
+		/// The Present path is held at this time (ms, any monotonic clock).
+		bool holding(uint64_t now_ms) const
 		{
-			return given_up || frame < until;
+			return given_up || now_ms < until;
 		}
-		/// Her pass at the tonemapper in frame `frame` drew (her technique ran) or not. True: a hold began.
-		bool result(uint64_t frame, bool drawn)
+		/// Her pass at the tonemapper at `now_ms` drew (her technique ran) or not. True: a hold began.
+		bool result(uint64_t now_ms, bool drawn)
 		{
 			if (drawn)
 			{
@@ -95,7 +97,7 @@ namespace pretone_rules
 			}
 			++misses;
 			hold = hold == 0 ? kFirstHold : std::min(hold * 2, kMaxHold);
-			until = frame + hold;
+			until = now_ms + hold;
 			given_up = given_up || misses >= kGiveUp;
 			return true;
 		}
@@ -142,9 +144,9 @@ namespace pretone_rules
 
 	/// Try her pass at the tonemapper this frame? Not while the Present path is held - and not while the user has
 	/// ReShade's effects switched off (nothing would draw anywhere; counted as misses, that gave pretone up for good).
-	inline bool should_try(const Fallback &f, uint64_t frame, bool effects_on)
+	inline bool should_try(const Fallback &f, uint64_t now_ms, bool effects_on)
 	{
-		return effects_on && !f.holding(frame);
+		return effects_on && !f.holding(now_ms);
 	}
 
 	/// How many presents the GPU may still be behind the CPU with something we handed it - frames in flight are 2-3 (a

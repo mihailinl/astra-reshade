@@ -1056,7 +1056,7 @@ namespace pretone
 				++g_contended; // Present is in ReShade now, or another thread draws her pass: at Present this frame
 				return;
 			}
-			if (g_drawnAt.load() == frame || !pretone_rules::should_try(g_fallback, frame, runtime->get_effects_state()))
+			if (g_drawnAt.load() == frame || !pretone_rules::should_try(g_fallback, GetTickCount64(), runtime->get_effects_state()))
 				return;
 			// g_stability (like g_fallback above) is touched only here, past the Recording guard: one thread at a time.
 			{
@@ -1153,14 +1153,14 @@ namespace pretone
 				++g_before;
 				++g_periodBefore;
 			}
-			if (g_fallback.result(frame, ran))
+			if (g_fallback.result(GetTickCount64(), ran))
 			{
 				if (!g_loggedHold)
 				{
 					g_loggedHold = true;
 					logf("pretone: her pass before the tonemapper did not draw (the effects are compiling for its %ux%u scene colour): one frame "
-						 "without effects; she is drawn at presentation for %llu frames, then tried again",
-						scene.w, scene.h, (unsigned long long)g_fallback.hold);
+						 "without effects; she is drawn at presentation for %.1f s, then tried again",
+						scene.w, scene.h, double(g_fallback.hold) / 1000.0);
 				}
 				if (g_fallback.given_up && !g_loggedGiveUp)
 				{

@@ -885,24 +885,41 @@ static void test_pretone_rules()
 	{
 		pretone_rules::Fallback fb;
 		int lost = 0, tries = 0;
-		// the effects compile for 5 s (300 frames): every try before that is a miss
-		for (uint64_t frame = 0; frame < 2000; ++frame)
+		// 60 frames a second (16 ms), the effects compile for 5 s: every try before that is a miss
+		for (uint64_t ms = 0; ms < 33000; ms += 16)
 		{
-			if (fb.holding(frame))
+			if (fb.holding(ms))
 				continue;
 			++tries;
-			const bool drawn = frame >= 300;
+			const bool drawn = ms >= 5000;
 			lost += !drawn;
-			fb.result(frame, drawn);
+			fb.result(ms, drawn);
 		}
-		CHECK(lost == 3 && tries > 1500 && !fb.given_up); // misses at 0, 60, 180 - three lost frames in 5 s - drawn from 420
+		CHECK(lost == 3 && tries > 1500 && !fb.given_up); // misses at 0, 1 s, 3 s - three lost frames in 5 s - drawn from 7 s
+		// Poppy Playtime's menu: 700 frames a second (1.4 ms), a 6.3 s compile for its 384x217 scene colour - a hold
+		// counted in frames gave up after 5 s; by the clock she is drawn at the tonemapper once it is done
+		pretone_rules::Fallback fast;
+		uint64_t first_drawn = 0;
+		lost = 0;
+		for (uint64_t us = 0; us < 30000000 && first_drawn == 0; us += 1400)
+		{
+			const uint64_t ms = us / 1000;
+			if (fast.holding(ms))
+				continue;
+			const bool drawn = ms >= 6300;
+			lost += !drawn;
+			fast.result(ms, drawn);
+			if (drawn)
+				first_drawn = ms;
+		}
+		CHECK(!fast.given_up && lost == 3 && first_drawn >= 6300 && first_drawn < 8000);
 		pretone_rules::Fallback never;
 		lost = 0;
-		for (uint64_t frame = 0; frame < 100000; ++frame)
-			if (!never.holding(frame))
+		for (uint64_t ms = 0; ms < 1000000; ms += 16)
+			if (!never.holding(ms))
 			{
 				++lost;
-				never.result(frame, false);
+				never.result(ms, false);
 			}
 		CHECK(never.given_up && lost == pretone_rules::Fallback::kGiveUp);
 	}
@@ -912,17 +929,17 @@ static void test_pretone_rules()
 	{
 		pretone_rules::Fallback fb;
 		uint64_t first_drawn = 0;
-		for (uint64_t frame = 0; frame < 3000 && first_drawn == 0; ++frame)
+		for (uint64_t ms = 0; ms < 48000 && first_drawn == 0; ms += 16)
 		{
-			const bool effects_on = frame >= 2000;
-			if (pretone_rules::should_try(fb, frame, effects_on))
+			const bool effects_on = ms >= 32000;
+			if (pretone_rules::should_try(fb, ms, effects_on))
 			{
-				fb.result(frame, effects_on); // with the effects off nothing draws
+				fb.result(ms, effects_on); // with the effects off nothing draws
 				if (effects_on)
-					first_drawn = frame;
+					first_drawn = ms;
 			}
 		}
-		CHECK(!fb.given_up && first_drawn == 2000);
+		CHECK(!fb.given_up && first_drawn == 32000);
 	}
 
 	// a sub-resolution tonemapper (passfind.h) is drawn into only once its viewport has held for kStable found frames
