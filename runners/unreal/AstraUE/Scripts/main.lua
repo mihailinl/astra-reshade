@@ -128,14 +128,19 @@ M.SLIDE_FACTOR = 0.7            -- ported from astra.cpp:594
 M.COLLIDE_TURN_RATE = 400.0     -- deg/s the WALK direction chases the goal bearing while a sweep is wired (never
                                  -- the raw bearing recomputed fresh every frame - that oscillates against a wall,
                                  -- see M.walk_collide's doc); her cosmetic s.yaw turn (540 deg/s) is unaffected
-M.STUCK_SECONDS = 1.6           -- ported from astra.cpp kStuckSeconds (astra.cpp:32): no progress toward her
-                                 -- REAL spot for this long WHILE A SWEEP IS ACTUALLY REPORTING A BLOCK (s.
-                                 -- collide_blocked - never raw distance from the spot alone: an open-field sprint
-                                 -- at her speed cap plateaus the SAME WAY a genuine wedge does once she can't
-                                 -- close the gap any faster, and sweep == nil must never read as stuck at all -
-                                 -- review finding, 2026-10-20) folds into the EXISTING put-her-at-her-spot branch
-                                 -- below (never a second "teleport" mechanism) - a wall that will never open must
-                                 -- not wedge her against it forever, the same way raw distance already doesn't
+M.STUCK_SECONDS, M.STUCK_DISTANCE = 1.6, 300.0 -- ported verbatim (m -> cm) from astra.cpp kStuckSeconds/
+                                 -- kStuckDistance (astra.cpp:32), the CONSERVATIVE DS rule (round-2 review
+                                 -- finding: a sole "any block this frame" gate fired on a slow creep sliding
+                                 -- cleanly around a small obstacle): no progress toward her REAL spot for this
+                                 -- long, while still this far from it (within STUCK_DISTANCE she is never
+                                 -- teleported for being stuck - a documented limitation, the same one DS has),
+                                 -- AND a sweep actually reported a block at some point during the SAME
+                                 -- no-progress stretch (s.stuck_blocked_seen, below - never raw distance alone,
+                                 -- and never collision-unaware: an open-field sprint at her speed cap plateaus
+                                 -- the gap the SAME WAY a genuine wedge does, and sweep == nil must never read
+                                 -- as stuck at all) folds into the EXISTING put-her-at-her-spot branch below
+                                 -- (never a second "teleport" mechanism) - a wall that will never open must not
+                                 -- wedge her against it forever, the same way raw distance already doesn't
                                  -- (M.TELEPORT)
 M.STUCK_IMPROVE = 30.0          -- "progress" (astra.cpp:495): to_spot must shrink by more than this to count -
                                  -- a noise floor, not a literal zero (her own slow walk covers far more than
@@ -550,35 +555,36 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
     if s.placed then M.update_ground(s, p, now, ground) end
     local pspeed = math.sqrt(p.vx * p.vx + p.vy * p.vy)
     local to_spot = math.sqrt((tx - s.x) ^ 2 + (ty - s.y) ^ 2)
-    -- stuck (G): no PROGRESS toward her real spot for a while, AND a sweep is actually reporting a block (s.
-    -- collide_blocked, set below - LAST frame's, the same one-frame lag s.going already uses) - ported from
-    -- the Death Stranding follower's stuck detector (astra.cpp:494-516) and folded into this SAME
-    -- put-her-at-her-spot branch, not a second mechanism (she reached "far from her spot" by a different route
-    -- - a wall in the way, not raw distance - but the fix is identical). Progress is to_spot SHRINKING by more
-    -- than STUCK_IMPROVE, never elapsed time alone, so she is never cut off mid-progress. Gating accumulation
-    -- on an actual reported block (never raw distance from the spot, and never collision-unaware - review
-    -- finding: with sweep == nil this must be BYTE-IDENTICAL to today, and an open-field sprint at her speed
-    -- cap plateaus the gap the SAME WAY a genuine wedge does once she cannot close it any faster, which must
-    -- never read as stuck either) is what lets this fire even wedged WITHIN what used to be a raw-distance
-    -- gate - that gate's only effect was to EXEMPT a close wedge from ever being rescued at all. Gated on
-    -- s.going (last frame's: it is not recomputed yet this frame) - while she is standing or wandering her own
-    -- nearby aim, tx/ty is NOT her live goal at all (see the stand/go hysteresis below), so to_spot not
-    -- shrinking means nothing; that quieter case has its own, separate giveup (s.aim_time, below) and must not
-    -- feed this one, or standing still arbitrarily far from her spot while the player himself never moves
-    -- falsely reads as "stuck" and teleports her there every ~1.6 s (found by reproducing exactly that
-    -- regression while porting this). A frame that is neither progress nor a reported block (a slide that
-    -- happened to clear a substep on its own, right at a corner, say) FREEZES stuck_time rather than zeroing
-    -- it - only real progress earns a reset; a genuinely sealed wall reports a block on most frames but not
-    -- EVERY single one (the sticky slide direction occasionally finds a substep the wall doesn't block yet),
-    -- and zeroing on every such gap never let the total reach M.STUCK_SECONDS at all (review finding).
+    -- stuck (G): the Death Stranding follower's OWN, conservative rule (astra.cpp:494-516), ported literally
+    -- this time (review finding, round 2 - the round-1 attempt used "any try_move failed this frame" as the
+    -- sole gate, which fired on a slow creep sliding CLEANLY around a small obstacle - 2 teleports in 20 s
+    -- past a 40x40 cm pillar at her trailing spot - because that gate doesn't care whether the stall is a
+    -- genuine wedge or a few frames of ordinary slide negotiation on an otherwise-fine detour). stuck_time
+    -- accumulates only while ALL THREE hold: to_spot > M.STUCK_DISTANCE (far enough to matter at all - WITHIN
+    -- this she is never teleported for being stuck, a documented limitation, the same one DS itself has);
+    -- NO PROGRESS (to_spot has not shrunk by more than M.STUCK_IMPROVE since the current stretch's best); and
+    -- a sweep reported a block AT SOME POINT during this SAME no-progress stretch (s.stuck_blocked_seen,
+    -- latched true the first time s.collide_blocked is true after the last progress reset, not required on
+    -- EVERY frame of the stretch - a genuinely sealed wall reports a block on most frames but not literally
+    -- all of them, and requiring every single one reopened the exact "sealed wall, player walking away" stall
+    -- this ported from). Progress (to_spot shrinking) resets stuck_time AND the latch together - she is never
+    -- cut off mid-progress, and a fresh stretch starts clean. With sweep == nil, s.collide_blocked is always
+    -- false, so the latch never sets and this can never fire - BYTE-IDENTICAL to today; an open-field sprint
+    -- at her speed cap plateauing the gap the SAME WAY a genuine wedge does must never read as stuck either,
+    -- which the STUCK_DISTANCE gate alone already guards (a plateaued gap keeps growing past it, but with no
+    -- sweep the latch never sets). Gated on s.going (last frame's: it is not recomputed yet this frame) - see
+    -- the stand/go hysteresis below for why tx/ty is not her live goal at all while she is standing.
     if s.going then
         if to_spot < (s.stuck_best or 1e9) - M.STUCK_IMPROVE then
-            s.stuck_best, s.stuck_time = to_spot, 0
-        elseif s.collide_blocked then
-            s.stuck_time = (s.stuck_time or 0) + dt
+            s.stuck_best, s.stuck_time, s.stuck_blocked_seen = to_spot, 0, false
+        else
+            if s.collide_blocked then s.stuck_blocked_seen = true end
+            if to_spot > M.STUCK_DISTANCE and s.stuck_blocked_seen then
+                s.stuck_time = (s.stuck_time or 0) + dt
+            end
         end
     else
-        s.stuck_time, s.stuck_best = 0, 1e9
+        s.stuck_time, s.stuck_best, s.stuck_blocked_seen = 0, 1e9, false
     end
     -- a SECOND escape, for when she is never "going" at all (the player never moves - the quieter aim giveup
     -- below just drops an unreachable aim rather than teleporting for it, since on its own that is low stakes;
@@ -625,7 +631,7 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
         s.v, s.vx, s.vy, s.speed, s.placed, s.teleports, s.going = 0, 0, 0, 0, true, (s.teleports or 0) + 1, false
         s.aim_x, s.aim_y, s.aim_time, s.aim_best, s.aim_drops = nil, nil, 0, 1e9, 0
         s.aim_drop_x, s.aim_drop_y, s.aim_drop_time = nil, nil, nil
-        s.stuck_time, s.stuck_best, s.slide_side, s.slide_dir_x, s.slide_dir_y = 0, 1e9, nil, nil, nil
+        s.stuck_time, s.stuck_best, s.stuck_blocked_seen, s.slide_side, s.slide_dir_x, s.slide_dir_y = 0, 1e9, false, nil, nil, nil
         s.collide_blocked = false
         if stuck then s.stuck_teleports = (s.stuck_teleports or 0) + 1 end
         return s

@@ -1718,30 +1718,41 @@ do
     -- "byte-identical to today" half of this at the top of the file; this one adds the SUSTAINED-sprint shape
     -- the review flagged specifically (a plateaued catch-up gap, not just 400 random frames).
 
-    -- (b) wedged against a sealed wall, her spot ~200 cm past it, while he paces nearby (oscillating but always
-    -- "going") - she must never enter the wall, and must be rescued within STUCK_SECONDS + 1 s of the pacing
-    -- (i.e. the steady-state wedge) starting, not left stuck indefinitely by a reported-block flicker right at
-    -- a slide's own corner case resetting her progress baseline.
-    local sweep = box_sweep({ { -20, -1000, 20, 1000 } }, M.SWEEP_RADIUS)
-    local her2, p2, now2, entered_wall = fresh_her(), { x = -500, y = 0, z = 0, yaw = 0, vx = 300, vy = 0, falling = false }, 0, false
-    M.follow(her2, p2, 1 / 60, now2, nil, sweep)
-    for _ = 1, 150 do -- he walks up to ~200 cm past the wall (her spot ends up there, her wedged on this side)
-        p2.x = math.min(p2.x + 5, 286)
-        now2 = now2 + 1 / 60
-        M.follow(her2, p2, 1 / 60, now2, nil, sweep)
-        if her2.x > -20 and her2.x < 20 then entered_wall = true end
-    end
-    local rescued_frame
-    for i = 1, 300 do -- he paces near there, still registering as "going" throughout
+    -- (b) DOCUMENTED LIMITATION (round-2 review, the conservative DS rule): wedged against a sealed wall with
+    -- her spot only ~200 cm past it (WITHIN M.STUCK_DISTANCE) while he paces nearby, never running far enough
+    -- away to cross that threshold - she is never teleported for this (the same limitation the Death Stranding
+    -- follower itself has), but she must still never enter the wall; collision avoidance is unconditional,
+    -- the stuck-rescue is the part that is bounded.
+    local sweep = box_sweep({ { -20, -100000, 20, 100000 } }, M.SWEEP_RADIUS)
+    local her2 = { placed = true, x = -54, y = 90, z = 0, yaw = 90, v = 0 }
+    local p2, now2, entered_wall = { x = 286, y = 0, z = 0, yaw = 0, vx = 300, vy = 0, falling = false }, 0, false
+    for i = 1, 600 do -- 10 s of pacing, always registering as "going"
         p2.x = 286 + 10 * math.sin(i * 0.3)
         p2.vx = 300 * ((i % 2 == 0) and 1 or -1)
         now2 = now2 + 1 / 60
         M.follow(her2, p2, 1 / 60, now2, nil, sweep)
         if her2.x > -20 and her2.x < 20 then entered_wall = true end
-        if (her2.stuck_teleports or 0) > 0 and rescued_frame == nil then rescued_frame = i end
     end
-    check(not entered_wall, "review fix: wedged near her spot while he paces - she never enters the wall")
-    check(rescued_frame ~= nil and rescued_frame / 60 < M.STUCK_SECONDS + 1, string.format("review fix: wedged near her spot while he paces - rescued within STUCK_SECONDS + 1 s (%s frames)", tostring(rescued_frame)))
+    check(not entered_wall, "review fix: wedged within STUCK_DISTANCE of her spot while he paces - she never enters the wall")
+    check((her2.stuck_teleports or 0) == 0, string.format("review fix: wedged within STUCK_DISTANCE of her spot - the documented limitation holds, never teleported for it (stuck_teleports %s)", tostring(her2.stuck_teleports)))
+
+    -- (c) the round-2 defect itself: a 16 cm/s creep, cleanly SLIDING AROUND a small (40x40 cm) pillar sitting
+    -- at her trailing spot - the round-1 gate ("any try_move failed this frame") teleported her twice in 20 s
+    -- here, because it did not care whether the stall was a genuine wedge or a few ordinary slide-negotiation
+    -- frames on an otherwise-fine detour. She starts already negotiating the pillar (placed, not swept-placed
+    -- into it); 20 s of creeping past it must give zero stuck teleports.
+    local sweep3 = box_sweep({ { 100, 70, 140, 110 } }, M.SWEEP_RADIUS)
+    local her3 = { placed = true, x = 60, y = 90, z = 0, yaw = 90, v = 0 }
+    local p3, now3 = { x = 200, y = 0, z = 0, yaw = 0, vx = 16, vy = 0, falling = false }, 0
+    local any_blocked3 = false
+    for _ = 1, 1200 do -- 20 s
+        p3.x = p3.x + 16 / 60
+        now3 = now3 + 1 / 60
+        M.follow(her3, p3, 1 / 60, now3, nil, sweep3)
+        if her3.collide_blocked then any_blocked3 = true end
+    end
+    check(any_blocked3, "review fix: the pillar creep actually negotiates a block (the test exercises the defect)")
+    check((her3.stuck_teleports or 0) == 0, string.format("review fix: a 16 cm/s creep sliding cleanly around a small pillar - zero stuck teleports (stuck_teleports %s)", tostring(her3.stuck_teleports)))
 end
 
 do
