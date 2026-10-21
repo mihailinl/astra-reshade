@@ -942,6 +942,21 @@ static void test_pretone_rules()
 		CHECK(!fb.given_up && first_drawn == 32000);
 	}
 
+	// below the presented size only the MAIN view's tonemapper is drawn into: its scene colour on the grid of the depth
+	// buffer ReShade's depth add-on picked - never a scene capture's own tonemap at the view's aspect
+	{
+		passfind::Tex main_scene;
+		main_scene.w = 384;
+		main_scene.h = 220;
+		passfind::Tex capture = main_scene;
+		capture.w = 640;
+		capture.h = 360;
+		CHECK(passfind::main_view_grid(main_scene, 384, 220));  // Poppy Playtime: both 384x220 around a 384x217 image
+		CHECK(!passfind::main_view_grid(capture, 384, 220));    // an in-game monitor at 640x360: not the main view
+		CHECK(!passfind::main_view_grid(main_scene, 0, 0));     // no depth buffer known yet: not drawn into
+		CHECK(!passfind::main_view_grid(main_scene, 768, 436)); // a depth buffer of another size: not this view's
+	}
+
 	// a sub-resolution tonemapper (passfind.h) is drawn into only once its viewport has held for kStable found frames
 	// running; a different size restarts the count; after kMaxChanges changes in a session, dynamic resolution gives
 	// up for the rest of it. The presented size itself needs none of this.
@@ -961,7 +976,20 @@ static void test_pretone_rules()
 		bool ever_ready = false;
 		for (int frame = 0; frame < 200; ++frame)
 			ever_ready = ever_ready || flap.ready(frame % 2 == 0 ? 384u : 400u, 217, 1280, 720);
-		CHECK(!ever_ready && flap.given_up); // a size that never repeats never reaches kStable, and gives up besides
+		CHECK(!ever_ready && !flap.given_up); // two sizes every other frame never reach kStable - but are only two sizes
+
+		// a game going back and forth between two FIXED sizes (its menu and its levels): drawn into in every long
+		// stretch, never given up - only a size never met before counts towards kMaxChanges
+		pretone_rules::Stability menus;
+		int stretches_ready = 0;
+		for (int stretch = 0; stretch < 8; ++stretch)
+		{
+			bool ready = false;
+			for (int frame = 0; frame < 100; ++frame)
+				ready = menus.ready(stretch % 2 == 0 ? 384u : 768u, stretch % 2 == 0 ? 217u : 432u, 2560, 1440) || ready;
+			stretches_ready += ready;
+		}
+		CHECK(stretches_ready == 8 && !menus.given_up);
 
 		pretone_rules::Stability changes;
 		for (uint32_t w = 300; w <= 300 + uint32_t(pretone_rules::Stability::kMaxChanges); ++w)
@@ -1649,7 +1677,7 @@ static void test_her_edge()
 	// AstraHdr is on and it was actually measured this run (0, 0): everywhere else (Present) the knob alone decides
 	const std::string eff = body("float2 EffectiveDepthUvScale()");
 	CHECK(std::regex_search(eff, std::regex(R"(const float2 auto_scale = AstraDepthScaleAuto;)")));
-	CHECK(std::regex_search(eff, std::regex(R"(return \(AstraHdr && auto_scale\.x > 0\.0 && auto_scale\.y > 0\.0\) \? auto_scale : DepthUvScale;)")));
+	CHECK(std::regex_search(eff, std::regex(R"(return \(AstraHdr && auto_scale\.x > 0\.0 && auto_scale\.y > 0\.0\) \? min\(auto_scale, 1\.0\) : DepthUvScale;)")));
 	const std::string gd = body("float game_depth(float2 uv)");
 	CHECK(std::regex_search(gd, std::regex(R"(uv \* EffectiveDepthUvScale\(\))")));
 }

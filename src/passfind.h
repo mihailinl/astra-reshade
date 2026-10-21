@@ -167,6 +167,16 @@ namespace passfind
 		return std::abs(a - b) <= 0.01 * b;
 	}
 
+	/// A tonemapper BELOW the presented size is the main view's only when its scene colour is on the grid of the
+	/// depth buffer ReShade's depth add-on picked: Unreal sizes the main view's scene colour and depth from one extent
+	/// (Poppy Playtime: both 384x220 around a 384x217 image), while a scene capture's own tonemap (an in-game camera,
+	/// a monitor, at the view's aspect) reads a scene colour of the capture's size. No depth buffer known (0x0): not
+	/// the main view's - she stays at Present until one is.
+	inline bool main_view_grid(const Tex &scene, uint32_t depth_w, uint32_t depth_h)
+	{
+		return depth_w != 0 && depth_h != 0 && scene.w == depth_w && scene.h == depth_h;
+	}
+
 	/// Of what the draw reads, its scene colour: the first HDR texture of the target's size (none: not a tonemapper -
 	/// a UI quad, a copy, a fade). `ambiguous` is set when it reads more than one.
 	inline Tex scene_read(const Tracker &t, const Tex *reads, size_t n, bool *ambiguous = nullptr)

@@ -116,8 +116,10 @@ namespace pretone_rules
 		static constexpr int kMaxChanges = 3;
 		uint32_t w = 0, h = 0; // the sub-resolution size counted so far (meaningless until have_size)
 		uint32_t count = 0;    // consecutive found frames of that size
-		int changes = 0;       // how many times the size has changed this session (the first size is not a change)
+		int changes = 0;       // how many NEW sizes have followed the first this session (a size seen before is not one)
 		bool have_size = false, given_up = false;
+		uint32_t seen_w[kMaxChanges + 1] = {}, seen_h[kMaxChanges + 1] = {}; // the distinct sizes met so far
+		int seen = 0;
 
 		/// A tonemapper found this frame, with viewport (vp_w, vp_h) into a target sized for the presented picture
 		/// (out_w, out_h) exactly or below it. True: drawn into.
@@ -129,8 +131,22 @@ namespace pretone_rules
 				return false;
 			if (!have_size || vp_w != w || vp_h != h)
 			{
-				if (have_size && ++changes >= kMaxChanges)
-					given_up = true;
+				// a game going back and forth between two fixed sizes (its menu and its levels, windowed and
+				// fullscreen) is not dynamic resolution: only a size never met before counts
+				bool known = false;
+				for (int i = 0; i < seen; ++i)
+					known = known || (seen_w[i] == vp_w && seen_h[i] == vp_h);
+				if (!known)
+				{
+					if (seen < kMaxChanges + 1)
+					{
+						seen_w[seen] = vp_w;
+						seen_h[seen] = vp_h;
+						++seen;
+					}
+					if (have_size && ++changes >= kMaxChanges)
+						given_up = true;
+				}
 				have_size = true;
 				w = vp_w;
 				h = vp_h;

@@ -23,6 +23,8 @@ namespace layer
 	/// pretone may draw her pass before the tonemapper (an Unreal game): only then is the tone table made - on the
 	/// present thread, the next time the effects run there. Elsewhere nothing of it exists.
 	void set_tone_wanted(bool wanted);
+	/// The depth buffer ReShade's depth add-on had bound at the last run of the effects (false: none yet). Any thread.
+	bool depth_size(uint32_t &w, uint32_t &h);
 	/// The tone table exists: her pass before the tonemapper waits for it.
 	bool tone_ready();
 	/// [tone] Exposure: her brightness in the game's scene, before its tone curve (1: as her engine drew her).

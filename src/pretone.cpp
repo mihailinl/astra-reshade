@@ -8,6 +8,7 @@
 #include <d3d11.h>
 #include <d3d12.h>
 #include <algorithm>
+#include <iterator>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -148,7 +149,7 @@ namespace pretone
 			g_deferred{0};
 		std::atomic<uint32_t> g_api{0}; // the device_api of the tonemapper pass last driven (0: none yet)
 		ULONGLONG g_nextStats = 0;
-		bool g_loggedFound = false, g_loggedAmbiguous = false, g_loggedCompute = false, g_loggedHdr = false, g_loggedNone = false, g_loggedApi = false,
+		bool g_loggedFound = false, g_loggedNotMain = false, g_loggedAmbiguous = false, g_loggedCompute = false, g_loggedHdr = false, g_loggedNone = false, g_loggedApi = false,
 			 g_loggedFail = false, g_loggedHold = false, g_loggedGiveUp = false, g_loggedDeferred = false, g_loggedResChanges = false;
 		char g_status[260] = "drawn at presentation (over the game's UI): no frame yet";
 
@@ -835,9 +836,10 @@ namespace pretone
 			static constexpr UINT kVb = D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT;
 			static constexpr UINT kViewport = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
 			static constexpr UINT kRtv = D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT;
-			// the base interface's shared RTV/UAV register count (8); a Direct3D 11.1 context's extra CS UAV slots
-			// (up to D3D11_1_UAV_SLOT_COUNT = 64) are not saved or restored - UNVERIFIED beyond slot 8.
+			// OM UAVs: the base interface's shared RTV/UAV register count (8). CS UAVs: as many as the device's feature
+			// level has (64 at 11_1, 8 at 11_0, 1 below) - the same counts ReShade's own D3D11 state block saves.
 			static constexpr UINT kUav = D3D11_PS_CS_UAV_REGISTER_COUNT;
+			static constexpr UINT kCsUav = D3D11_1_UAV_SLOT_COUNT;
 			static constexpr UINT kCb = D3D11StageState<ID3D11VertexShader>::kCb;
 			static constexpr UINT kSrv = D3D11StageState<ID3D11VertexShader>::kSrv;
 			static constexpr UINT kSampler = D3D11StageState<ID3D11VertexShader>::kSampler;
@@ -863,7 +865,8 @@ namespace pretone
 			ID3D11Buffer *cs_cb[kCb] = {};
 			ID3D11ShaderResourceView *cs_srv[kSrv] = {};
 			ID3D11SamplerState *cs_sampler[kSampler] = {};
-			ID3D11UnorderedAccessView *cs_uav[kUav] = {};
+			ID3D11UnorderedAccessView *cs_uav[kCsUav] = {};
+			UINT cs_uav_count = kUav; // what this device's feature level binds (d3d11_capture)
 
 			ID3D11RasterizerState *rs_state = nullptr;
 			UINT viewport_count = kViewport;
@@ -942,7 +945,17 @@ namespace pretone
 			ctx->CSGetConstantBuffers(0, D3D11Snapshot::kCb, s.cs_cb);
 			ctx->CSGetShaderResources(0, D3D11Snapshot::kSrv, s.cs_srv);
 			ctx->CSGetSamplers(0, D3D11Snapshot::kSampler, s.cs_sampler);
-			ctx->CSGetUnorderedAccessViews(0, D3D11Snapshot::kUav, s.cs_uav);
+			{
+				ID3D11Device *dev11 = nullptr;
+				ctx->GetDevice(&dev11);
+				const D3D_FEATURE_LEVEL fl = dev11 != nullptr ? dev11->GetFeatureLevel() : D3D_FEATURE_LEVEL_11_0;
+				if (dev11 != nullptr)
+					dev11->Release();
+				s.cs_uav_count = fl >= D3D_FEATURE_LEVEL_11_1 ? D3D11Snapshot::kCsUav
+					: fl == D3D_FEATURE_LEVEL_11_0				 ? D3D11_PS_CS_UAV_REGISTER_COUNT
+																 : D3D11_CS_4_X_UAV_REGISTER_COUNT;
+			}
+			ctx->CSGetUnorderedAccessViews(0, s.cs_uav_count, s.cs_uav);
 			ctx->RSGetState(&s.rs_state);
 			s.viewport_count = D3D11Snapshot::kViewport;
 			ctx->RSGetViewports(&s.viewport_count, s.viewports);
@@ -972,15 +985,23 @@ namespace pretone
 			ctx->CSSetConstantBuffers(0, D3D11Snapshot::kCb, s.cs_cb);
 			ctx->CSSetShaderResources(0, D3D11Snapshot::kSrv, s.cs_srv);
 			ctx->CSSetSamplers(0, D3D11Snapshot::kSampler, s.cs_sampler);
-			ctx->CSSetUnorderedAccessViews(0, D3D11Snapshot::kUav, s.cs_uav, nullptr);
+			UINT keep_counts[D3D11Snapshot::kCsUav];
+			std::fill(std::begin(keep_counts), std::end(keep_counts), UINT(-1)); // append/consume counters kept as they are
+			ctx->CSSetUnorderedAccessViews(0, s.cs_uav_count, s.cs_uav, keep_counts);
 			ctx->RSSetState(s.rs_state);
 			ctx->RSSetViewports(s.viewport_count, s.viewports);
 			ctx->RSSetScissorRects(s.scissor_count, s.scissors);
-			// the same two-call split as the capture: RTV/DSV first (keeping whatever UAVs are bound right now),
-			// then the UAVs (keeping the RTV/DSV just set).
-			ctx->OMSetRenderTargetsAndUnorderedAccessViews(D3D11Snapshot::kRtv, s.rtv, s.dsv, 0, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, nullptr, nullptr);
-			ctx->OMSetRenderTargetsAndUnorderedAccessViews(
-				D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, 0, D3D11Snapshot::kUav, s.om_uav, nullptr);
+			// RTV/DSV as ReShade's own state block puts them back. The OM UAVs (none in a tonemapper, and no ReShade
+			// effect binds one) only if the game had any: from the first bound one - always past the bound RTVs, since
+			// the capture read slots an RTV holds as empty - so the call can never overlap (and unbind) a render target.
+			ctx->OMSetRenderTargets(D3D11Snapshot::kRtv, s.rtv, s.dsv);
+			UINT first_uav = D3D11Snapshot::kUav;
+			for (UINT i = 0; i < D3D11Snapshot::kUav && first_uav == D3D11Snapshot::kUav; ++i)
+				if (s.om_uav[i] != nullptr)
+					first_uav = i;
+			if (first_uav < D3D11Snapshot::kUav)
+				ctx->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, first_uav,
+					D3D11Snapshot::kUav - first_uav, s.om_uav + first_uav, keep_counts);
 			ctx->OMSetBlendState(s.blend_state, s.blend_factor, s.sample_mask);
 			ctx->OMSetDepthStencilState(s.depth_state, s.stencil_ref);
 		}
@@ -1222,7 +1243,29 @@ namespace pretone
 					passfind::near_presented_size(s->find.target.w, s->find.target.h, g_outW, g_outH) ? 1 : 0);
 				trace_pass(cmd, what, reads, n, scene.id != 0 ? "THE TONEMAPPER" : shape ? "full-screen, no HDR input" : "-");
 			}
-			if (scene.id == 0 || g_foundAt.exchange(g_presents.load()) == g_presents.load())
+			if (scene.id == 0)
+				return false;
+			// below the presented size, the shape alone would also take a scene capture's own tonemap (an in-game
+			// camera, a monitor, at the view's aspect): only the MAIN view's is drawn into - the one whose scene colour
+			// is on the grid of the depth buffer ReShade's depth add-on picked (Unreal sizes both from one extent).
+			// Checked BEFORE the frame's tonemapper is claimed, so a capture recorded first never hides the real one.
+			if (!passfind::presented_size(s->find.target.w, s->find.target.h, g_outW, g_outH))
+			{
+				uint32_t dw = 0, dh = 0;
+				const bool have_depth = layer::depth_size(dw, dh);
+				if (!passfind::main_view_grid(scene, have_depth ? dw : 0, have_depth ? dh : 0))
+				{
+					if (!g_loggedNotMain)
+					{
+						g_loggedNotMain = true;
+						logf("pretone: a tonemapper below the presented size reads a %ux%u scene colour, but the depth buffer is %ux%u: "
+							 "not the main view (a scene capture?) - not drawn into",
+							scene.w, scene.h, dw, dh);
+					}
+					return false;
+				}
+			}
+			if (g_foundAt.exchange(g_presents.load()) == g_presents.load())
 				return false;
 			if (ambiguous && !g_loggedAmbiguous)
 			{

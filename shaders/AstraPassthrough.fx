@@ -328,7 +328,7 @@ float host_linear(float d)
 float2 EffectiveDepthUvScale()
 {
 	const float2 auto_scale = AstraDepthScaleAuto;
-	return (AstraHdr && auto_scale.x > 0.0 && auto_scale.y > 0.0) ? auto_scale : DepthUvScale;
+	return (AstraHdr && auto_scale.x > 0.0 && auto_scale.y > 0.0) ? min(auto_scale, 1.0) : DepthUvScale;
 }
 
 float game_depth(float2 uv)
