@@ -1037,7 +1037,8 @@ local function nav_update(pawn, fx, fy, fz, tx, ty, tz, now)
         navsys = found
     end
     local ok, path = pcall(function()
-        return navsys:FindPathToLocationSynchronously(pawn, { X = fx, Y = fy, Z = fz }, { X = tx, Y = ty, Z = tz })
+        -- all FIVE parameters (UE4SS checks the arity): no pathfinding context actor, the default filter class
+        return navsys:FindPathToLocationSynchronously(pawn, { X = fx, Y = fy, Z = fz }, { X = tx, Y = ty, Z = tz }, nil, nil)
     end)
     if not ok then
         nav_broken = true

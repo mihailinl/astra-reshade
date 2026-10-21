@@ -635,7 +635,12 @@ function make_world(opts)
     -- NavMesh would). w.nav_partial: IsPartial() answers true (a path that doesn't actually reach the goal).
     -- w.nav_calls: how many times FindPathToLocationSynchronously was actually invoked.
     local navsys = object({
-        FindPathToLocationSynchronously = function(_, context, from, to)
+        -- UE4SS checks a UFunction's arity: FindPathToLocationSynchronously takes FIVE (WorldContextObject, PathStart,
+        -- PathEnd, PathfindingContext, FilterClass) - a live Mecha Chameleon run, 2026-10-21: "UFunction expected 5
+        -- parameters, received 3" when the last two were left out
+        FindPathToLocationSynchronously = function(_, ...)
+            local n = select('#', ...)
+            if n ~= 5 then error(string.format("[UFunction::setup_metamethods -> __call] UFunction expected 5 parameters, received %d", n)) end
             w.nav_calls = (w.nav_calls or 0) + 1
             return { PathPoints = w.nav_points,
                 IsValid = function() return w.nav_points ~= nil end,
