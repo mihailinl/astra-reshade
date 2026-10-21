@@ -1937,8 +1937,23 @@ do
     M.update_ground(s3, p3, 0, pit_with_floor, true)
     check(not near(s3.ground, 75, 1), string.format("OBJECT_BAND continuity: a crate at a pit's edge, a floor at his level between them - she does not stand on the crate (ground %s)", tostring(s3.ground)))
 
+    -- (iii-b) the PURE void case (review round 4: round 3 reopened it): a crate at a pit's edge, nothing under it
+    -- and nothing at the midpoint either (the pit), him down in the pit - she must not stand on the crate.
+    local function pit_with_crate(x, y, from, to)
+        local best
+        if from >= to then
+            if (x < 150 or x > 400) and 0 <= from and 0 >= to then best = 0 end -- the floor outside the pit
+            if x >= 150 and x <= 250 and 75 <= from and 75 >= to and (best == nil or 75 > best) then best = 75 end
+        end
+        return best
+    end
+    local s6, p6 = { x = 200, y = 0, z = 75, trace = {} }, { x = 320, y = 0, z = -90, falling = false }
+    M.update_ground(s6, p6, 0, pit_with_crate, true)
+    check(not near(s6.ground, 75, 1), string.format("OBJECT_BAND continuity: a crate over a pure void, him in the pit - she does not stand on the crate (ground %s)", tostring(s6.ground)))
+
     -- (iv) a balcony reached by stairs NOT on the straight line to the player - the midpoint along that
-    -- straight line is open air (nil), never evidence of anything: she keeps the balcony height.
+    -- straight line is open air (nil): the ambiguous case, and the POLICY is that she stays on HIS floor, not the
+    -- balcony (a modest companion, never one on a floating crate - main.lua's comment).
     local function balcony_offline(x, y, from, to)
         if from >= to then
             if x >= 0 and x <= 50 and y >= 0 and y <= 50 and 75 <= from and 75 >= to then return 75 end -- the balcony
@@ -1948,7 +1963,7 @@ do
     end
     local s4, p4 = { x = 25, y = 25, z = 75, trace = {} }, { x = 200, y = 200, z = 0, falling = false }
     M.update_ground(s4, p4, 0, balcony_offline, true)
-    check(near(s4.ground, 75, 1), string.format("OBJECT_BAND continuity: a balcony off the straight-line stairs - she keeps the balcony height (ground %s)", tostring(s4.ground)))
+    check(not near(s4.ground, 75, 1), string.format("OBJECT_BAND continuity: a balcony off the straight-line stairs - unclear, she stays on his floor (ground %s)", tostring(s4.ground)))
 
     -- (v) him airborne (or on a ladder) over the SAME "clear evidence" geometry as (iii) - even a floor
     -- reading right at his height must not count while p.z is not a floor height at all: she keeps z.

@@ -361,21 +361,19 @@ function M.update_ground(s, p, now, ground, force)
                 -- the retrace found nothing - but a single downward ray cannot tell a continuous slope (keep
                 -- z) from an isolated object sitting over a void (a crate at a pit's edge, him down in the
                 -- pit: the SAME "nothing lower" reading, for the opposite reason - review finding). CONSERVATIVE
-                -- (round 3 - comparing to the midpoint of the two heights also discarded a legitimate elevated
-                -- floor: a balcony reached by stairs NOT on the straight line to the player, where the midpoint
-                -- is open air, and a player who is airborne or on a ladder, where p.z is not a floor height at
-                -- all): discard z ONLY on CLEAR evidence of an object - he is not falling/airborne, AND the
-                -- midpoint between her and him actually finds a surface, AND that surface reads within
-                -- M.OBJECT_CONTINUITY of HIS OWN height (p.z, not the average) - a floor at his level right
-                -- beside her raised surface, exactly what an isolated object over it looks like. Every other
-                -- case (the midpoint finds nothing - open air; him falling; the midpoint reads somewhere else
-                -- entirely) keeps z - a slope, a balcony off the straight line, or simply not enough evidence
-                -- either way default to the surface she is already standing on, never a mid-air guess.
+                -- One more ray, at the midpoint between her and him: a CONTINUOUS slope reads there somewhere
+                -- between their heights - keep z. A floor at HIS level beside her raised surface is an object -
+                -- discard. Open air there (nothing found) is the ambiguous case a single ray cannot settle: an
+                -- object over a void (a crate at a pit's edge) or a balcony whose stairs are off this straight
+                -- line read the same. The POLICY (the owner's companion, review round 4): when it is unclear,
+                -- she stays on HIS floor - a companion beside him never looks broken; one standing on a crate
+                -- over a pit does; one not following him onto a balcony is merely modest. While he is falling or
+                -- airborne (a jump, a ladder) p.z is no floor height at all: no verdict, keep z.
                 if not p.falling then
                     local midx, midy = (s.x + p.x) / 2, (s.y + p.y) / 2
                     local mid_z = ground(midx, midy, math.max(s.z, p.z) + M.TRACE_UP, bottom)
-                    if mid_z ~= nil and math.abs(mid_z - p.z) <= M.OBJECT_CONTINUITY then
-                        z = nil -- clear evidence of a floor at his level: an object, not a slope/balcony
+                    if mid_z == nil or math.abs(mid_z - p.z) <= M.OBJECT_CONTINUITY then
+                        z = nil -- an object (or, unclear, the safe side): not her floor
                         g.objects = (g.objects or 0) + 1
                     end
                 end
