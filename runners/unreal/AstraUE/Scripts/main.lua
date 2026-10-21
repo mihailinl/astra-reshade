@@ -90,12 +90,16 @@ M.OBJECT_BAND = M.STEP_UP       -- ...and even then, only if the PLAYER's own fe
                                  -- walking path and a forced teleport - a teleport landing over furniture was
                                  -- accepted completely unconditionally before this (UNVERIFIED tuning: reusing
                                  -- STEP_UP's number for symmetry, not measured against real game furniture).
-M.OBJECT_CONTINUITY = 25.0      -- a ray alone cannot tell a continuous slope (keep the surface it found) from
-                                 -- an isolated object sitting over a void (a crate at a pit's edge, him down
-                                 -- in the pit - the SAME "nothing lower" reading as a slope, for the opposite
-                                 -- reason - review finding): the ground at the MIDPOINT between her and the
-                                 -- player must read within this of the midpoint of their two heights, or it
-                                 -- is an object, not a slope (M.update_ground's own continuity check)
+M.OBJECT_CONTINUITY = 25.0      -- a ray alone cannot tell a continuous slope/balcony (keep the surface it
+                                 -- found) from an isolated object over a void (a crate at a pit's edge, him
+                                 -- down in the pit - the SAME "nothing lower" reading, for the opposite
+                                 -- reason - review finding): CONSERVATIVE (round 3) - discard z only when the
+                                 -- player is not falling AND the ground at the MIDPOINT between her and him
+                                 -- actually finds a surface AND that surface reads within this of HIS OWN
+                                 -- height (p.z, not the average of theirs) - clear evidence of a floor at his
+                                 -- level right beside her raised one. Every other case (the midpoint finds
+                                 -- nothing - a balcony off the straight-line stairs; him airborne/on a ladder;
+                                 -- anything else) keeps z (M.update_ground's own continuity check)
 M.GROUND_KEEP = 1.0             -- a trace that misses keeps the last ground this long, then the player's
 M.TRACE_CHANNEL = 0             -- ETraceTypeQuery: 0 = TraceTypeQuery1, the Visibility channel in every UE game
 
@@ -356,16 +360,25 @@ function M.update_ground(s, p, now, ground, force)
             else
                 -- the retrace found nothing - but a single downward ray cannot tell a continuous slope (keep
                 -- z) from an isolated object sitting over a void (a crate at a pit's edge, him down in the
-                -- pit: the SAME "nothing lower" reading, for the opposite reason - review finding). A
-                -- continuity check: a real slope's height varies smoothly, so the ground at the MIDPOINT
-                -- between her and the player should read close to the midpoint of their two heights; an
-                -- object over a void does not - there is nothing continuous to find there at all.
-                local midx, midy = (s.x + p.x) / 2, (s.y + p.y) / 2
-                local mid_z = ground(midx, midy, math.max(s.z, p.z) + M.TRACE_UP, bottom)
-                if mid_z == nil or math.abs(mid_z - (p.z + z) / 2) > M.OBJECT_CONTINUITY then
-                    z = nil -- an object over a void: no floor here (the pre-fe33078 behaviour)
-                    g.objects = (g.objects or 0) + 1
-                end -- else: a continuous slope after all - keep z, same as fe33078's own slope case
+                -- pit: the SAME "nothing lower" reading, for the opposite reason - review finding). CONSERVATIVE
+                -- (round 3 - comparing to the midpoint of the two heights also discarded a legitimate elevated
+                -- floor: a balcony reached by stairs NOT on the straight line to the player, where the midpoint
+                -- is open air, and a player who is airborne or on a ladder, where p.z is not a floor height at
+                -- all): discard z ONLY on CLEAR evidence of an object - he is not falling/airborne, AND the
+                -- midpoint between her and him actually finds a surface, AND that surface reads within
+                -- M.OBJECT_CONTINUITY of HIS OWN height (p.z, not the average) - a floor at his level right
+                -- beside her raised surface, exactly what an isolated object over it looks like. Every other
+                -- case (the midpoint finds nothing - open air; him falling; the midpoint reads somewhere else
+                -- entirely) keeps z - a slope, a balcony off the straight line, or simply not enough evidence
+                -- either way default to the surface she is already standing on, never a mid-air guess.
+                if not p.falling then
+                    local midx, midy = (s.x + p.x) / 2, (s.y + p.y) / 2
+                    local mid_z = ground(midx, midy, math.max(s.z, p.z) + M.TRACE_UP, bottom)
+                    if mid_z ~= nil and math.abs(mid_z - p.z) <= M.OBJECT_CONTINUITY then
+                        z = nil -- clear evidence of a floor at his level: an object, not a slope/balcony
+                        g.objects = (g.objects or 0) + 1
+                    end
+                end
             end
         end
         g.at, g.x, g.y, g.traces = now, s.x, s.y, (g.traces or 0) + 1

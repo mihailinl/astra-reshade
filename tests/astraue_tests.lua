@@ -1881,15 +1881,19 @@ do
 end
 
 do
-    -- review fix (S), round 2: M.OBJECT_BAND's keep-z (fe33078) cannot tell a continuous slope from an
-    -- isolated object sitting over a VOID - "nothing lower found" reads the same for both. Added a
-    -- continuity check (M.OBJECT_CONTINUITY): the ground at the MIDPOINT between her and the player should
-    -- read close to the midpoint of their two heights for a real slope; an object over a void has nothing
-    -- continuous there at all. M.update_ground is called directly here (not through M.follow) to isolate the
-    -- ground logic from the placement cascade's own spot math.
+    -- review fix (S), round 2, made CONSERVATIVE in round 3: M.OBJECT_BAND's keep-z (fe33078) cannot tell a
+    -- continuous slope/balcony from an isolated object over a void - "nothing lower found" reads the same
+    -- for both. Round 2's continuity check (comparing the midpoint to the AVERAGE of her and his heights)
+    -- discarded two legitimate cases too eagerly: a balcony reached by stairs NOT on the straight line to the
+    -- player (the midpoint over the straight line is open air, so it finds nothing - never evidence of
+    -- anything) and a player who is airborne or on a ladder (p.z is not a floor height at all there). Round 3:
+    -- discard z ONLY on CLEAR evidence - he is not falling AND the midpoint actually finds a surface AND that
+    -- surface reads within M.OBJECT_CONTINUITY of HIS OWN height (p.z, not the average) - a floor at his
+    -- level right beside her raised one. Every other case keeps z. M.update_ground is called directly here
+    -- (not through M.follow) to isolate the ground logic from the placement cascade's own spot math.
 
-    -- (i) the slope still stands at 54 cm (fe33078's own case, unaffected: the midpoint of a smooth slope
-    -- reads exactly where it should).
+    -- (i) the slope still stands at 54 cm (fe33078's own case, unaffected: the slope's midpoint reads neither
+    -- nil nor close to p.z, so it never qualifies as "clear evidence").
     local function slope(x, y, from, to)
         local h = 0.6 * y
         if from >= to then
@@ -1899,7 +1903,7 @@ do
         end
         return nil
     end
-    local s1, p1 = { x = 0, y = 90, z = 54, trace = {} }, { x = 0, y = 0, z = 0 }
+    local s1, p1 = { x = 0, y = 90, z = 54, trace = {} }, { x = 0, y = 0, z = 0, falling = false }
     M.update_ground(s1, p1, 0, slope, true)
     check(near(s1.ground, 54, 1), string.format("OBJECT_BAND continuity: a slope still stands at 54 cm (ground %s)", tostring(s1.ground)))
 
@@ -1913,24 +1917,44 @@ do
         end
         return best
     end
-    local s2, p2 = { x = 200, y = 0, z = 75, trace = {} }, { x = 0, y = 0, z = 0 }
+    local s2, p2 = { x = 200, y = 0, z = 75, trace = {} }, { x = 0, y = 0, z = 0, falling = false }
     M.update_ground(s2, p2, 0, crate_over_floor, true)
     check(near(s2.ground, 0, 0.5), string.format("OBJECT_BAND continuity: a crate over a floor still gives 0 (ground %s)", tostring(s2.ground)))
 
-    -- (iii) a crate at a PIT's edge, him 90 cm below (no floor at all under the crate OR in the pit between
-    -- them) - the retrace finds nothing (same as the slope), but the midpoint ALSO finds nothing: not
-    -- continuous, so it is treated as an object, not a slope - she must not stand on the crate.
-    local function pit_with_crate(x, y, from, to)
+    -- (iii) a crate at a pit's edge WITH a floor at HIS OWN level somewhere between them (the clear-evidence
+    -- case) - the retrace at HER position finds nothing (no floor under the crate itself), but the midpoint
+    -- between her and him finds the pit floor, at his own height: an object, not a slope - she must not
+    -- stand on the crate.
+    local function pit_with_floor(x, y, from, to)
         local best
         if from >= to then
-            if not (x >= 150 and x <= 400) and 0 <= from and 0 >= to then best = 0 end -- floor, outside the pit
+            if x >= 250 and x <= 400 and -90 <= from and -90 >= to then best = -90 end -- the pit floor (not under the crate)
             if x >= 150 and x <= 250 and 75 <= from and 75 >= to and (best == nil or 75 > best) then best = 75 end
         end
         return best
     end
-    local s3, p3 = { x = 200, y = 0, z = 75, trace = {} }, { x = 320, y = 0, z = -90 }
-    M.update_ground(s3, p3, 0, pit_with_crate, true)
-    check(not near(s3.ground, 75, 1), string.format("OBJECT_BAND continuity: a crate at a pit's edge - she does not stand on the crate (ground %s)", tostring(s3.ground)))
+    local s3, p3 = { x = 200, y = 0, z = 75, trace = {} }, { x = 320, y = 0, z = -90, falling = false }
+    M.update_ground(s3, p3, 0, pit_with_floor, true)
+    check(not near(s3.ground, 75, 1), string.format("OBJECT_BAND continuity: a crate at a pit's edge, a floor at his level between them - she does not stand on the crate (ground %s)", tostring(s3.ground)))
+
+    -- (iv) a balcony reached by stairs NOT on the straight line to the player - the midpoint along that
+    -- straight line is open air (nil), never evidence of anything: she keeps the balcony height.
+    local function balcony_offline(x, y, from, to)
+        if from >= to then
+            if x >= 0 and x <= 50 and y >= 0 and y <= 50 and 75 <= from and 75 >= to then return 75 end -- the balcony
+            if x >= 150 and x <= 250 and y >= 150 and y <= 250 and 0 <= from and 0 >= to then return 0 end -- the ground, near the (off-line) stairs
+        end
+        return nil
+    end
+    local s4, p4 = { x = 25, y = 25, z = 75, trace = {} }, { x = 200, y = 200, z = 0, falling = false }
+    M.update_ground(s4, p4, 0, balcony_offline, true)
+    check(near(s4.ground, 75, 1), string.format("OBJECT_BAND continuity: a balcony off the straight-line stairs - she keeps the balcony height (ground %s)", tostring(s4.ground)))
+
+    -- (v) him airborne (or on a ladder) over the SAME "clear evidence" geometry as (iii) - even a floor
+    -- reading right at his height must not count while p.z is not a floor height at all: she keeps z.
+    local s5, p5 = { x = 200, y = 0, z = 75, trace = {} }, { x = 320, y = 0, z = -90, falling = true }
+    M.update_ground(s5, p5, 0, pit_with_floor, true)
+    check(near(s5.ground, 75, 1), string.format("OBJECT_BAND continuity: him airborne - she keeps z (ground %s)", tostring(s5.ground)))
 end
 
 do
