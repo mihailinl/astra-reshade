@@ -631,12 +631,15 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
         -- near_player (review finding, round 2: the old code then fell back to his EXACT position - inside
         -- his own capsule, or inside the camera in a tight first-person room), keep the best PARTIAL result
         -- among the five instead - whichever reached the most free distance - provided that clears at least
-        -- her own body (M.SWEEP_RADIUS); never his exact (p.x, p.y). If even the best partial result is
-        -- tighter than that and she already had a position, stay there rather than move into something worse
-        -- - only a first placement (nothing to stay at yet) takes the best point anyway.
+        -- her own body (M.SWEEP_RADIUS); never his exact (p.x, p.y). Round 3: the best partial result is used
+        -- for a RE-placement too, never "stay put" - staying put in a tight room, re-entered every time the
+        -- stuck timer fires (~every M.STUCK_SECONDS), froze her for the whole session, since "stay put" also
+        -- reset the stuck bookkeeping and counted a teleport each time, as if real progress had happened. If
+        -- even the best candidate is under 1 cm free (so close to his exact position that using it outright
+        -- would be indistinguishable from the forbidden p.x, p.y), it is offset by exactly 1 cm along that
+        -- candidate's own direction instead - still never his exact position, but always SOME movement.
         local near_player = M.NEAR_PLAYER * dscale
         local beside = near_player + M.SWEEP_RADIUS
-        local was_placed = s.placed
         local candidates = {
             { tx, ty },                                             -- her real spot
             { p.x - fx * back - rx * side, p.y - fy * back - ry * side }, -- the mirror: the other side of him
@@ -645,34 +648,44 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
             { p.x - fx * beside, p.y - fy * beside },               -- directly behind him
         }
         local px2, py2, ok = nil, nil, false
-        local best_x, best_y, best_free = nil, nil, -1
+        local best_x, best_y, best_free, best_ux, best_uy = nil, nil, -1, nil, nil
         for _, c in ipairs(candidates) do
             local x, y, cok, free = sweep_place(p.x, p.y, c[1], c[2], sweep, near_player)
-            if free > best_free then best_x, best_y, best_free = x, y, free end
+            if free > best_free then
+                best_x, best_y, best_free = x, y, free
+                local cdx, cdy = c[1] - p.x, c[2] - p.y
+                local cdist = math.sqrt(cdx * cdx + cdy * cdy)
+                if cdist > 1e-3 then best_ux, best_uy = cdx / cdist, cdy / cdist end
+            end
             if cok then
                 px2, py2, ok = x, y, true
                 break
             end
         end
         if not ok then
-            if best_free >= M.SWEEP_RADIUS then
-                px2, py2 = best_x, best_y
-            elseif was_placed then
-                px2, py2 = s.x, s.y -- every candidate too tight, already somewhere: stay put
-            else
-                px2, py2 = best_x, best_y -- first placement: nothing to stay at, take the best anyway
+            if best_free < 1.0 and best_ux ~= nil then
+                best_x, best_y = p.x + best_ux * 1.0, p.y + best_uy * 1.0
             end
+            px2, py2 = best_x, best_y
         end
+        -- Fix B, belt and braces: a placement that moves her less than 1 cm is not a real rescue - never
+        -- reset the stuck/aim bookkeeping or count a teleport for it (either Fix A already found some real
+        -- movement, or this is the rare remaining case where even that was negligible).
+        local moved = math.sqrt((px2 - s.x) ^ 2 + (py2 - s.y) ^ 2)
         s.x, s.y, s.z, s.yaw = px2, py2, p.z, p.yaw
         if s.trace then s.trace.z = nil end
         M.update_ground(s, p, now, ground, true)
         s.z = s.ground or p.z
-        s.v, s.vx, s.vy, s.speed, s.placed, s.teleports, s.going = 0, 0, 0, 0, true, (s.teleports or 0) + 1, false
-        s.aim_x, s.aim_y, s.aim_time, s.aim_best, s.aim_drops = nil, nil, 0, 1e9, 0
-        s.aim_drop_x, s.aim_drop_y, s.aim_drop_time = nil, nil, nil
-        s.stuck_time, s.stuck_best, s.stuck_blocked_seen, s.slide_side, s.slide_dir_x, s.slide_dir_y = 0, 1e9, false, nil, nil, nil
-        s.collide_blocked = false
-        if stuck then s.stuck_teleports = (s.stuck_teleports or 0) + 1 end
+        if moved < 1.0 then
+            s.placed = true
+        else
+            s.v, s.vx, s.vy, s.speed, s.placed, s.teleports, s.going = 0, 0, 0, 0, true, (s.teleports or 0) + 1, false
+            s.aim_x, s.aim_y, s.aim_time, s.aim_best, s.aim_drops = nil, nil, 0, 1e9, 0
+            s.aim_drop_x, s.aim_drop_y, s.aim_drop_time = nil, nil, nil
+            s.stuck_time, s.stuck_best, s.stuck_blocked_seen, s.slide_side, s.slide_dir_x, s.slide_dir_y = 0, 1e9, false, nil, nil, nil
+            s.collide_blocked = false
+            if stuck then s.stuck_teleports = (s.stuck_teleports or 0) + 1 end
+        end
         return s
     end
     -- stand/go (E): she tracks the player once he is really GOING; a hysteresis gap (GO_START to start,

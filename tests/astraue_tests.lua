@@ -1851,29 +1851,33 @@ do
 end
 
 do
-    -- review fix (R), round 2: the placement cascade's last resort must never use his EXACT (p.x, p.y) - a
-    -- tight room (170 cm, first person - the comfort radii are all FIRST_PERSON_SCALE larger) can leave every
-    -- one of the five swept candidates short of near_player; the old code then fell back to his exact
-    -- position, inside his own capsule. Now it keeps the best PARTIAL result among the five (provided it
-    -- clears at least M.SWEEP_RADIUS), or - every candidate even tighter than that, and she already had a
-    -- position - stays exactly where she was rather than moving into something worse. This drives a
-    -- RE-placement (she starts far away, well past M.TELEPORT) so "already placed" is the live branch; the
-    -- room is small enough that the best candidate here (~27 cm) is itself under M.SWEEP_RADIUS (34 cm).
+    -- review fix (R), round 2 (round 3: never his EXACT position, not "never within M.SWEEP_RADIUS" - that
+    -- guarantee was dropped by the round-3 fix below, in favour of never freezing her in a tight space; see
+    -- review fix (U)). A tight room (170 cm, first person - the comfort radii are all FIRST_PERSON_SCALE
+    -- larger) can leave every one of the five swept candidates short of near_player; the old code then fell
+    -- back to his exact position, inside his own capsule. Now it keeps the best PARTIAL result among the
+    -- five - whichever reached the most free distance - never his exact (p.x, p.y). Checked from BOTH a
+    -- far-away start (well past M.TELEPORT) and an already-nearby one (same XY, just far enough on Z to
+    -- trip FLOOR_APART) - the cascade's own candidates do not depend on where she started, and must not.
     local walls = {
         { 85, -1000, 1086, 1000 }, { -1086, -1000, -85, 1000 }, -- right / left
         { -1000, 85, 1000, 1086 }, { -1000, -1086, 1000, -85 }, -- top / bottom (a 170 cm square room)
     }
     local sweep = box_sweep(walls, M.SWEEP_RADIUS)
-    local her = { placed = true, x = 5000, y = 5000, z = 0, yaw = 0, v = 0 } -- already placed, far past M.TELEPORT
-    local p = { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false, camera_dist = 50 } -- first person
-    M.follow(her, p, 1 / 60, 0, nil, sweep)
-    local dist = math.sqrt((her.x - p.x) ^ 2 + (her.y - p.y) ^ 2)
-    check(dist >= M.SWEEP_RADIUS, string.format("review fix: a 170 cm first-person room - never within M.SWEEP_RADIUS of him (dist %.1f)", dist))
-    local inside = false
-    for _, b in ipairs(walls) do
-        if her.x >= b[1] - M.SWEEP_RADIUS and her.x <= b[3] + M.SWEEP_RADIUS and her.y >= b[2] - M.SWEEP_RADIUS and her.y <= b[4] + M.SWEEP_RADIUS then inside = true end
+    local function check_room(her, p, label)
+        M.follow(her, p, 1 / 60, 0, nil, sweep)
+        local dist = math.sqrt((her.x - p.x) ^ 2 + (her.y - p.y) ^ 2)
+        check(dist >= 1.0, string.format("review fix: a 170 cm first-person room (%s) - never his exact position (dist %.2f)", label, dist))
+        local inside = false
+        for _, b in ipairs(walls) do
+            if her.x >= b[1] - M.SWEEP_RADIUS and her.x <= b[3] + M.SWEEP_RADIUS and her.y >= b[2] - M.SWEEP_RADIUS and her.y <= b[4] + M.SWEEP_RADIUS then inside = true end
+        end
+        check(not inside, string.format("review fix: a 170 cm first-person room (%s) - never inside a wall (her %.1f, %.1f)", label, her.x, her.y))
     end
-    check(not inside, string.format("review fix: a 170 cm first-person room - never inside a wall (her %.1f, %.1f)", her.x, her.y))
+    check_room({ placed = true, x = 5000, y = 5000, z = 0, yaw = 0, v = 0 }, -- far away, past M.TELEPORT
+        { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false, camera_dist = 50 }, "far away")
+    check_room({ placed = true, x = 200, y = 200, z = 1000, yaw = 0, v = 0 }, -- nearby XY, floor-apart on Z
+        { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false, camera_dist = 50 }, "already nearby")
 end
 
 do
@@ -1966,6 +1970,44 @@ do
     end
     check(drops_seen == 5, string.format("review fix: five unrelated drops (player never moves) still happen (saw %d)", drops_seen))
     check((her2.stuck_teleports or 0) == 0, string.format("review fix: five unrelated drops, 20 s apart, still never escalate to a teleport (stuck_teleports %s)", tostring(her2.stuck_teleports)))
+end
+
+do
+    -- review fix (U), round 3: "stay put" was a PERMANENT no-op in a tight space - she is already placed in
+    -- a 170 cm room and the player paces nearby; to_spot sits past M.STUCK_DISTANCE, the stuck timer fires
+    -- every ~M.STUCK_SECONDS, and each "rescue" landed her at s.x, s.y (unchanged) while still resetting the
+    -- stuck/aim bookkeeping and counting a teleport - frozen for the whole session, every single "rescue" a
+    -- no-op. Fix A: never stay put - the best PARTIAL candidate (whichever reached the most free distance)
+    -- is used for a RE-placement too, offset by 1 cm along its own direction if even that is under 1 cm free
+    -- (still never his exact position). Fix B (belt and braces): a placement that moves her under 1 cm does
+    -- not reset the stuck/aim bookkeeping or count a teleport - it was never a real rescue.
+    local half = 85
+    local walls = {
+        { half, -1000, half + 1000, 1000 }, { -half - 1000, -1000, -half, 1000 },
+        { -1000, half, 1000, half + 1000 }, { -1000, -half - 1000, 1000, -half },
+    }
+    local sweep = box_sweep(walls, M.SWEEP_RADIUS)
+    -- placed in a far corner of the room from the natural spot direction, so to_spot clears STUCK_DISTANCE
+    local her = { placed = true, x = 45, y = -29, z = 0, yaw = 0, v = 0 }
+    local p = { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false, camera_dist = 50 } -- first person
+    local now, last_teleports, frozen_rescue, entered_wall = 0, her.stuck_teleports or 0, false, false
+    for i = 1, 3600 do -- 60 s, a 3 cm circle at ~27 cm/s
+        local ang = i * 2 * math.pi * 27 / (2 * math.pi * 3) / 60
+        p.x, p.y = 3 * math.cos(ang), 3 * math.sin(ang)
+        p.vx, p.vy = -3 * math.sin(ang) * (27 / 3), 3 * math.cos(ang) * (27 / 3)
+        now = now + 1 / 60
+        local prevx, prevy = her.x, her.y
+        M.follow(her, p, 1 / 60, now, nil, sweep)
+        if (her.stuck_teleports or 0) ~= last_teleports then
+            if math.sqrt((her.x - prevx) ^ 2 + (her.y - prevy) ^ 2) < 1.0 then frozen_rescue = true end
+            last_teleports = her.stuck_teleports
+        end
+        for _, b in ipairs(walls) do
+            if her.x >= b[1] - M.SWEEP_RADIUS and her.x <= b[3] + M.SWEEP_RADIUS and her.y >= b[2] - M.SWEEP_RADIUS and her.y <= b[4] + M.SWEEP_RADIUS then entered_wall = true end
+        end
+    end
+    check(not frozen_rescue, "review fix: a tight room, the player pacing - no stuck teleport leaves her within 1 cm of where she was")
+    check(not entered_wall, "review fix: a tight room, the player pacing - she never enters a wall")
 end
 
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
