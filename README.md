@@ -30,11 +30,14 @@ the game's process (Proton or Windows)                       Astra avatar engine
 
 **Before the tonemapper — Unreal games only.** ReShade runs effects at Present, over the game's UI and past its tone
 curve. In a game whose provider declares it Unreal (`astra_provider_engine("unreal")`, AstraUE's `E unreal` line) or
-whose launcher ini says `[tone] Engine=unreal`, `src/pretone.cpp` finds the game's tonemapper in its Direct3D 12
+whose launcher ini says `[tone] Engine=unreal`, `src/pretone.cpp` finds the game's tonemapper in its Direct3D 11 or 12
 command stream - a full-screen draw into an 8/10-bit target of exactly the presented size that reads an HDR texture
 of that size (`src/passfind.h`; what a draw reads comes from the descriptors the game copied for it since the draw
-before) - and runs the effects there, on the game's recording thread (never while Present is inside ReShade), into a
-copy of that scene colour, copied back, the game's state put back after. Her 8-bit picture is mapped into the scene's
+before on D3D12, or the slot a D3D11 `*SetShaderResources` call names directly) - and runs the effects there, on the
+game's recording thread (never while Present is inside ReShade), into a copy of that scene colour, copied back, the
+game's state put back after (tracked and replayed on D3D12; read with Get* and written back with Set* on D3D11,
+whose context hands its own state back on request - a deferred D3D11 context is not drawn into yet). Her 8-bit
+picture is mapped into the scene's
 light by inverting **Unreal's default** tonemapping (`src/tone.h`: its film curve, desaturations, blue correction and
 gamut expansion; a game's own film settings or colour LUT are not read - `[tone] Exposure` in the `-AstraConfig` ini,
 the overlay's "her exposure", trims her). Every other game - Death Stranding, a Unity game, a provider that reads its

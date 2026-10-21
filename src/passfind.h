@@ -109,6 +109,21 @@ namespace passfind
 		return std::abs(a - b) <= 0.01 * b && w * 2 >= out_w && w <= out_w;
 	}
 
+	/// TRACE ONLY, a wider net than near_presented_size: the same aspect within 2%, at any size down to 1/4 of the
+	/// presented width - never used to decide what gets drawn into (presented_size is the only drawing rule). A game
+	/// that renders well below native and upscales after (Poppy Playtime: 768x436 of a 2560x1440 presentation, 0.3x
+	/// width) falls outside near_presented_size's half-width floor; this exists so ASTRA_PRETONE_TRACE still shows
+	/// such a game's candidates, so phase B can pick a sub-resolution rule from what a live trace actually sees.
+	inline bool trace_candidate_size(uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h)
+	{
+		if (out_w == 0 || out_h == 0 || w == 0 || h == 0)
+			return false;
+		if (w == out_w && h == out_h)
+			return true;
+		const double a = double(w) / double(h), b = double(out_w) / double(out_h);
+		return std::abs(a - b) <= 0.02 * b && w * 4 >= out_w;
+	}
+
 	/// Could this draw be the tonemapper by its SHAPE (a full-screen draw into one 8/10-bit target of exactly the
 	/// presented size)? Cheap: asked of every draw before what it reads is looked up. `vertices`: its vertex (or index) count.
 	inline bool tonemapper_shape(const Tracker &t, uint32_t vertices, uint32_t instances, uint32_t out_w, uint32_t out_h)

@@ -6,12 +6,15 @@
 // drawn over her. Her picture is mapped into the scene's light with tone.h.
 //
 // Only in a game whose provider (or the launcher's ini) declares it Unreal (pretone_rules.h): the tonemapper's shape
-// and the tone curve inverted are Unreal's. Direct3D 12 only (ReShade cannot save and restore a D3D12 command list's
-// state, so this module tracks what the game bound and puts it back after the effects). Anywhere else - no engine
-// declared, no tonemapper found, HDR output, another API, [tone] Path=present - every event below returns at once and
-// the effects run at Present as before pretone existed; a frame her pass at the tonemapper did not draw (the effects
-// compiling for its target) is a frame without effects, then the Present path for a while. The log and the overlay say
-// which path is used and why.
+// and the tone curve inverted are Unreal's. Direct3D 11 and 12 (ReShade saves and restores neither a D3D12 command
+// list's state nor a D3D11 context's - this module puts the game's state back after the effects itself, two
+// different ways: D3D12 has no "read the state back" call, so it TRACKS what the game bound and replays it; D3D11's
+// state is sticky and the context hands it back on request, so this just reads it with Get* right before the
+// effects and writes it back with Set* right after). A D3D11 game's deferred contexts are not drawn into yet (her
+// pass stays at Present for their frames). Anywhere else - no engine declared, no tonemapper found, HDR output,
+// another API, [tone] Path=present - every event below returns at once and the effects run at Present as before
+// pretone existed; a frame her pass at the tonemapper did not draw (the effects compiling for its target) is a frame
+// without effects, then the Present path for a while. The log and the overlay say which path is used and why.
 #include <cstdint>
 #include <string>
 

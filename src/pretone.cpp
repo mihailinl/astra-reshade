@@ -5,6 +5,7 @@
 #include "pretone_rules.h"
 #include "provider.h"
 #include <windows.h>
+#include <d3d11.h>
 #include <d3d12.h>
 #include <algorithm>
 #include <atomic>
@@ -55,6 +56,11 @@ namespace pretone
 				uint64_t va = 0; // a root SRV/UAV's GPU address
 				std::vector<uint32_t> constants;
 			};
+			/// D3D11: which texture is bound at each shader stage's slot right now (no root signature, no descriptor
+			/// heap - *SetShaderResources/*SetUnorderedAccessViews name the slot directly). Unused on D3D12 (which
+			/// uses `gfx`/`cmp` + the recording thread's descriptor-copy ring instead).
+			pretone_rules::D3D11Srv d3d11_srv;
+
 			/// A root signature and its arguments (the graphics one, and the compute one).
 			struct Root
 			{
@@ -93,6 +99,8 @@ namespace pretone
 				scissors.clear();
 				gfx.clear();
 				cmp.clear();
+				for (auto &s : d3d11_srv.slots)
+					s.clear();
 			}
 			Root *root(shader_stage stages)
 			{
@@ -141,10 +149,12 @@ namespace pretone
 		pretone_rules::Fallback g_fallback; // touched only by the thread holding g_recording
 
 		// what happened, for the log and the overlay
-		std::atomic<uint64_t> g_before{0}, g_atPresent{0}, g_lost{0}, g_found{0}, g_contended{0}, g_periodBefore{0}, g_periodPresent{0}, g_periodLost{0};
+		std::atomic<uint64_t> g_before{0}, g_atPresent{0}, g_lost{0}, g_found{0}, g_contended{0}, g_periodBefore{0}, g_periodPresent{0}, g_periodLost{0},
+			g_deferred{0};
+		std::atomic<uint32_t> g_api{0}; // the device_api of the tonemapper pass last driven (0: none yet)
 		ULONGLONG g_nextStats = 0;
 		bool g_loggedFound = false, g_loggedAmbiguous = false, g_loggedCompute = false, g_loggedHdr = false, g_loggedNone = false, g_loggedApi = false,
-			 g_loggedFail = false, g_loggedHold = false, g_loggedGiveUp = false;
+			 g_loggedFail = false, g_loggedHold = false, g_loggedGiveUp = false, g_loggedDeferred = false;
 		char g_status[260] = "drawn at presentation (over the game's UI): no frame yet";
 
 		// ASTRA_PRETONE_TRACE=<frame>: that frame's command stream as the finder sees it, into the log (a game whose
@@ -161,6 +171,21 @@ namespace pretone
 		uint32_t format_of(device *dev, uint64_t id)
 		{
 			return id != 0 ? uint32_t(dev->get_resource_desc(resource{id}).texture.format) : 0;
+		}
+
+		/// For the log and the overlay: which API path is driving her pass (item 2 of the D3D11 port - every message
+		/// that names a path must say which one).
+		const char *api_name(device_api api)
+		{
+			switch (api)
+			{
+			case device_api::d3d11:
+				return "Direct3D 11";
+			case device_api::d3d12:
+				return "Direct3D 12";
+			default:
+				return "another API";
+			}
 		}
 
 		ListState *state(command_list *cmd)
@@ -349,9 +374,67 @@ namespace pretone
 			}
 		}
 
+		/// The D3D11 stage of a push_descriptors event's `stages` (always exactly one bit for a real D3D11
+		/// *SetShaderResources/*SetUnorderedAccessViews call); `count` for anything else (a combined mask, or a
+		/// stage this add-on does not track - amplification/mesh/ray tracing never appear on D3D11).
+		pretone_rules::D3D11Stage d3d11_stage_of(shader_stage stages)
+		{
+			switch (stages)
+			{
+			case shader_stage::vertex:
+				return pretone_rules::D3D11Stage::vs;
+			case shader_stage::hull:
+				return pretone_rules::D3D11Stage::hs;
+			case shader_stage::domain:
+				return pretone_rules::D3D11Stage::ds;
+			case shader_stage::geometry:
+				return pretone_rules::D3D11Stage::gs;
+			case shader_stage::pixel:
+				return pretone_rules::D3D11Stage::ps;
+			case shader_stage::compute:
+				return pretone_rules::D3D11Stage::cs;
+			default:
+				return pretone_rules::D3D11Stage::count;
+			}
+		}
+
+		/// D3D11: *SetShaderResources(binding.., count, views) or CSSetUnorderedAccessViews(binding.., count, uavs)
+		/// resolved to Tex and written into the list's per-stage slot table - `update.binding` IS the register slot
+		/// (D3D11 has no descriptor heap indirection to resolve through); a null view in the array unbinds its slot,
+		/// matching the real call. Returns false (not handled: not a D3D11 SRV/UAV bind) so the caller falls through
+		/// to the D3D12 root-table tracking below.
+		bool d3d11_push_descriptors(command_list *cmd, shader_stage stages, const descriptor_table_update &update)
+		{
+			if (cmd->get_device()->get_api() != device_api::d3d11 || update.count == 0 || update.descriptors == nullptr)
+				return false;
+			if (update.type != descriptor_type::shader_resource_view && update.type != descriptor_type::unordered_access_view)
+				return false; // texture_shader_resource_view / texture_unordered_access_view are the same values
+			const pretone_rules::D3D11Stage stage = d3d11_stage_of(stages);
+			if (stage == pretone_rules::D3D11Stage::count)
+				return false;
+			ListState *s = state(cmd);
+			if (s == nullptr)
+				return true; // handled (a D3D11 bind): nothing else should touch this event
+			device *dev = cmd->get_device();
+			const resource_view *views = static_cast<const resource_view *>(update.descriptors);
+			const bool uav = update.type == descriptor_type::unordered_access_view;
+			constexpr uint32_t kCap = 128; // D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT: the most one call can bind
+			passfind::Tex resolved[kCap];
+			const uint32_t count = std::min<uint32_t>(update.count, kCap);
+			for (uint32_t i = 0; i < count; ++i)
+			{
+				resolved[i] = describe(dev, dev->get_resource_from_view(views[i]));
+				resolved[i].written = uav && resolved[i].id != 0;
+			}
+			s->d3d11_srv.bind(stage, update.binding, count, resolved);
+			return true;
+		}
+
 		void on_push_descriptors(command_list *cmd, shader_stage stages, pipeline_layout layout, uint32_t index, const descriptor_table_update &update)
 		{
 			if (!on())
+				return;
+			if (d3d11_push_descriptors(cmd, stages, update))
 				return;
 			ListState *s = state(cmd);
 			ListState::Root *r = s != nullptr ? s->root(stages) : nullptr;
@@ -678,6 +761,240 @@ namespace pretone
 			cmd->bind_render_targets_and_depth_stencil(uint32_t(s.rtvs.size()), s.rtvs.data(), s.dsv);
 		}
 
+		// ---- D3D11: the whole context state, saved and restored around her pass --------------------------------
+		//
+		// ReShade's effect_runtime::render_effects does not save or restore ANY D3D11 context state (unlike its own
+		// Present path, which wraps it in a private state block) - so unlike D3D12's restore() above (built by
+		// TRACKING what the game bound, since D3D12 has no "get the current state back" call), this reads the real
+		// thing with the context's own Get* calls right before render_effects runs, and puts it back with the
+		// matching Set* right after. Modelled on the field list of ReShade's own d3d11_impl_state_block (read on
+		// GitHub) - this is new code, not a copy of it.
+
+		/// One shader stage's shader + class instances + constant buffers + SRVs + samplers (VS/HS/DS/GS/PS; CS adds
+		/// UAVs and is captured separately below). Every pointer a Get* call hands back is a NEW reference - the
+		/// destructor releases all of them.
+		template <class Shader>
+		struct D3D11StageState
+		{
+			// D3D11_SHADER_MAX_INTERFACES is 253; HLSL dynamic shader linkage is rare enough that a game using more
+			// than 32 class instances on one stage is UNVERIFIED territory for this phase.
+			static constexpr UINT kClass = 32;
+			static constexpr UINT kCb = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
+			static constexpr UINT kSrv = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
+			static constexpr UINT kSampler = D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT;
+
+			Shader *shader = nullptr;
+			ID3D11ClassInstance *instances[kClass] = {};
+			UINT instance_count = kClass;
+			ID3D11Buffer *cb[kCb] = {};
+			ID3D11ShaderResourceView *srv[kSrv] = {};
+			ID3D11SamplerState *sampler[kSampler] = {};
+
+			D3D11StageState() = default;
+			D3D11StageState(const D3D11StageState &) = delete;
+			D3D11StageState &operator=(const D3D11StageState &) = delete;
+			~D3D11StageState()
+			{
+				if (shader != nullptr)
+					shader->Release();
+				for (ID3D11ClassInstance *p : instances)
+					if (p != nullptr)
+						p->Release();
+				for (ID3D11Buffer *p : cb)
+					if (p != nullptr)
+						p->Release();
+				for (ID3D11ShaderResourceView *p : srv)
+					if (p != nullptr)
+						p->Release();
+				for (ID3D11SamplerState *p : sampler)
+					if (p != nullptr)
+						p->Release();
+			}
+		};
+
+// VS/HS/DS/GS/PS share one shape (shader + class instances, constant buffers, SRVs, samplers); CS's own capture/
+// restore (below) adds its UAVs. A template helper over the method name would need as much machinery as this macro
+// to stay type-correct across 5 unrelated COM interfaces - six near-identical blocks, kept duplicated on purpose.
+#define ASTRA_D3D11_STAGE(TAG, Shader)                                                                                                             \
+		void d3d11_capture_##TAG(ID3D11DeviceContext *ctx, D3D11StageState<Shader> &s)                                                             \
+		{                                                                                                                                           \
+			s.instance_count = D3D11StageState<Shader>::kClass;                                                                                    \
+			ctx->TAG##GetShader(&s.shader, s.instances, &s.instance_count);                                                                        \
+			ctx->TAG##GetConstantBuffers(0, D3D11StageState<Shader>::kCb, s.cb);                                                                   \
+			ctx->TAG##GetShaderResources(0, D3D11StageState<Shader>::kSrv, s.srv);                                                                 \
+			ctx->TAG##GetSamplers(0, D3D11StageState<Shader>::kSampler, s.sampler);                                                                 \
+		}                                                                                                                                           \
+		void d3d11_restore_##TAG(ID3D11DeviceContext *ctx, const D3D11StageState<Shader> &s)                                                       \
+		{                                                                                                                                           \
+			ctx->TAG##SetShader(s.shader, s.instances, s.instance_count);                                                                          \
+			ctx->TAG##SetConstantBuffers(0, D3D11StageState<Shader>::kCb, s.cb);                                                                    \
+			ctx->TAG##SetShaderResources(0, D3D11StageState<Shader>::kSrv, s.srv);                                                                  \
+			ctx->TAG##SetSamplers(0, D3D11StageState<Shader>::kSampler, s.sampler);                                                                 \
+		}
+		ASTRA_D3D11_STAGE(VS, ID3D11VertexShader)
+		ASTRA_D3D11_STAGE(HS, ID3D11HullShader)
+		ASTRA_D3D11_STAGE(DS, ID3D11DomainShader)
+		ASTRA_D3D11_STAGE(GS, ID3D11GeometryShader)
+		ASTRA_D3D11_STAGE(PS, ID3D11PixelShader)
+#undef ASTRA_D3D11_STAGE
+
+		/// IA, every shader stage, RS, OM, CS's UAVs - what draw_before captures once before running the effects and
+		/// puts back once after.
+		struct D3D11Snapshot
+		{
+			static constexpr UINT kVb = D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT;
+			static constexpr UINT kViewport = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+			static constexpr UINT kRtv = D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT;
+			// the base interface's shared RTV/UAV register count (8); a Direct3D 11.1 context's extra CS UAV slots
+			// (up to D3D11_1_UAV_SLOT_COUNT = 64) are not saved or restored - UNVERIFIED beyond slot 8.
+			static constexpr UINT kUav = D3D11_PS_CS_UAV_REGISTER_COUNT;
+			static constexpr UINT kCb = D3D11StageState<ID3D11VertexShader>::kCb;
+			static constexpr UINT kSrv = D3D11StageState<ID3D11VertexShader>::kSrv;
+			static constexpr UINT kSampler = D3D11StageState<ID3D11VertexShader>::kSampler;
+			static constexpr UINT kClass = D3D11StageState<ID3D11VertexShader>::kClass;
+
+			ID3D11InputLayout *input_layout = nullptr;
+			D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+			ID3D11Buffer *vb[kVb] = {};
+			UINT vb_stride[kVb] = {}, vb_offset[kVb] = {};
+			ID3D11Buffer *ib = nullptr;
+			DXGI_FORMAT ib_format = DXGI_FORMAT_UNKNOWN;
+			UINT ib_offset = 0;
+
+			D3D11StageState<ID3D11VertexShader> vs;
+			D3D11StageState<ID3D11HullShader> hs;
+			D3D11StageState<ID3D11DomainShader> ds;
+			D3D11StageState<ID3D11GeometryShader> gs;
+			D3D11StageState<ID3D11PixelShader> ps;
+
+			ID3D11ComputeShader *cs_shader = nullptr;
+			ID3D11ClassInstance *cs_instances[kClass] = {};
+			UINT cs_instance_count = kClass;
+			ID3D11Buffer *cs_cb[kCb] = {};
+			ID3D11ShaderResourceView *cs_srv[kSrv] = {};
+			ID3D11SamplerState *cs_sampler[kSampler] = {};
+			ID3D11UnorderedAccessView *cs_uav[kUav] = {};
+
+			ID3D11RasterizerState *rs_state = nullptr;
+			UINT viewport_count = kViewport;
+			D3D11_VIEWPORT viewports[kViewport] = {};
+			UINT scissor_count = kViewport;
+			D3D11_RECT scissors[kViewport] = {};
+
+			ID3D11RenderTargetView *rtv[kRtv] = {};
+			ID3D11DepthStencilView *dsv = nullptr;
+			ID3D11UnorderedAccessView *om_uav[kUav] = {};
+			ID3D11BlendState *blend_state = nullptr;
+			FLOAT blend_factor[4] = {};
+			UINT sample_mask = 0;
+			ID3D11DepthStencilState *depth_state = nullptr;
+			UINT stencil_ref = 0;
+
+			D3D11Snapshot() = default;
+			D3D11Snapshot(const D3D11Snapshot &) = delete;
+			D3D11Snapshot &operator=(const D3D11Snapshot &) = delete;
+			~D3D11Snapshot()
+			{
+				if (input_layout != nullptr)
+					input_layout->Release();
+				for (ID3D11Buffer *p : vb)
+					if (p != nullptr)
+						p->Release();
+				if (ib != nullptr)
+					ib->Release();
+				if (cs_shader != nullptr)
+					cs_shader->Release();
+				for (ID3D11ClassInstance *p : cs_instances)
+					if (p != nullptr)
+						p->Release();
+				for (ID3D11Buffer *p : cs_cb)
+					if (p != nullptr)
+						p->Release();
+				for (ID3D11ShaderResourceView *p : cs_srv)
+					if (p != nullptr)
+						p->Release();
+				for (ID3D11SamplerState *p : cs_sampler)
+					if (p != nullptr)
+						p->Release();
+				for (ID3D11UnorderedAccessView *p : cs_uav)
+					if (p != nullptr)
+						p->Release();
+				if (rs_state != nullptr)
+					rs_state->Release();
+				for (ID3D11RenderTargetView *p : rtv)
+					if (p != nullptr)
+						p->Release();
+				if (dsv != nullptr)
+					dsv->Release();
+				for (ID3D11UnorderedAccessView *p : om_uav)
+					if (p != nullptr)
+						p->Release();
+				if (blend_state != nullptr)
+					blend_state->Release();
+				if (depth_state != nullptr)
+					depth_state->Release();
+			}
+		};
+
+		void d3d11_capture(ID3D11DeviceContext *ctx, D3D11Snapshot &s)
+		{
+			ctx->IAGetInputLayout(&s.input_layout);
+			ctx->IAGetPrimitiveTopology(&s.topology);
+			ctx->IAGetVertexBuffers(0, D3D11Snapshot::kVb, s.vb, s.vb_stride, s.vb_offset);
+			ctx->IAGetIndexBuffer(&s.ib, &s.ib_format, &s.ib_offset);
+			d3d11_capture_VS(ctx, s.vs);
+			d3d11_capture_HS(ctx, s.hs);
+			d3d11_capture_DS(ctx, s.ds);
+			d3d11_capture_GS(ctx, s.gs);
+			d3d11_capture_PS(ctx, s.ps);
+			s.cs_instance_count = D3D11Snapshot::kClass;
+			ctx->CSGetShader(&s.cs_shader, s.cs_instances, &s.cs_instance_count);
+			ctx->CSGetConstantBuffers(0, D3D11Snapshot::kCb, s.cs_cb);
+			ctx->CSGetShaderResources(0, D3D11Snapshot::kSrv, s.cs_srv);
+			ctx->CSGetSamplers(0, D3D11Snapshot::kSampler, s.cs_sampler);
+			ctx->CSGetUnorderedAccessViews(0, D3D11Snapshot::kUav, s.cs_uav);
+			ctx->RSGetState(&s.rs_state);
+			s.viewport_count = D3D11Snapshot::kViewport;
+			ctx->RSGetViewports(&s.viewport_count, s.viewports);
+			s.scissor_count = D3D11Snapshot::kViewport;
+			ctx->RSGetScissorRects(&s.scissor_count, s.scissors);
+			// two calls, not one: RTV/DSV and UAVs share the OM stage's 8 slots (UAVStartSlot must equal the real
+			// RTV count, which this capture does not know ahead of time) - NumRTVs=0 / NumUAVs=0 is the documented
+			// way to read only the other half without that overlap.
+			ctx->OMGetRenderTargetsAndUnorderedAccessViews(D3D11Snapshot::kRtv, s.rtv, &s.dsv, 0, 0, nullptr);
+			ctx->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, D3D11Snapshot::kUav, s.om_uav);
+			ctx->OMGetBlendState(&s.blend_state, s.blend_factor, &s.sample_mask);
+			ctx->OMGetDepthStencilState(&s.depth_state, &s.stencil_ref);
+		}
+
+		void d3d11_restore(ID3D11DeviceContext *ctx, const D3D11Snapshot &s)
+		{
+			ctx->IASetInputLayout(s.input_layout);
+			ctx->IASetPrimitiveTopology(s.topology);
+			ctx->IASetVertexBuffers(0, D3D11Snapshot::kVb, s.vb, s.vb_stride, s.vb_offset);
+			ctx->IASetIndexBuffer(s.ib, s.ib_format, s.ib_offset);
+			d3d11_restore_VS(ctx, s.vs);
+			d3d11_restore_HS(ctx, s.hs);
+			d3d11_restore_DS(ctx, s.ds);
+			d3d11_restore_GS(ctx, s.gs);
+			d3d11_restore_PS(ctx, s.ps);
+			ctx->CSSetShader(s.cs_shader, s.cs_instances, s.cs_instance_count);
+			ctx->CSSetConstantBuffers(0, D3D11Snapshot::kCb, s.cs_cb);
+			ctx->CSSetShaderResources(0, D3D11Snapshot::kSrv, s.cs_srv);
+			ctx->CSSetSamplers(0, D3D11Snapshot::kSampler, s.cs_sampler);
+			ctx->CSSetUnorderedAccessViews(0, D3D11Snapshot::kUav, s.cs_uav, nullptr);
+			ctx->RSSetState(s.rs_state);
+			ctx->RSSetViewports(s.viewport_count, s.viewports);
+			ctx->RSSetScissorRects(s.scissor_count, s.scissors);
+			// the same two-call split as the capture: RTV/DSV first (keeping whatever UAVs are bound right now),
+			// then the UAVs (keeping the RTV/DSV just set).
+			ctx->OMSetRenderTargetsAndUnorderedAccessViews(D3D11Snapshot::kRtv, s.rtv, s.dsv, 0, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, nullptr, nullptr);
+			ctx->OMSetRenderTargetsAndUnorderedAccessViews(
+				D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, 0, D3D11Snapshot::kUav, s.om_uav, nullptr);
+			ctx->OMSetBlendState(s.blend_state, s.blend_factor, s.sample_mask);
+			ctx->OMSetDepthStencilState(s.depth_state, s.stencil_ref);
+		}
+
 		/// Holds g_recording for one pass (released when it goes out of scope).
 		struct Recording
 		{
@@ -706,20 +1023,42 @@ namespace pretone
 		{
 			++g_found;
 			const uint64_t frame = g_presents.load();
-			if (g_drawnAt.load() == frame || !on() || s.epoch != g_onEpoch.load())
-				return; // tried this frame already (a second view, a scene capture); pretone off; a list not tracked whole
+			if (g_drawnAt.load() == frame || !on())
+				return; // tried this frame already (a second view, a scene capture); pretone off
 			device *dev = cmd->get_device();
 			effect_runtime *runtime = g_runtime.load();
 			if (runtime == nullptr || runtime->get_device() != dev)
 				return;
-			if (dev->get_api() != device_api::d3d12)
+			const device_api api = dev->get_api();
+			if (api != device_api::d3d11 && api != device_api::d3d12)
 			{
 				if (!g_loggedApi)
 				{
 					g_loggedApi = true;
-					logf("pretone: a tonemapper pass, but not Direct3D 12: she is drawn at presentation");
+					logf("pretone: a tonemapper pass, but not Direct3D 11 or 12 (%s): she is drawn at presentation", api_name(api));
 				}
 				return;
+			}
+			// D3D12 only: a list not tracked whole since pretone turned on - what it bound before that is unknown,
+			// and restore() would put back an incomplete root signature. D3D11 has no such gap: its state is
+			// sticky and read straight off the context below, never reconstructed from what this add-on tracked.
+			if (api == device_api::d3d12 && s.epoch != g_onEpoch.load())
+				return;
+			ID3D11DeviceContext *ctx11 = nullptr;
+			if (api == device_api::d3d11)
+			{
+				ctx11 = reinterpret_cast<ID3D11DeviceContext *>(cmd->get_native());
+				if (ctx11->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED)
+				{
+					++g_deferred; // phase A: only the immediate context draws; stay at Present for this list
+					if (!g_loggedDeferred)
+					{
+						g_loggedDeferred = true;
+						logf("pretone: the tonemapper pass is on a deferred Direct3D 11 context: not drawn there (not yet supported); she is drawn "
+							 "at presentation for its frames");
+					}
+					return;
+				}
 			}
 			const Recording rec;
 			if (!rec.held)
@@ -747,18 +1086,27 @@ namespace pretone
 			{
 				g_loggedFound = true;
 				const resource_desc d = dev->get_resource_desc(game);
-				logf("pretone: the game's tonemapper found: it reads a %ux%u scene colour (format %u); she is drawn into it, before the game's tone "
-					 "curve, grade, bloom and UI",
-					scene.w, scene.h, uint32_t(d.texture.format));
+				logf("pretone: the game's tonemapper found (%s): it reads a %ux%u scene colour (format %u); she is drawn into it, before the game's "
+					 "tone curve, grade, bloom and UI",
+					api_name(api), scene.w, scene.h, uint32_t(d.texture.format));
 			}
+			g_api = uint32_t(api);
 			const resource_usage was = resource_usage(scene_state);
+			if (api == device_api::d3d12) // D3D11 never fires barrier events (no transitions there) - no-op
 			{
 				const resource r[2] = {game, g_copy};
 				const resource_usage from[2] = {was, resource_usage::shader_resource}, to[2] = {resource_usage::copy_source, resource_usage::copy_dest};
 				cmd->barrier(2, r, from, to);
 			}
 			cmd->copy_texture_region(game, 0, nullptr, g_copy, 0, nullptr);
-			cmd->barrier(g_copy, resource_usage::copy_dest, resource_usage::render_target);
+			if (api == device_api::d3d12)
+				cmd->barrier(g_copy, resource_usage::copy_dest, resource_usage::render_target);
+			// D3D11: ReShade's render_effects saves and restores none of the context's state - capture it here,
+			// right before, and put it back right after (D3D12's restore(), by contrast, is built from what this
+			// add-on tracked, since D3D12 has nothing like these Get* calls to read the current state back from).
+			D3D11Snapshot snap11;
+			if (api == device_api::d3d11)
+				d3d11_capture(ctx11, snap11);
 			const unsigned long long runs = layer::her_runs();
 			layer::set_hdr_pass(true, frame);
 			runtime->render_effects(cmd, g_copyRtv, g_copyRtv);
@@ -767,6 +1115,7 @@ namespace pretone
 			// effects drawn either way, so nothing is drawn at Present this frame: one lost frame, then the Present
 			// path is held a while (pretone_rules::Fallback)
 			const bool ran = layer::her_runs() != runs;
+			if (api == device_api::d3d12)
 			{
 				const resource r[2] = {g_copy, game};
 				const resource_usage from[2] = {resource_usage::render_target, resource_usage::copy_source},
@@ -776,10 +1125,18 @@ namespace pretone
 			if (ran)
 			{
 				cmd->copy_texture_region(g_copy, 0, nullptr, game, 0, nullptr);
-				cmd->barrier(game, resource_usage::copy_dest, was);
+				if (api == device_api::d3d12)
+					cmd->barrier(game, resource_usage::copy_dest, was);
 			}
-			cmd->barrier(g_copy, resource_usage::copy_source, resource_usage::shader_resource);
-			restore(cmd, s);
+			if (api == device_api::d3d12)
+			{
+				cmd->barrier(g_copy, resource_usage::copy_source, resource_usage::shader_resource);
+				restore(cmd, s);
+			}
+			else
+			{
+				d3d11_restore(ctx11, snap11);
+			}
 			g_drawnAt = frame;
 			if (ran)
 			{
@@ -832,24 +1189,28 @@ namespace pretone
 			ListState *s = state(cmd);
 			if (s == nullptr)
 				return false;
-			const uint32_t window = take_window(*s);
+			device *dev = cmd->get_device();
+			const bool d3d11 = dev->get_api() == device_api::d3d11;
+			const uint32_t window = take_window(*s); // D3D12 only; a no-op bookkeeping call on every other API
 			const bool shape = passfind::tonemapper_shape(s->find, vertices, instances, g_outW, g_outH);
 			const bool trace = tracing() && vertices <= 6 && s->find.target.id != 0 &&
-							   passfind::near_presented_size(s->find.target.w, s->find.target.h, g_outW, g_outH);
+							   passfind::trace_candidate_size(s->find.target.w, s->find.target.h, g_outW, g_outH);
 			if (!shape && !trace)
 				return false;
 			if (shape && !trace && g_foundAt.load() == g_presents.load())
 				return false; // the tonemapper was this frame's already (the UI's quads come after it)
 			passfind::Tex reads[24];
-			const size_t n = draw_reads(cmd, s->gfx, window, reads, 24);
+			const size_t n = d3d11 ? s->d3d11_srv.resolve(pretone_rules::D3D11Stage::ps, reads, 24) : draw_reads(cmd, s->gfx, window, reads, 24);
 			bool ambiguous = false;
 			const passfind::Tex scene = shape ? passfind::scene_read(s->find, reads, n, &ambiguous) : passfind::Tex();
 			if (trace)
 			{
-				char what[160];
-				std::snprintf(what, sizeof(what), "draw %u x%u into %llx (format %u %ux%u, %u targets, viewport %ux%u)", vertices, instances,
-					(unsigned long long)s->find.target.id, format_of(cmd->get_device(), s->find.target.id), s->find.target.w, s->find.target.h,
-					s->find.targets_bound, s->find.vp_w, s->find.vp_h);
+				char what[200];
+				std::snprintf(what, sizeof(what), "%s draw %u x%u into %llx (format %u %ux%u, %u targets, viewport %ux%u, presented=%d near=%d)",
+					api_name(dev->get_api()), vertices, instances, (unsigned long long)s->find.target.id, format_of(dev, s->find.target.id),
+					s->find.target.w, s->find.target.h, s->find.targets_bound, s->find.vp_w, s->find.vp_h,
+					passfind::presented_size(s->find.target.w, s->find.target.h, g_outW, g_outH) ? 1 : 0,
+					passfind::near_presented_size(s->find.target.w, s->find.target.h, g_outW, g_outH) ? 1 : 0);
 				trace_pass(cmd, what, reads, n, scene.id != 0 ? "THE TONEMAPPER" : shape ? "full-screen, no HDR input" : "-");
 			}
 			if (scene.id == 0 || g_foundAt.exchange(g_presents.load()) == g_presents.load())
@@ -871,17 +1232,23 @@ namespace pretone
 			ListState *s = state(cmd);
 			if (s == nullptr)
 				return false;
+			device *dev = cmd->get_device();
+			const bool d3d11 = dev->get_api() == device_api::d3d11;
 			const uint32_t window = take_window(*s);
-			if (s->cmp.layout.handle == 0 || !tracing())
+			if (!tracing() || (!d3d11 && s->cmp.layout.handle == 0))
 				return false; // only looked at in a trace: a game's frame has hundreds of dispatches
 			passfind::Tex bound[24];
-			const size_t n = draw_reads(cmd, s->cmp, window, bound, 24);
+			const size_t n = d3d11 ? s->d3d11_srv.resolve(pretone_rules::D3D11Stage::cs, bound, 24) : draw_reads(cmd, s->cmp, window, bound, 24);
 			bool ambiguous = false, sized = false;
 			const passfind::Tex scene = passfind::compute_scene(bound, n, g_outW, g_outH, &ambiguous);
 			for (size_t i = 0; i < n; ++i)
-				sized = sized || passfind::near_presented_size(bound[i].w, bound[i].h, g_outW, g_outH);
+				sized = sized || passfind::trace_candidate_size(bound[i].w, bound[i].h, g_outW, g_outH);
 			if (sized)
-				trace_pass(cmd, "dispatch", bound, n, scene.id != 0 ? "a compute tonemapper (not drawn into)" : "-");
+			{
+				char what[32];
+				std::snprintf(what, sizeof(what), "%s dispatch", api_name(dev->get_api()));
+				trace_pass(cmd, what, bound, n, scene.id != 0 ? "a compute tonemapper (not drawn into)" : "-");
+			}
 			// recognised (in a trace), not drawn into: no game with one has been run, and a pass taken for it wrongly
 			// breaks the game's GPU state - she is drawn at presentation unless a tonemapper draw is found
 			if (scene.id != 0 && !g_loggedCompute)
@@ -1060,8 +1427,9 @@ namespace pretone
 			std::snprintf(g_status, sizeof(g_status), "drawn at presentation (over the game's UI): %s", g_why);
 		else if (g_before > 0)
 			std::snprintf(g_status, sizeof(g_status),
-				"drawn before the game's tonemapper (its grade, bloom and UI apply): %llu frames, %llu at presentation, %llu without effects",
-				(unsigned long long)g_before.load(), (unsigned long long)g_atPresent.load(), (unsigned long long)g_lost.load());
+				"drawn before the game's tonemapper (%s; its grade, bloom and UI apply): %llu frames, %llu at presentation, %llu without effects",
+				api_name(device_api(g_api.load())), (unsigned long long)g_before.load(), (unsigned long long)g_atPresent.load(),
+				(unsigned long long)g_lost.load());
 		else
 			std::snprintf(g_status, sizeof(g_status), "drawn at presentation (over the game's UI): %s",
 				g_found > 0 ? "a tonemapper is found, her pass is not drawn there yet" : "no tonemapper pass found yet");
