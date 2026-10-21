@@ -1739,5 +1739,21 @@ do
     check(rescued_frame ~= nil and rescued_frame / 60 < M.STUCK_SECONDS + 1, string.format("review fix: wedged near her spot while he paces - rescued within STUCK_SECONDS + 1 s (%s frames)", tostring(rescued_frame)))
 end
 
+do
+    -- review fix (O): placement's last-resort "beside him" fallback was unswept and could land her inside a
+    -- wall in a corridor narrower than about her spot's own lateral reach (M.SIDE + M.SWEEP_RADIUS, ~134 cm).
+    -- The player is centred in a 120 cm corridor (walls at |y| >= 60); her real spot and its mirror both reach
+    -- for |y| = 90 cm (past the walls) and fail, and so do the new right-/left-side candidates (same lateral
+    -- reach) - every swept candidate that reaches sideways fails, same as the old single fallback did; she
+    -- must still never land inside either wall box.
+    local walls = { { -100000, 60, 100000, 100000 }, { -100000, -100000, 100000, -60 } }
+    local sweep = box_sweep(walls, M.SWEEP_RADIUS)
+    local her = fresh_her()
+    local p = { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+    M.follow(her, p, 1 / 60, 0, nil, sweep)
+    local inside = her.y >= 60 - M.SWEEP_RADIUS or her.y <= -60 + M.SWEEP_RADIUS
+    check(not inside, string.format("review fix: a 120 cm corridor, both swept side spots fail - she never lands inside a wall box (y %.1f)", her.y))
+end
+
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
 os.exit(failed == 0 and 0 or 1)

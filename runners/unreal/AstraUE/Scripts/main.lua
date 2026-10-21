@@ -576,18 +576,34 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
     local stuck = s.placed and ((s.going and (s.stuck_time or 0) > M.STUCK_SECONDS) or (s.aim_drops or 0) > M.STUCK_AIM_DROPS)
     if not s.placed or to_spot > M.TELEPORT or stuck or math.abs((s.ground or p.z) - s.z) > M.FLOOR_APART then
         -- put at her spot (fix #3: swept from the player, never landing her inside geometry) - on the ground
-        -- there (traced at once). Tried in order: her real spot; its mirror (the other side of him, same
-        -- back/side magnitudes - "behind him on the other side"); simply beside him, unswept - he already
-        -- stands somewhere clear, and by then a sweep would rarely find more room anyway (never AT the
-        -- near_player edge itself - the same SWEEP_RADIUS margin the first two tries land short by).
+        -- there (traced at once). Tried in order, every one of them SWEPT (review finding: the old last
+        -- resort was unswept and landed her inside a wall in a corridor narrower than about her spot's own
+        -- lateral reach, ~134 cm): her real spot; its mirror (the other side of him, same back/side
+        -- magnitudes - "behind him on the other side"); his right side; his left side; directly behind him.
+        -- The three new ones land at near_player + M.SWEEP_RADIUS, never exactly AT near_player - M.SIDE
+        -- happens to equal M.NEAR_PLAYER (90 cm each), and an UNBLOCKED sweep_place lands a candidate exactly
+        -- where it was aimed, so aiming "his side" at M.SIDE put her exactly on the comfort-radius boundary,
+        -- which the very next frame's own walking dynamics could nudge inside of (the same coincidence fix #3
+        -- itself already had to correct for its own last resort). Only if EVERY swept candidate fails does she
+        -- fall back to his own feet - never inside geometry, because he stands there, and the existing step-
+        -- away rule (to_player < NEAR_PLAYER) moves her clear of him again next frame.
         local near_player = M.NEAR_PLAYER * dscale
+        local beside = near_player + M.SWEEP_RADIUS
         local px2, py2, ok = sweep_place(p.x, p.y, tx, ty, sweep, near_player)
         if not ok then
             px2, py2, ok = sweep_place(p.x, p.y, p.x - fx * back - rx * side, p.y - fy * back - ry * side, sweep, near_player)
         end
         if not ok then
-            local beside = near_player + M.SWEEP_RADIUS
-            px2, py2 = p.x + rx * beside, p.y + ry * beside
+            px2, py2, ok = sweep_place(p.x, p.y, p.x + rx * beside, p.y + ry * beside, sweep, near_player) -- his right side
+        end
+        if not ok then
+            px2, py2, ok = sweep_place(p.x, p.y, p.x - rx * beside, p.y - ry * beside, sweep, near_player) -- his left side
+        end
+        if not ok then
+            px2, py2, ok = sweep_place(p.x, p.y, p.x - fx * beside, p.y - fy * beside, sweep, near_player) -- behind him
+        end
+        if not ok then
+            px2, py2 = p.x, p.y -- last resort: his own feet
         end
         s.x, s.y, s.z, s.yaw = px2, py2, p.z, p.yaw
         if s.trace then s.trace.z = nil end
