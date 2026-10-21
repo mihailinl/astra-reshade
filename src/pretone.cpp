@@ -148,8 +148,10 @@ namespace pretone
 		std::atomic<uint64_t> g_before{0}, g_atPresent{0}, g_lost{0}, g_found{0}, g_contended{0}, g_periodBefore{0}, g_periodPresent{0}, g_periodLost{0},
 			g_deferred{0};
 		std::atomic<uint32_t> g_api{0}; // the device_api of the tonemapper pass last driven (0: none yet)
+		std::atomic<uint64_t> g_loggedNotMain{0}; // the last (scene colour, depth buffer) sizes logged as not the main view
+		std::atomic<ULONGLONG> g_loggedNotMainAt{0};
 		ULONGLONG g_nextStats = 0;
-		bool g_loggedFound = false, g_loggedNotMain = false, g_loggedAmbiguous = false, g_loggedCompute = false, g_loggedHdr = false, g_loggedNone = false, g_loggedApi = false,
+		bool g_loggedFound = false, g_loggedAmbiguous = false, g_loggedCompute = false, g_loggedHdr = false, g_loggedNone = false, g_loggedApi = false,
 			 g_loggedFail = false, g_loggedHold = false, g_loggedGiveUp = false, g_loggedDeferred = false, g_loggedResChanges = false;
 		char g_status[260] = "drawn at presentation (over the game's UI): no frame yet";
 
@@ -1255,9 +1257,12 @@ namespace pretone
 				const bool have_depth = layer::depth_size(dw, dh);
 				if (!passfind::main_view_grid(scene, have_depth ? dw : 0, have_depth ? dh : 0))
 				{
-					if (!g_loggedNotMain)
+					const uint64_t pair = (uint64_t(scene.w) << 48) | (uint64_t(scene.h) << 32) | (uint64_t(dw) << 16) | dh;
+					// a new pair of sizes, at most a line every 5 s (a capture and the view may alternate every frame)
+					const ULONGLONG now = GetTickCount64();
+					if (g_loggedNotMain.exchange(pair) != pair && now - g_loggedNotMainAt.load() >= 5000)
 					{
-						g_loggedNotMain = true;
+						g_loggedNotMainAt = now;
 						logf("pretone: a tonemapper below the presented size reads a %ux%u scene colour, but the depth buffer is %ux%u: "
 							 "not the main view (a scene capture?) - not drawn into",
 							scene.w, scene.h, dw, dh);

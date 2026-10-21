@@ -214,7 +214,7 @@ namespace layer
 			resource_view srv = {0};
 			runtime->get_texture_binding(v, &srv, nullptr);
 			if (srv.handle == 0)
-				return false;
+				return false; // nothing bound to DEPTH: the depth add-on binds one only once a buffer has draws (a menu has none)
 			device *dev = runtime->get_device();
 			const resource r = dev->get_resource_from_view(srv);
 			if (r.handle == 0)
@@ -573,6 +573,9 @@ namespace layer
 				uint32_t dw = 0, dh = 0;
 				if (!depth_buffer_size(runtime, dw, dh))
 					dw = dh = 0;
+				if (dw != g_depthW.load() || dh != g_depthH.load())
+					logf("layer: the depth buffer ReShade's depth add-on binds is %ux%u%s", dw, dh,
+						dw == 0 ? " (none: no 3D drawn yet - a menu - or none it would pick)" : "");
 				g_depthW = dw;
 				g_depthH = dh;
 			}
