@@ -159,11 +159,15 @@ M.STUCK_AIM_DROPS = 3            -- ...but dropping an aim changes nothing about
                                  -- escape at all; this many consecutive giveups with no arrival between them
                                  -- escalates to the real teleport above (a genuinely sealed-off spot, the
                                  -- player himself never moving) - about STUCK_GIVEUP * (this + 1) seconds...
-M.AIM_DROP_DIST, M.AIM_DROP_GAP = 100.0, 5.0 -- ...PROVIDED the drops are actually related (review finding): a
-                                 -- new aim set more than AIM_DROP_DIST from the LAST dropped one, or more than
+M.AIM_DROP_DIST, M.AIM_DROP_GAP = 100.0, 5.0 -- ...PROVIDED the drops are actually related (review finding,
+                                 -- round 1): a new aim set more than AIM_DROP_DIST from HER OWN position at
+                                 -- the LAST drop (round-2 correction - comparing the derived aim POINT instead
+                                 -- read a small sway of the PLAYER as "a different spot", since the aim is her
+                                 -- bearing from him projected ~166 cm out; she barely moves while genuinely
+                                 -- stuck, so her own position is the stable reference), or more than
                                  -- AIM_DROP_GAP seconds after it, resets s.aim_drops to 0 first - two giveups
                                  -- at opposite sides of him minutes apart are unrelated stand-mode failures,
-                                 -- never "a sealed-off spot" - only a RUN of drops at roughly the SAME aim,
+                                 -- never "a sealed-off spot" - only a RUN of drops while she herself stays put,
                                  -- close together in time, escalates
 M.NAV_EVERY = 0.5               -- seconds between navmesh path queries (optional, best-effort - never per frame;
                                  -- a synchronous query is comparatively expensive and only needs to be roughly
@@ -694,11 +698,16 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
             local ux, uy = -fx, -fy -- right on top of him: behind him
             if to_player > 1e-3 then ux, uy = (s.x - p.x) / to_player, (s.y - p.y) / to_player end
             s.aim_x, s.aim_y = p.x + ux * r, p.y + uy * r
-            -- review finding: a NEW aim far from (M.AIM_DROP_DIST) or long after (M.AIM_DROP_GAP) the LAST
-            -- dropped one is an unrelated stand-mode failure - never let it inherit an escalating count toward
+            -- review finding, round 2: compare HER OWN position (s.x, s.y), not the derived aim point - the
+            -- aim is her bearing from him projected `r` (~166 cm) out, so a small sway of the PLAYER swings
+            -- the aim point by more than M.AIM_DROP_DIST even though neither SHE nor the actual obstacle
+            -- moved at all, wrongly resetting a genuinely sealed-off retry into an infinite loop. She barely
+            -- moves while actually stuck, so her own position is the stable reference: a NEW aim set more
+            -- than M.AIM_DROP_DIST from where she was at the LAST drop, or more than M.AIM_DROP_GAP seconds
+            -- after it, is an unrelated stand-mode failure - never let it inherit an escalating count toward
             -- a teleport that belongs to a different spot entirely.
             if s.aim_drop_x ~= nil then
-                local ddx, ddy = s.aim_x - s.aim_drop_x, s.aim_y - s.aim_drop_y
+                local ddx, ddy = s.x - s.aim_drop_x, s.y - s.aim_drop_y
                 if ddx * ddx + ddy * ddy > M.AIM_DROP_DIST * M.AIM_DROP_DIST or now - s.aim_drop_time > M.AIM_DROP_GAP then
                     s.aim_drops = 0
                 end
@@ -721,7 +730,7 @@ function M.follow(s, p, dt, now, ground, sweep, nav)
         else
             s.aim_time = (s.aim_time or 0) + dt
             if s.aim_time > M.STUCK_GIVEUP then
-                s.aim_drop_x, s.aim_drop_y, s.aim_drop_time = s.aim_x, s.aim_y, now
+                s.aim_drop_x, s.aim_drop_y, s.aim_drop_time = s.x, s.y, now -- HER position, not the aim point
                 s.aim_x, s.aim_y, s.aim_time, s.aim_best = nil, nil, 0, 1e9
                 s.aim_drops = (s.aim_drops or 0) + 1
                 goal_x, goal_y, dx, dy, d = s.x, s.y, 0, 0, 0

@@ -1929,5 +1929,44 @@ do
     check(not near(s3.ground, 75, 1), string.format("OBJECT_BAND continuity: a crate at a pit's edge - she does not stand on the crate (ground %s)", tostring(s3.ground)))
 end
 
+do
+    -- review fix (T), round 2: aim_drops' reset must compare HER OWN position at drop time, not the derived
+    -- aim point - that point is her bearing from him projected ~166 cm out, so a small sway of the PLAYER
+    -- swings it by more than M.AIM_DROP_DIST even when neither she nor the obstacle moved at all, wrongly
+    -- resetting a genuinely sealed-off retry forever. The player sways +-30 cm (never going anywhere) while
+    -- her spot is sealed off (always blocked); she barely moves (stuck), so her own position stays put and
+    -- the drops must still accumulate and rescue her.
+    local sweep = function() return true, 0 end
+    local her, now = { placed = true, x = 0, y = 0, z = 0, yaw = 0, v = 0 }, 0
+    local p = { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }
+    for i = 1, 2400 do -- 40 s
+        p.x = 30 * math.sin(i * 0.05)
+        now = now + 1 / 60
+        M.follow(her, p, 1 / 60, now, nil, sweep)
+    end
+    check((her.stuck_teleports or 0) > 0, string.format("review fix: a sealed-off spot with the player swaying +-30 cm still rescues her (stuck_teleports %s)", tostring(her.stuck_teleports)))
+
+    -- the round-1 "three unrelated drops, 20 s apart" test (the player never moves there either) still gives
+    -- no teleport - unaffected, since her position and the aim point agree when he does not move at all.
+    local sweep2 = function() return true, 0 end
+    local her2, p2, now2 = { placed = false, x = 0, y = 0, z = 0, yaw = 0 }, { x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, falling = false }, 0
+    M.follow(her2, p2, 1 / 60, now2, nil, sweep2)
+    local drops_seen = 0
+    for _ = 1, 5 do
+        for _ = 1, 200 do
+            now2 = now2 + 1 / 60
+            local before = her2.aim_drops or 0
+            M.follow(her2, p2, 1 / 60, now2, nil, sweep2)
+            if (her2.aim_drops or 0) > before then
+                drops_seen = drops_seen + 1
+                break
+            end
+        end
+        now2 = now2 + 20
+    end
+    check(drops_seen == 5, string.format("review fix: five unrelated drops (player never moves) still happen (saw %d)", drops_seen))
+    check((her2.stuck_teleports or 0) == 0, string.format("review fix: five unrelated drops, 20 s apart, still never escalate to a teleport (stuck_teleports %s)", tostring(her2.stuck_teleports)))
+end
+
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
 os.exit(failed == 0 and 0 or 1)
