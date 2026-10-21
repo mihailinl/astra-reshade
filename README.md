@@ -36,7 +36,9 @@ of that size (`src/passfind.h`; what a draw reads: on D3D12 the descriptors the 
 before, on D3D11 what the context says is bound when a full-screen draw comes) - and runs the effects there, on the
 game's recording thread (never while Present is inside ReShade), into a copy of that scene colour, copied back, the
 game's state put back after (tracked and replayed on D3D12; read with Get* and written back with Set* on D3D11,
-whose context hands its own state back on request - a deferred D3D11 context is not drawn into yet). Her 8-bit
+whose context hands its own state back on request - a deferred D3D11 context is not drawn into yet). A game that
+renders below its output resolution (Unreal's screen percentage, TSR, DLSS, FSR) is drawn into at that lower render
+resolution instead, once it has held steady for a while, then upscaled with the game's own picture. Her 8-bit
 picture is mapped into the scene's
 light by inverting **Unreal's default** tonemapping (`src/tone.h`: its film curve, desaturations, blue correction and
 gamut expansion; a game's own film settings or colour LUT are not read - `[tone] Exposure` in the `-AstraConfig` ini,

@@ -3,6 +3,7 @@
 // crop-aware) are uploaded into AstraPassthrough.fx's textures; the effect re-projects the picture from the
 // camera it was drawn with onto the camera being presented, and depth-tests it against the game's depth.
 #include "view.h"
+#include <cstdint>
 
 namespace layer
 {
@@ -15,8 +16,10 @@ namespace layer
 	/// thread recording command list `frame` presents in: her picture is mapped into the scene's light (tone.h), the
 	/// game's own grade applies to her after, and her picture is uploaded through that command list.
 	/// `frame`: the present it belongs to (pretone's count; set at every present too) - the clock of the staging ring
-	/// her planes are uploaded from.
-	void set_hdr_pass(bool hdr, unsigned long long frame);
+	/// her planes are uploaded from. `vp_w`/`vp_h` (hdr only): the tonemapper's viewport - her copy's size - so the
+	/// depth uv scale (frame_meta's, for a game whose depth buffer is on a padded grid too) can be measured fresh
+	/// every run, against whatever size ReShade's own depth add-on actually picked.
+	void set_hdr_pass(bool hdr, unsigned long long frame, uint32_t vp_w = 0, uint32_t vp_h = 0);
 	/// pretone may draw her pass before the tonemapper (an Unreal game): only then is the tone table made - on the
 	/// present thread, the next time the effects run there. Elsewhere nothing of it exists.
 	void set_tone_wanted(bool wanted);

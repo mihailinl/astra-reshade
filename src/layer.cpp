@@ -33,6 +33,7 @@ namespace layer
 		};
 
 		std::atomic<bool> g_active{false}, g_hdrPass{false};
+		std::atomic<uint32_t> g_hdrVpW{0}, g_hdrVpH{0}; // the tonemapper's viewport this hdr pass (0, 0: none/Present)
 		std::atomic<unsigned long long> g_herRuns{0};
 		Layer g_toneLut; // tone.h's curve and its inverse (ASTRATONE), for her pass before the game's tonemapper
 		bool g_toneFailed = false;
@@ -195,6 +196,30 @@ namespace layer
 		{
 			if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, name); v.handle != 0)
 				runtime->set_uniform_value_float(v, x, y, z, w);
+		}
+
+		/// ReShade's own generic-depth add-on's pick, exactly as this effect sees it (the texture variable declared
+		/// `DepthBufferTex : DEPTH` by ReShade.fxh, which AstraPassthrough.fx includes) - its ACTUAL resource size,
+		/// never assumed equal to the game's scene colour: the depth add-on may pick a differently-padded pool, or
+		/// (config_rules.h's DEPTH seeds) none of Unreal's aspect-ratio heuristics at all. false (w/h left 0): no
+		/// depth add-on has bound one yet.
+		bool depth_buffer_size(effect_runtime *runtime, uint32_t &w, uint32_t &h)
+		{
+			const effect_texture_variable v = runtime->find_texture_variable(kEffect, "DepthBufferTex");
+			if (v.handle == 0)
+				return false;
+			resource_view srv = {0};
+			runtime->get_texture_binding(v, &srv, nullptr);
+			if (srv.handle == 0)
+				return false;
+			device *dev = runtime->get_device();
+			const resource r = dev->get_resource_from_view(srv);
+			if (r.handle == 0)
+				return false;
+			const resource_desc d = dev->get_resource_desc(r);
+			w = d.texture.width;
+			h = d.texture.height;
+			return w != 0 && h != 0;
 		}
 
 		void bind(effect_runtime *runtime)
@@ -626,6 +651,18 @@ namespace layer
 				}
 				v.sun = sun_map;
 			}
+			if (hdr)
+			{
+				// the depth buffer may be on its own padded grid, never assumed the same as the scene colour's: measured
+				// fresh this run, against whatever size ReShade's own depth add-on actually picked (config_rules.h)
+				uint32_t dw = 0, dh = 0;
+				const uint32_t vp_w = g_hdrVpW, vp_h = g_hdrVpH;
+				if (vp_w != 0 && vp_h != 0 && depth_buffer_size(runtime, dw, dh))
+				{
+					v.depth_scale[0] = float(vp_w) / float(dw);
+					v.depth_scale[1] = float(vp_h) / float(dh);
+				}
+			}
 			float values[frame_meta::kTexels * 4];
 			frame_meta::pack(v, values);
 			commit(runtime, cmd, next, values);
@@ -670,10 +707,12 @@ namespace layer
 		return g_active;
 	}
 
-	void set_hdr_pass(bool hdr, unsigned long long frame)
+	void set_hdr_pass(bool hdr, unsigned long long frame, uint32_t vp_w, uint32_t vp_h)
 	{
 		g_passFrame = frame;
 		g_hdrPass = hdr;
+		g_hdrVpW = vp_w;
+		g_hdrVpH = vp_h;
 	}
 
 	void set_tone_wanted(bool wanted)

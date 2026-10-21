@@ -140,7 +140,8 @@ namespace pretone
 		resource_view g_copyRtv = {0};
 		resource_desc g_copyDesc;
 		pretone_rules::Retired<Copy> g_retired;
-		pretone_rules::Fallback g_fallback; // touched only by the thread holding g_recording
+		pretone_rules::Fallback g_fallback;   // touched only by the thread holding g_recording
+		pretone_rules::Stability g_stability; // touched only by the thread holding g_recording
 
 		// what happened, for the log and the overlay
 		std::atomic<uint64_t> g_before{0}, g_atPresent{0}, g_lost{0}, g_found{0}, g_contended{0}, g_periodBefore{0}, g_periodPresent{0}, g_periodLost{0},
@@ -148,7 +149,7 @@ namespace pretone
 		std::atomic<uint32_t> g_api{0}; // the device_api of the tonemapper pass last driven (0: none yet)
 		ULONGLONG g_nextStats = 0;
 		bool g_loggedFound = false, g_loggedAmbiguous = false, g_loggedCompute = false, g_loggedHdr = false, g_loggedNone = false, g_loggedApi = false,
-			 g_loggedFail = false, g_loggedHold = false, g_loggedGiveUp = false, g_loggedDeferred = false;
+			 g_loggedFail = false, g_loggedHold = false, g_loggedGiveUp = false, g_loggedDeferred = false, g_loggedResChanges = false;
 		char g_status[260] = "drawn at presentation (over the game's UI): no frame yet";
 
 		// ASTRA_PRETONE_TRACE=<frame>: that frame's command stream as the finder sees it, into the log (a game whose
@@ -330,7 +331,7 @@ namespace pretone
 			for (uint32_t i = 0; i < count; ++i)
 				s->viewports[first + i] = vps[i];
 			if (first == 0 && count > 0)
-				s->find.viewport(vps[0].width, vps[0].height);
+				s->find.viewport(vps[0].x, vps[0].y, vps[0].width, vps[0].height);
 		}
 
 		void on_bind_scissor_rects(command_list *cmd, uint32_t first, uint32_t count, const rect *rects)
@@ -476,7 +477,9 @@ namespace pretone
 				if (resources[i].handle == 0 || (new_states[i] & resource_usage::shader_resource) == 0 || (new_states[i] & writes) != 0)
 					continue;
 				const passfind::Tex t = describe(cmd->get_device(), resources[i]);
-				if (t.kind != passfind::Kind::hdr || !passfind::presented_size(t.w, t.h, g_outW, g_outH))
+				// a candidate scene colour: the presented size, or a sub-resolution one (phase B) - the wider net
+				// (trace_candidate_size) errs toward tracking a few extra HDR textures, never toward missing the real one
+				if (t.kind != passfind::Kind::hdr || !passfind::trace_candidate_size(t.w, t.h, g_outW, g_outH))
 					continue;
 				std::lock_guard<std::mutex> lock(g_stateLock);
 				if (g_readState.size() > 4096)
@@ -649,12 +652,16 @@ namespace pretone
 			g_copyRtv = {0};
 		}
 
-		/// Her pass's target: like the game's scene colour (its size, its format typed), and writable by ReShade.
-		bool ensure_copy(device *dev, resource scene, uint64_t frame)
+		/// Her pass's target: the tonemapper's IMAGE (its viewport `vp_w` x `vp_h`, never the padded target it may sit
+		/// inside - a pool's padding is never drawn), like the game's scene colour in format, and writable by ReShade.
+		/// `vp_w`/`vp_h` 0 (or bigger than the scene itself - never asked for, a defensive fallback): the scene's own size.
+		bool ensure_copy(device *dev, resource scene, uint32_t vp_w, uint32_t vp_h, uint64_t frame)
 		{
 			const resource_desc d = dev->get_resource_desc(scene);
 			const format typed = format(passfind::typed_hdr(uint32_t(d.texture.format)));
-			if (g_copy.handle != 0 && g_device == dev && g_copyDesc.texture.width == d.texture.width && g_copyDesc.texture.height == d.texture.height &&
+			const uint32_t w = vp_w != 0 && vp_w <= d.texture.width ? vp_w : d.texture.width;
+			const uint32_t h = vp_h != 0 && vp_h <= d.texture.height ? vp_h : d.texture.height;
+			if (g_copy.handle != 0 && g_device == dev && g_copyDesc.texture.width == w && g_copyDesc.texture.height == h &&
 				g_copyDesc.texture.format == typed)
 				return true;
 			if (g_device != dev)
@@ -664,7 +671,7 @@ namespace pretone
 			}
 			retire_copy(frame);
 			g_device = dev;
-			g_copyDesc = resource_desc(d.texture.width, d.texture.height, 1, 1, typed, 1, memory_heap::default_,
+			g_copyDesc = resource_desc(w, h, 1, 1, typed, 1, memory_heap::default_,
 				resource_usage::render_target | resource_usage::shader_resource | resource_usage::copy_source | resource_usage::copy_dest);
 			if (!dev->create_resource(g_copyDesc, nullptr, resource_usage::shader_resource, &g_copy))
 			{
@@ -1051,17 +1058,34 @@ namespace pretone
 			}
 			if (g_drawnAt.load() == frame || !pretone_rules::should_try(g_fallback, frame, runtime->get_effects_state()))
 				return;
+			// g_stability (like g_fallback above) is touched only here, past the Recording guard: one thread at a time.
+			{
+				const bool gave_up_before = g_stability.given_up;
+				const bool ready = g_stability.ready(s.find.vp_w, s.find.vp_h, g_outW, g_outH);
+				if (!gave_up_before && g_stability.given_up && !g_loggedResChanges)
+				{
+					g_loggedResChanges = true;
+					logf("pretone: the game's render resolution keeps changing (dynamic resolution): she is drawn at presentation for the rest of "
+						 "this session");
+				}
+				if (!ready)
+					return; // this size has not held for pretone_rules::Stability::kStable frames yet (or gave up): at Present
+			}
 			g_beginFrame(); // this is the frame being drawn: its camera now (its picture is waited for in the effect)
 			if (!layer::active() || !layer::tone_ready())
 				return; // she is not out (the game's picture passes through at Present), or no Present ran the effects yet
 			const resource game = {scene.id};
+			// her copy (and the effects' target) is the tonemapper's IMAGE - its viewport - never the padded target it
+			// may sit inside (Unreal's pool): clamped defensively to the target's own size (the exact-size case tolerates
+			// the viewport overshooting it by 1 px, a float-rounding slop; the copy and the box below never do)
+			const uint32_t vp_w = s.find.vp_w < scene.w ? s.find.vp_w : scene.w, vp_h = s.find.vp_h < scene.h ? s.find.vp_h : scene.h;
 			std::lock_guard<std::mutex> lock(g_targetLock);
-			if (!ensure_copy(dev, game, frame))
+			if (!ensure_copy(dev, game, vp_w, vp_h, frame))
 			{
 				if (!g_loggedFail)
 				{
 					g_loggedFail = true;
-					logf("pretone: cannot make a copy of the game's scene colour (%ux%u): she is drawn at presentation", scene.w, scene.h);
+					logf("pretone: cannot make a copy of the game's scene colour (%ux%u): she is drawn at presentation", vp_w, vp_h);
 				}
 				return;
 			}
@@ -1069,9 +1093,9 @@ namespace pretone
 			{
 				g_loggedFound = true;
 				const resource_desc d = dev->get_resource_desc(game);
-				logf("pretone: the game's tonemapper found (%s): it reads a %ux%u scene colour (format %u); she is drawn into it, before the game's "
-					 "tone curve, grade, bloom and UI",
-					api_name(api), scene.w, scene.h, uint32_t(d.texture.format));
+				logf("pretone: the game's tonemapper found (%s): it reads a %ux%u scene colour (format %u), its image %ux%u of the presented "
+					 "%ux%u; she is drawn into it, before the game's tone curve, grade, bloom and UI",
+					api_name(api), scene.w, scene.h, uint32_t(d.texture.format), vp_w, vp_h, g_outW.load(), g_outH.load());
 			}
 			g_api = uint32_t(api);
 			const resource_usage was = resource_usage(scene_state);
@@ -1081,7 +1105,9 @@ namespace pretone
 				const resource_usage from[2] = {was, resource_usage::shader_resource}, to[2] = {resource_usage::copy_source, resource_usage::copy_dest};
 				cmd->barrier(2, r, from, to);
 			}
-			cmd->copy_texture_region(game, 0, nullptr, g_copy, 0, nullptr);
+			// the box is the viewport's own corner of the padded target - what copy_texture_region moves either way
+			const subresource_box box{0, 0, 0, vp_w, vp_h, 1};
+			cmd->copy_texture_region(game, 0, &box, g_copy, 0, nullptr);
 			if (api == device_api::d3d12)
 				cmd->barrier(g_copy, resource_usage::copy_dest, resource_usage::render_target);
 			// D3D11: ReShade's render_effects saves and restores none of the context's state - capture it here,
@@ -1091,7 +1117,7 @@ namespace pretone
 			if (api == device_api::d3d11)
 				d3d11_capture(ctx11, snap11);
 			const unsigned long long runs = layer::her_runs();
-			layer::set_hdr_pass(true, frame);
+			layer::set_hdr_pass(true, frame, vp_w, vp_h);
 			runtime->render_effects(cmd, g_copyRtv, g_copyRtv);
 			layer::set_hdr_pass(false, frame);
 			// her technique drew - not: the effects compile for this target or reload. ReShade has marked this frame's
@@ -1107,7 +1133,7 @@ namespace pretone
 			}
 			if (ran)
 			{
-				cmd->copy_texture_region(g_copy, 0, nullptr, game, 0, nullptr);
+				cmd->copy_texture_region(g_copy, 0, nullptr, game, 0, &box);
 				if (api == device_api::d3d12)
 					cmd->barrier(game, resource_usage::copy_dest, was);
 			}

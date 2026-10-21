@@ -4,6 +4,8 @@
 //              shape: passfind.h) and tone curve (tone.h) this add-on knows - Unreal - as the provider or the launcher's
 //              ini declares; everywhere else at Present, as before pretone existed
 //   Fallback   her pass at the tonemapper that did not draw: the Present path for a while, then a new try
+//   Stability  a sub-resolution tonemapper (passfind.h) is drawn into only once its size has held for 60 found
+//              frames running; after 3 changes in a session, dynamic resolution gives up and stays at Present
 //   Retired    a copy of the scene colour no longer used is destroyed frames later, never while the GPU may read it
 //   Staging    the upload buffers her picture goes through on a recording thread: reused only as late
 //   CopyRing   D3D12: which descriptor copies a draw reads - only the ones made since its command list's previous draw
@@ -96,6 +98,45 @@ namespace pretone_rules
 			until = frame + hold;
 			given_up = given_up || misses >= kGiveUp;
 			return true;
+		}
+	};
+
+	/// A sub-resolution tonemapper (its viewport below the presented size) is drawn into only once the SAME size has
+	/// been found kStable frames running: a size caught mid-change (dynamic resolution, a menu that drops screen
+	/// percentage) would make a copy and an effect permutation for a target about to be replaced. A different size
+	/// restarts the count (the existing Retired<> machinery in pretone.cpp retires the old copy the next time
+	/// ensure_copy is asked for the new one - ready() only decides WHEN to ask). After kMaxChanges sizes have been
+	/// tried in one session, further changes are not: dynamic resolution would otherwise retry forever. The exact
+	/// presented size needs none of this - today's behaviour, no wait, never given up.
+	struct Stability
+	{
+		static constexpr uint32_t kStable = 60;
+		static constexpr int kMaxChanges = 3;
+		uint32_t w = 0, h = 0; // the sub-resolution size counted so far (meaningless until have_size)
+		uint32_t count = 0;    // consecutive found frames of that size
+		int changes = 0;       // how many times the size has changed this session (the first size is not a change)
+		bool have_size = false, given_up = false;
+
+		/// A tonemapper found this frame, with viewport (vp_w, vp_h) into a target sized for the presented picture
+		/// (out_w, out_h) exactly or below it. True: drawn into.
+		bool ready(uint32_t vp_w, uint32_t vp_h, uint32_t out_w, uint32_t out_h)
+		{
+			if (vp_w == out_w && vp_h == out_h)
+				return true; // the exact presented size: no wait, never given up
+			if (given_up)
+				return false;
+			if (!have_size || vp_w != w || vp_h != h)
+			{
+				if (have_size && ++changes >= kMaxChanges)
+					given_up = true;
+				have_size = true;
+				w = vp_w;
+				h = vp_h;
+				count = 0;
+				if (given_up)
+					return false;
+			}
+			return ++count >= kStable;
 		}
 	};
 

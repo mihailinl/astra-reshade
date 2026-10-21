@@ -3,7 +3,10 @@
 // - over the game's UI and menus, and past its grade, bloom and vignette. This finds the game's tonemapper in its
 // command stream (passfind.h) and runs the effects there instead, into a copy of the HDR scene colour the tonemapper
 // is about to read, copied back - so the game's tone curve, grade, bloom, vignette and grain apply to her, and its UI is
-// drawn over her. Her picture is mapped into the scene's light with tone.h.
+// drawn over her. Her picture is mapped into the scene's light with tone.h. A game that renders below its output
+// resolution (Unreal's screen percentage, TSR/DLSS/FSR) is drawn into at that lower render resolution, then upscaled
+// with the game's own picture - once that size has held for a while (pretone_rules::Stability; a size still changing,
+// dynamic resolution, is not drawn into).
 //
 // Only in a game whose provider (or the launcher's ini) declares it Unreal (pretone_rules.h): the tonemapper's shape
 // and the tone curve inverted are Unreal's. Direct3D 11 and 12 (ReShade saves and restores neither a D3D12 command

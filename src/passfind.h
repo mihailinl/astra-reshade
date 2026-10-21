@@ -67,10 +67,11 @@ namespace passfind
 	/// One command list's view of the stream, fed by its events in order.
 	struct Tracker
 	{
-		Tex target;                  // the first colour target bound (id 0: none)
-		uint32_t targets_bound = 0;  // how many
-		uint32_t vp_w = 0, vp_h = 0; // viewport 0
-		bool in_pass = false;        // inside an API render pass: nothing can be copied there
+		Tex target;                                // the first colour target bound (id 0: none)
+		uint32_t targets_bound = 0;                // how many
+		uint32_t vp_x = 0, vp_y = 0, vp_w = 0, vp_h = 0; // viewport 0
+
+		bool in_pass = false; // inside an API render pass: nothing can be copied there
 
 		void reset()
 		{
@@ -82,10 +83,20 @@ namespace passfind
 			targets_bound = count;
 			target = count >= 1 ? first : Tex();
 		}
+		/// Viewport 0's size, at (0, 0) (every caller but the sub-resolution shape test below).
 		void viewport(float w, float h)
 		{
-			vp_w = w > 0.0f ? uint32_t(w + 0.5f) : 0;
-			vp_h = h > 0.0f ? uint32_t(h + 0.5f) : 0;
+			viewport(0.0f, 0.0f, w, h);
+		}
+		/// Viewport 0's rectangle: a game that tonemaps below the presented size still sits its viewport at the
+		/// target's top-left (Unreal does) - a draw whose doesn't is never taken (tonemapper_shape).
+		void viewport(float x, float y, float w, float h)
+		{
+			const auto round = [](float v) { return v > 0.0f ? uint32_t(v + 0.5f) : 0; };
+			vp_x = round(x);
+			vp_y = round(y);
+			vp_w = round(w);
+			vp_h = round(h);
 		}
 	};
 
@@ -124,18 +135,36 @@ namespace passfind
 		return std::abs(a - b) <= 0.02 * b && w * 4 >= out_w;
 	}
 
-	/// Could this draw be the tonemapper by its SHAPE (a full-screen draw into one 8/10-bit target of exactly the
-	/// presented size)? Cheap: asked of every draw before what it reads is looked up. `vertices`: its vertex (or index) count.
+	/// Could this draw be the tonemapper by its SHAPE (a full-screen draw into one 8/10-bit target)? Cheap: asked of
+	/// every draw before what it reads is looked up. `vertices`: its vertex (or index) count. Two cases:
+	///   - the EXACT-size one (unchanged): the target IS the presented size, and the viewport is within 1 px of it.
+	///   - a SUB-RESOLUTION tonemapper (Unreal's screen percentage, TSR/DLSS/FSR, dynamic resolution): the viewport
+	///     sits at the target's top-left (0, 0), has the presented aspect within 1%, is at least 1/4 of the presented
+	///     width, and fits inside the target - which may be a pool's padding bigger (at most 16 px or 3% per axis,
+	///     whichever is larger; Unreal pools its targets, so a 384x217 image sits inside a 384x220 texture). The
+	///     target need not be the presented size here - only the viewport's own shape and its fit inside the target
+	///     decide it; the HDR texture a draw reads must still be the TARGET's size (scene_read) - the scene colour
+	///     shares the padded grid, never the viewport's cropped one.
 	inline bool tonemapper_shape(const Tracker &t, uint32_t vertices, uint32_t instances, uint32_t out_w, uint32_t out_h)
 	{
 		if (t.in_pass || t.target.id == 0 || t.target.kind != Kind::ldr)
 			return false;
 		if ((vertices != 3 && vertices != 4 && vertices != 6) || instances != 1)
 			return false;
-		const auto off = [](uint32_t a, uint32_t b) { return a > b ? a - b : b - a; };
-		if (off(t.vp_w, t.target.w) > 1 || off(t.vp_h, t.target.h) > 1)
+		if (t.vp_x != 0 || t.vp_y != 0 || t.vp_w == 0 || t.vp_h == 0 || out_w == 0 || out_h == 0)
 			return false;
-		return presented_size(t.target.w, t.target.h, out_w, out_h);
+		const auto off = [](uint32_t a, uint32_t b) { return a > b ? a - b : b - a; };
+		if (presented_size(t.target.w, t.target.h, out_w, out_h) && off(t.vp_w, t.target.w) <= 1 && off(t.vp_h, t.target.h) <= 1)
+			return true; // the exact-size case, unchanged
+		if (t.vp_w > t.target.w || t.vp_h > t.target.h)
+			return false; // the viewport does not fit inside its own target
+		const auto pad = [](uint32_t size) { const uint32_t p = (size * 3 + 99) / 100; return p > 16 ? p : 16; };
+		if (t.target.w - t.vp_w > pad(t.target.w) || t.target.h - t.vp_h > pad(t.target.h))
+			return false; // more than a pool's padding between the viewport and its target
+		if (t.vp_w * 4 < out_w)
+			return false; // under 1/4 of the presented width
+		const double a = double(t.vp_w) / double(t.vp_h), b = double(out_w) / double(out_h);
+		return std::abs(a - b) <= 0.01 * b;
 	}
 
 	/// Of what the draw reads, its scene colour: the first HDR texture of the target's size (none: not a tonemapper -

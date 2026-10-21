@@ -93,6 +93,7 @@ static const int AstraFrameSunRight = 9;
 static const int AstraFrameSunUp = 10;
 static const int AstraFrameSunDir = 11;
 static const int AstraFrameSunParams = 12;
+static const int AstraFrameDepthScale = 14;
 #define ASTRA_FRAME(i) tex2Dfetch(sAstraFrame, int2(i, 0))
 // she is drawn this frame
 #define AstraActive (ASTRA_FRAME(AstraFramePlanes).w > 0.5)
@@ -121,10 +122,15 @@ static const int AstraFrameSunParams = 12;
 #define SunVDir ASTRA_FRAME(AstraFrameSunDir).xyz
 #define SunVParams ASTRA_FRAME(AstraFrameSunParams).xyz
 #define AstraShadow ASTRA_FRAME(AstraFrameSunCenter).w
+// her pass before the tonemapper: the depth buffer's uv scale, measured fresh this run by the add-on (the
+// tonemapper's viewport / ReShade's own depth add-on's pick) - (0, 0) when not measured (the Present path, or no
+// depth add-on bound one yet), in which case EffectiveDepthUvScale falls back to the user's own knob below
+#define AstraDepthScaleAuto ASTRA_FRAME(AstraFrameDepthScale).xy
 
 uniform float2 DepthUvScale < ui_type = "drag"; ui_min = 0.1; ui_max = 1.0; ui_step = 0.001; ui_label = "Depth buffer part used";
 	ui_tooltip = "Under upscaling (TSR, DLSS, FSR) a game may draw its depth into the top-left part of a larger buffer.\n"
-				 "If her occlusion is offset or scaled, set this to render size / buffer size."; > = float2(1.0, 1.0);
+				 "If her occlusion is offset or scaled, set this to render size / buffer size.\n"
+				 "Before the game's tonemapper this is measured automatically; this knob is the fallback (and the Present path)."; > = float2(1.0, 1.0);
 uniform float DepthBias < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.005; ui_label = "Depth bias (m)";
 	ui_tooltip = "How far behind the game's surface she may still show (her feet on the ground)."; > = 0.04;
 uniform float SlopeBias < ui_type = "drag"; ui_min = 0.0; ui_max = 40.0; ui_step = 0.1; ui_label = "Depth bias per grazing slope"; > = 0.0;
@@ -316,9 +322,18 @@ float host_linear(float d)
 	return d > 0.0 ? n * f / (n + d * (f - n)) : 1e9;
 }
 
+/// The depth buffer's uv scale to use: measured fresh this run by the add-on (the tonemapper's viewport / ReShade's
+/// own depth add-on's pick) before the tonemapper, when it could - else the user's own knob (DepthUvScale), as at
+/// Present, where nothing measures it.
+float2 EffectiveDepthUvScale()
+{
+	const float2 auto_scale = AstraDepthScaleAuto;
+	return (AstraHdr && auto_scale.x > 0.0 && auto_scale.y > 0.0) ? auto_scale : DepthUvScale;
+}
+
 float game_depth(float2 uv)
 {
-	return host_linear(tex2Dlod(ReShade::DepthBuffer, float4(uv * DepthUvScale, 0, 0)).x);
+	return host_linear(tex2Dlod(ReShade::DepthBuffer, float4(uv * EffectiveDepthUvScale(), 0, 0)).x);
 }
 
 /// How much of her is in front of the game's surfaces here: the depth test of the four depth texels around the sample
@@ -328,12 +343,13 @@ float game_depth(float2 uv)
 /// quarter of her shoes, the ground's lighting showing through in 16-pixel blocks). Weighted, a texel that flips moves
 /// her by its weight, and her edge against a nearer surface is soft, as TSR leaves the game's own - while a pole, a wire
 /// or a blade of grass one texel wide in front of her still hides her where it is (an equal share of nine texels let
-/// 8/9 of her through it). The taps stay inside the part of the depth buffer the game drew (DepthUvScale).
+/// 8/9 of her through it). The taps stay inside the part of the depth buffer the game drew (EffectiveDepthUvScale).
 float her_visibility(float2 uv, float za, float allow)
 {
+	const float2 duv = EffectiveDepthUvScale();
 	const int2 size = tex2Dsize(ReShade::DepthBuffer);
-	const int2 last = max(int2(DepthUvScale * float2(size) + 0.5) - 1, int2(0, 0));
-	const float2 p = uv * DepthUvScale * float2(size) - 0.5; // texel centres at whole numbers
+	const int2 last = max(int2(duv * float2(size) + 0.5) - 1, int2(0, 0));
+	const float2 p = uv * duv * float2(size) - 0.5; // texel centres at whole numbers
 	const int2 c = int2(floor(p));
 	const float2 f = p - float2(c);
 	float4 seen;

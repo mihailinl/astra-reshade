@@ -760,15 +760,16 @@ static void test_passfind()
 		d.reads = {tex(18, 512, 512, kRGBA16F)};
 		CHECK(d.scene() == 0);
 	}
-	// a game that tonemaps at its render resolution (same aspect, at least half size) and upscales after: shown in a
-	// trace, never drawn into - each size would be another copy and another effect permutation, and a size following
-	// dynamic resolution would free a copy the GPU still reads (she is drawn at Present there); not another aspect
+	// a game that tonemaps at its render resolution (same aspect, at least half size) and upscales after is now (phase
+	// B) shape-accepted too - the viewport sits exactly at its own target's size (no pool padding) and well past the
+	// 1/4-width floor; pretone_rules::Stability (not passfind) decides WHEN that is trusted enough to draw into. Not
+	// another aspect.
 	{
 		Draw a(tex(19, 1280, 720, kBGRA8)), b(tex(20, 1280, 1024, kBGRA8)), c(tex(23, 1920, 1080, kBGRA8));
 		a.reads = {tex(21, 1280, 720, kRGBA16F)};
 		b.reads = {tex(22, 1280, 1024, kRGBA16F)};
 		c.reads = {tex(24, 1920, 1080, kRGBA16F)};
-		CHECK(a.scene() == 0 && b.scene() == 0 && c.scene() == 24);
+		CHECK(a.scene() == 21 && b.scene() == 0 && c.scene() == 24);
 		CHECK(passfind::near_presented_size(1280, 720, kOutW, kOutH) && !passfind::near_presented_size(1280, 1024, kOutW, kOutH));
 		CHECK(!passfind::presented_size(1440, 810, kOutW, kOutH) && passfind::presented_size(kOutW, kOutH, kOutW, kOutH));
 	}
@@ -782,6 +783,41 @@ static void test_passfind()
 		CHECK(!passfind::trace_candidate_size(639, 360, 2560, 1440)); // one pixel under 1/4 width
 		CHECK(!passfind::trace_candidate_size(768, 300, 2560, 1440)); // same width, a different aspect
 		CHECK(passfind::trace_candidate_size(2560, 1440, 2560, 1440)); // the presented size itself
+	}
+	// tonemapper_shape itself, sub-resolution (phase B): the viewport - not the (possibly pool-padded) target - must
+	// sit at the target's top-left, have the presented aspect within 1%, be at least 1/4 of the presented width, and
+	// fit inside the target within a pool's padding (16 px or 3% per axis, whichever is larger)
+	{
+		// Poppy Playtime (UE4.27, D3D11), presented at 1280x720: a 384x220 target, its image 384x217 (3 px padding)
+		Draw a(tex(26, 384, 220, kBGRA8));
+		a.t.viewport(384, 217);
+		a.reads = {tex(27, 384, 220, kRGBA16F)};
+		CHECK(a.scene(1280, 720) == 27);
+		// the owner's own run, presented at 2560x1440: a 768x436 target, its image 768x432 (4 px padding)
+		Draw b(tex(28, 768, 436, kBGRA8));
+		b.t.viewport(768, 432);
+		b.reads = {tex(29, 768, 436, kRGBA16F)};
+		CHECK(b.scene(2560, 1440) == 29);
+		// wrong aspect: a 1:1 image (no padding at all) never matches 1280x720's
+		Draw c(tex(30, 384, 384, kBGRA8));
+		c.t.viewport(384, 384);
+		c.reads = {tex(31, 384, 384, kRGBA16F)};
+		CHECK(c.scene(1280, 720) == 0);
+		// too small: one pixel under 1/4 of the presented width (320 px), at the right aspect and no padding
+		Draw d(tex(32, 319, 179, kBGRA8));
+		d.t.viewport(319, 179);
+		d.reads = {tex(33, 319, 179, kRGBA16F)};
+		CHECK(d.scene(1280, 720) == 0);
+		// padding too large: the same 384x217 image sits far inside a much bigger target - not a pool's few px of slack
+		Draw e(tex(34, 460, 220, kBGRA8));
+		e.t.viewport(384, 217);
+		e.reads = {tex(35, 460, 220, kRGBA16F)};
+		CHECK(e.scene(1280, 720) == 0);
+		// off-origin: the same 384x217 image, shifted off the target's top-left
+		Draw f(tex(36, 384, 220, kBGRA8));
+		f.t.viewport(4, 0, 384, 217);
+		f.reads = {tex(37, 384, 220, kRGBA16F)};
+		CHECK(f.scene(1280, 720) == 0);
 	}
 	// an HDR picture of another size, or one bound for writing, is not its input; two of them are flagged
 	{
@@ -887,6 +923,37 @@ static void test_pretone_rules()
 			}
 		}
 		CHECK(!fb.given_up && first_drawn == 2000);
+	}
+
+	// a sub-resolution tonemapper (passfind.h) is drawn into only once its viewport has held for kStable found frames
+	// running; a different size restarts the count; after kMaxChanges changes in a session, dynamic resolution gives
+	// up for the rest of it. The presented size itself needs none of this.
+	{
+		pretone_rules::Stability st;
+		int ready_at = -1;
+		for (int frame = 1; frame <= 60 && ready_at < 0; ++frame)
+			if (st.ready(384, 217, 1280, 720))
+				ready_at = frame;
+		CHECK(ready_at == int(pretone_rules::Stability::kStable)); // frame 60, not 59
+
+		pretone_rules::Stability exact;
+		CHECK(exact.ready(1280, 720, 1280, 720)); // no wait, ever
+		CHECK(exact.ready(1280, 720, 1280, 720));
+
+		pretone_rules::Stability flap;
+		bool ever_ready = false;
+		for (int frame = 0; frame < 200; ++frame)
+			ever_ready = ever_ready || flap.ready(frame % 2 == 0 ? 384u : 400u, 217, 1280, 720);
+		CHECK(!ever_ready && flap.given_up); // a size that never repeats never reaches kStable, and gives up besides
+
+		pretone_rules::Stability changes;
+		for (uint32_t w = 300; w <= 300 + uint32_t(pretone_rules::Stability::kMaxChanges); ++w)
+			changes.ready(w, 200, 1280, 720); // 4 distinct sizes: 3 changes
+		CHECK(changes.given_up);
+		bool any_ready_after_giveup = false;
+		for (int frame = 0; frame < int(pretone_rules::Stability::kStable) + 10; ++frame)
+			any_ready_after_giveup = any_ready_after_giveup || changes.ready(500, 200, 1280, 720); // held steady from here
+		CHECK(!any_ready_after_giveup); // given up means given up - not even a size held for kStable after
 	}
 
 	// the upload buffers her pass fills: one pass a frame always finds one, and none is reused (or freed to grow)
@@ -1555,11 +1622,19 @@ static void test_her_edge()
 											  R"(\(her - display_to_scene_raw\(hd\)\) \* cover;)")));
 	// her visibility: the four depth texels around the sample point, bilinear weights, inside the part the game drew
 	const std::string vis = body("float her_visibility(float2 uv, float za, float allow)");
-	CHECK(std::regex_search(vis, std::regex(R"(const int2 last = max\(int2\(DepthUvScale \* float2\(size\) \+ 0\.5\) - 1, int2\(0, 0\)\);)")));
-	CHECK(std::regex_search(vis, std::regex(R"(const float2 p = uv \* DepthUvScale \* float2\(size\) - 0\.5;)")));
+	CHECK(std::regex_search(vis, std::regex(R"(const float2 duv = EffectiveDepthUvScale\(\);)")));
+	CHECK(std::regex_search(vis, std::regex(R"(const int2 last = max\(int2\(duv \* float2\(size\) \+ 0\.5\) - 1, int2\(0, 0\)\);)")));
+	CHECK(std::regex_search(vis, std::regex(R"(const float2 p = uv \* duv \* float2\(size\) - 0\.5;)")));
 	CHECK(std::regex_search(vis, std::regex(R"(clamp\(c \+ int2\(i & 1, i >> 1\), int2\(0, 0\), last\))")));
 	CHECK(std::regex_search(vis, std::regex(R"(return lerp\(lerp\(seen\.x, seen\.y, f\.x\), lerp\(seen\.z, seen\.w, f\.x\), f\.y\);)")));
 	CHECK(vis.find("/ 9.0") == std::string::npos && vis.find("size - 1") == std::string::npos);
+	// the depth scale measured before the tonemapper (frame_meta's kDepthScale) replaces the user's own knob only when
+	// AstraHdr is on and it was actually measured this run (0, 0): everywhere else (Present) the knob alone decides
+	const std::string eff = body("float2 EffectiveDepthUvScale()");
+	CHECK(std::regex_search(eff, std::regex(R"(const float2 auto_scale = AstraDepthScaleAuto;)")));
+	CHECK(std::regex_search(eff, std::regex(R"(return \(AstraHdr && auto_scale\.x > 0\.0 && auto_scale\.y > 0\.0\) \? auto_scale : DepthUvScale;)")));
+	const std::string gd = body("float game_depth(float2 uv)");
+	CHECK(std::regex_search(gd, std::regex(R"(uv \* EffectiveDepthUvScale\(\))")));
 }
 
 /// layer.cpp commits the frame's values with every run (removing the commit drew her with stale values and stayed
@@ -1655,6 +1730,8 @@ static void test_frame_meta()
 	v.sun_n = 256.0f;
 	v.sun = true;
 	v.run = (uint64_t(1) << 40) + 77;
+	v.depth_scale[0] = 0.875f;
+	v.depth_scale[1] = 0.6f;
 	float t[frame_meta::kTexels * 4];
 	frame_meta::pack(v, t);
 	auto at = [&](int texel, int c) { return t[texel * 4 + c]; };
@@ -1666,9 +1743,11 @@ static void test_frame_meta()
 	CHECK(at(frame_meta::kSunCenter, 0) == 7.0f && at(frame_meta::kSunCenter, 3) == 0.6f && at(frame_meta::kSunDir, 1) == -0.9f);
 	CHECK(at(frame_meta::kSunParams, 2) == 256.0f && at(frame_meta::kSunParams, 3) == 1.0f);
 	CHECK(at(frame_meta::kRun, 0) == 77.0f); // 24 bits: exact in a float
+	CHECK(at(frame_meta::kDepthScale, 0) == 0.875f && at(frame_meta::kDepthScale, 1) == 0.6f);
 	frame_meta::Values off;
 	frame_meta::pack(off, t);
 	CHECK(at(frame_meta::kPlanes, 3) == 0.0f && at(frame_meta::kHost, 2) == 0.0f && at(frame_meta::kSunParams, 3) == 0.0f);
+	CHECK(at(frame_meta::kDepthScale, 0) == 0.0f && at(frame_meta::kDepthScale, 1) == 0.0f); // (0, 0): not measured
 
 	std::ifstream f(ASTRA_FX);
 	CHECK(f.good());
@@ -1683,7 +1762,7 @@ static void test_frame_meta()
 	} texels[] = {{"Rect", frame_meta::kRect}, {"Planes", frame_meta::kPlanes}, {"Host", frame_meta::kHost}, {"Warp0", frame_meta::kWarp0},
 		{"Warp1", frame_meta::kWarp1}, {"Warp2", frame_meta::kWarp2}, {"WarpT", frame_meta::kWarpT}, {"WarpTan", frame_meta::kWarpTan},
 		{"SunCenter", frame_meta::kSunCenter}, {"SunRight", frame_meta::kSunRight}, {"SunUp", frame_meta::kSunUp}, {"SunDir", frame_meta::kSunDir},
-		{"SunParams", frame_meta::kSunParams}};
+		{"SunParams", frame_meta::kSunParams}, {"DepthScale", frame_meta::kDepthScale}};
 	for (const auto &x : texels)
 	{
 		std::smatch m;
@@ -1701,7 +1780,7 @@ static void test_frame_meta()
 		{"AstraRect", "Rect", ""}, {"AstraWarpRow0", "Warp0", "xyz"}, {"AstraWarpRow1", "Warp1", "xyz"}, {"AstraWarpRow2", "Warp2", "xyz"},
 		{"AstraWarpT", "WarpT", "xyz"}, {"AstraWarpIdentity", "Host", "w"}, {"AstraWarpTan", "WarpTan", "xyz"}, {"SunVActive", "SunParams", "w"},
 		{"SunVCenter", "SunCenter", "xyz"}, {"SunVRight", "SunRight", "xyz"}, {"SunVUp", "SunUp", "xyz"}, {"SunVDir", "SunDir", "xyz"},
-		{"SunVParams", "SunParams", "xyz"}, {"AstraShadow", "SunCenter", "w"}};
+		{"SunVParams", "SunParams", "xyz"}, {"AstraShadow", "SunCenter", "w"}, {"AstraDepthScaleAuto", "DepthScale", "xy"}};
 	for (const auto &r : reads)
 	{
 		const std::string want = std::string(R"(#define )") + r.macro + R"(\s+\(?ASTRA_FRAME\(AstraFrame)" + r.texel + R"(\))" +

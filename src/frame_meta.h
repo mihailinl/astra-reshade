@@ -31,6 +31,10 @@ namespace frame_meta
 	constexpr int kSunDir = 11;   // the way the light travels (xyz)
 	constexpr int kSunParams = 12; // half width, near, N (texels a side), 1 = her sun view is used this frame
 	constexpr int kRun = 13;      // the add-on's run of the effects this was written for (x, low 24 bits): for tests
+	// her pass before the tonemapper, measured fresh this run: the tonemapper's viewport / ReShade's own depth add-on's
+	// pick, per axis - the depth buffer's uv scale, for a game whose depth is on a padded grid too (phase B). (0, 0):
+	// not measured this run (the Present path, or no depth add-on bound one) - the effect falls back to its own knob.
+	constexpr int kDepthScale = 14;
 
 	struct Values
 	{
@@ -46,6 +50,7 @@ namespace frame_meta
 		float sun_half = 1.0f, sun_near = 0.0f, sun_n = 512.0f, shadow = 0.0f;
 		bool sun = false;
 		uint64_t run = 0;
+		float depth_scale[2] = {0, 0}; // viewport / depth-buffer size this run (hdr only); (0, 0): not measured
 	};
 
 	inline void put(float *out, int texel, float x, float y, float z, float w)
@@ -85,5 +90,6 @@ namespace frame_meta
 		put(out, kSunDir, v.sun_dir[0], v.sun_dir[1], v.sun_dir[2], 0.0f);
 		put(out, kSunParams, v.sun_half, v.sun_near, v.sun_n, v.sun ? 1.0f : 0.0f);
 		put(out, kRun, float(v.run & 0xFFFFFF), 0.0f, 0.0f, 0.0f);
+		put(out, kDepthScale, v.depth_scale[0], v.depth_scale[1], 0.0f, 0.0f);
 	}
 }
