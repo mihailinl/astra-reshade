@@ -1876,5 +1876,58 @@ do
     check(not inside, string.format("review fix: a 170 cm first-person room - never inside a wall (her %.1f, %.1f)", her.x, her.y))
 end
 
+do
+    -- review fix (S), round 2: M.OBJECT_BAND's keep-z (fe33078) cannot tell a continuous slope from an
+    -- isolated object sitting over a VOID - "nothing lower found" reads the same for both. Added a
+    -- continuity check (M.OBJECT_CONTINUITY): the ground at the MIDPOINT between her and the player should
+    -- read close to the midpoint of their two heights for a real slope; an object over a void has nothing
+    -- continuous there at all. M.update_ground is called directly here (not through M.follow) to isolate the
+    -- ground logic from the placement cascade's own spot math.
+
+    -- (i) the slope still stands at 54 cm (fe33078's own case, unaffected: the midpoint of a smooth slope
+    -- reads exactly where it should).
+    local function slope(x, y, from, to)
+        local h = 0.6 * y
+        if from >= to then
+            if h <= from and h >= to then return h end
+        else
+            if h >= from and h <= to then return h end
+        end
+        return nil
+    end
+    local s1, p1 = { x = 0, y = 90, z = 54, trace = {} }, { x = 0, y = 0, z = 0 }
+    M.update_ground(s1, p1, 0, slope, true)
+    check(near(s1.ground, 54, 1), string.format("OBJECT_BAND continuity: a slope still stands at 54 cm (ground %s)", tostring(s1.ground)))
+
+    -- (ii) the crate over a floor (the ground fix (B)'s own case) still gives 0 - the retrace finds the real
+    -- floor directly, the continuity check never even runs.
+    local function crate_over_floor(x, y, from, to)
+        local best
+        if from >= to then
+            if 0 <= from and 0 >= to then best = 0 end
+            if x >= 150 and x <= 250 and 75 <= from and 75 >= to and (best == nil or 75 > best) then best = 75 end
+        end
+        return best
+    end
+    local s2, p2 = { x = 200, y = 0, z = 75, trace = {} }, { x = 0, y = 0, z = 0 }
+    M.update_ground(s2, p2, 0, crate_over_floor, true)
+    check(near(s2.ground, 0, 0.5), string.format("OBJECT_BAND continuity: a crate over a floor still gives 0 (ground %s)", tostring(s2.ground)))
+
+    -- (iii) a crate at a PIT's edge, him 90 cm below (no floor at all under the crate OR in the pit between
+    -- them) - the retrace finds nothing (same as the slope), but the midpoint ALSO finds nothing: not
+    -- continuous, so it is treated as an object, not a slope - she must not stand on the crate.
+    local function pit_with_crate(x, y, from, to)
+        local best
+        if from >= to then
+            if not (x >= 150 and x <= 400) and 0 <= from and 0 >= to then best = 0 end -- floor, outside the pit
+            if x >= 150 and x <= 250 and 75 <= from and 75 >= to and (best == nil or 75 > best) then best = 75 end
+        end
+        return best
+    end
+    local s3, p3 = { x = 200, y = 0, z = 75, trace = {} }, { x = 320, y = 0, z = -90 }
+    M.update_ground(s3, p3, 0, pit_with_crate, true)
+    check(not near(s3.ground, 75, 1), string.format("OBJECT_BAND continuity: a crate at a pit's edge - she does not stand on the crate (ground %s)", tostring(s3.ground)))
+end
+
 io.stdout:write(string.format("AstraUE: %d checks, %d failed\n", checks, failed))
 os.exit(failed == 0 and 0 or 1)
